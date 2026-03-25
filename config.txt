@@ -1,0 +1,73 @@
+# 数据集参数
+total_doc_num = 10000000
+total_tag_num = 35840; //实际只有35672种tag
+total_bucket_num = 10000
+vector_dim = 64
+max_doc_per_bucket = 1024  //为了适配npu，这个参数必须是16的倍数
+
+# CPU 资源
+cpu_core_count_serial = 8
+npu_device_count_serial = 1
+groups_per_device_serial = 1
+
+cpu_core_count_parallel = 48
+npu_device_count_parallel = 2
+groups_per_device_parallel = 3
+
+cores_per_group = 8
+
+# 检索策略
+valid_bucket_num_base = 200  // 首轮探测桶数
+valid_bucket_num_incremental = 200  // 后续每轮新增探测桶数，必须 <= valid_bucket_num_base
+k_expand_param = 1  // expanded_k = k_expand_param * topk
+query_file = ../../QueryData_10.txt  // 查询文件路径
+query_result_root = ../../result/  // 查询过程结果输出根目录，recall/ latency/ log 子目录会自动创建
+ground_truth_cache_file = ../../ground_truth_cache.bin  // ground-truth缓存文件，设为""可关闭
+bucket_ivf_index_file = ../../bucket_ivf_index.bin  // CPU侧桶级IVF索引文件
+bucket_index_file = ../../bucket_index.bin  // CPU侧桶内索引文件
+
+# NPU 资源
+npu_device_id_start = 0
+
+# 预留草稿内存
+# max_rpn_length = max_query_tags * 3
+max_query_tags = 2000
+max_rpn_length = 6000
+
+# 查询侧预分配
+# 注意：max_query_topk_prealloc 是 expanded_k 的上界，不是原始 top_k 的上界
+# 这里按 top_k 最高约 3500、k_expand_param 可能到 5 预留到 32768
+max_query_topk_prealloc = 32768
+query_pool_capacity = 64
+query_vector_reserve_floats = 64
+query_bucket_rpn_reserve_items = 8192
+query_bucket_level_ivf_rpn_reserve_items = 8192
+query_compile_stack_reserve_items = 1024
+query_exec_stack_reserve_items = 2048
+query_merge_batch_reserve_items = 65536
+
+# Group / thread_local 工作区预分配
+group_tls_scratch_pool_reserve_u64 = 262144
+group_tls_ivf_mask_reserve_u64 = 64
+group_tls_batch_mask_reserve_u64 = 512
+group_local_pq_reserve_items_per_rank = 2048
+group_thread_bucket_results_reserve_items_per_rank = 2048
+group_candidate_merge_reserve_items = 16384
+group_sorted_buckets_reserve_items = 16384
+group_batch_bucket_ids_reserve_items = 256
+group_temp_doc_mask_reserve_u64_per_rank = 32
+group_thread_doc_results_reserve_items_per_rank = 32768
+group_all_items_reserve_items = 262144
+
+
+# cache line优化BucketLevelIVF读取
+# kunpeng920的cache line 是128字节
+cpu_cache_line_size = 128; 
+
+memory_events_log_enable = 0  # 1: 开启查询期动态内存扩容检测并输出 query_result_root/log/memory_logs.txt
+
+
+npu_debug_verify = 0   # npu_debug_verify置为0就不会检测npu计算是否正确，置为1会耗时检测
+npu_debug_verify_abs_tol = 0.1
+npu_debug_verify_rel_tol = 0.02
+npu_debug_verify_max_report = 5

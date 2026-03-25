@@ -1,0 +1,652 @@
+#include "NPU/npuAPI.h"
+#include "DataBaseCPU/InputDataset.h"
+#include <atomic>
+#include <iostream>
+#include <algorithm>
+#include <cmath>
+#include <cstring>
+#include <limits>
+#include <mutex>
+#include <vector>
+#include "acl/acl.h"
+#include "utils/DataReader.h"
+#include "NPU/BatchTask.h" //避免acl头文件污染
+
+// 引用内核启动头文件
+#include "aclrtlaunch_kernel_vector_mmad.h"
+
+namespace npuAPI
+{
+    uint16_t Float32ToFp16(float value)
+    {
+        uint32_t f32;
+        std::memcpy(&f32, &value, sizeof(float));
+        uint16_t f16 = 0;
+        uint32_t sign = (f32 >> 16) & 0x8000;
+        int16_t exponent = ((f32 >> 23) & 0xFF) - 127;
+        uint32_t mantissa = f32 & 0x007FFFFF;
+        if (exponent > 15)
+        {
+            f16 = sign | 0x7C00;
+        }
+        else if (exponent <= -15)
+        {
+            f16 = sign;
+        }
+        else
+        {
+            exponent += 15;
+            mantissa >>= 13;
+            f16 = sign | (exponent << 10) | mantissa;
+        }
+        return f16;
+    }
+
+    struct DeviceContext
+    {
+        //定义一张NPU设备的信息
+        int device_id = -1;   //0~7
+        void *dev_base_addr = nullptr; //该NPU的 HBM 上存储全体向量数据的基地址
+        std::vector<aclrtStream> streams;  //每个NPU上有3个group，每个group有一个 Stream
+    };
+
+    struct GroupContext
+    {
+        /*
+            定义一个group的device侧的workspace
+            指针指向的是HBM上的地址
+            被group循环利用
+        */
+        void *d_query_ws = nullptr;   //存放查询向量
+        void *d_result_ws = nullptr;  //存放计算结果
+        void *d_task_ws = nullptr;    // 存放CPU发来的BatchTaskData 数组（比如有200个element）
+
+        // --- Flag 同步资源 ---
+        bool *h_flag = nullptr;       // Host 侧 Flag (Pinned Memory)
+        void *d_flag_false = nullptr; // Device 侧存放 "false" 值的内存
+    };
+
+    struct BucketMeta
+    {
+        /*
+            在 CPU 侧记录每个桶在 NPU HBM 中的物理位置
+            在Init 索引构建时：根据 BucketMeta 将向量数据上传至 DeviceContext 的 dev_base_addr内存块
+            在LaunchBatchKernel时，cpu发来一批桶id，然后依据 BucketMeta 构建 BatchTaskData 数组
+        */
+        size_t byte_offset; //桶起始位置相对于 dev_base_addr 的偏移量
+        uint32_t doc_num;   //桶内doc数量
+        size_t doc_id_offset = 0; // 调试校验时用于回溯桶内 doc 的全局 ID 顺序
+    };
+
+    // 注意：这里不能在静态初始化阶段使用配置全局变量，
+    // 否则会在 main()->LoadParams() 之前使用默认值。
+    static std::vector<DeviceContext> g_devices;
+    static std::vector<GroupContext> g_group_ctxs;
+    static std::vector<BucketMeta> g_bucket_metas;
+    static std::vector<uint32_t> g_bucket_doc_ids;
+    static const float *g_host_vectors = nullptr;
+    static bool g_acl_initialized = false;
+    static bool g_initialized = false;
+    static std::mutex g_debug_log_mutex;
+    static std::atomic<uint64_t> g_debug_batch_counter{0};
+
+    namespace
+    {
+        constexpr uint32_t kKernelRowTile = 256;
+
+        struct DebugMismatch
+        {
+            uint32_t bucket_id = 0;
+            uint32_t local_doc_idx = 0;
+            uint32_t global_doc_id = 0;
+            float cpu_score = 0.0f;
+            float npu_score = 0.0f;
+            float abs_err = 0.0f;
+            float allowed_err = 0.0f;
+        };
+
+        inline float ComputeCpuDotProduct(const float *lhs, const float *rhs, int dim)
+        {
+            float sum = 0.0f;
+            for (int d = 0; d < dim; ++d)
+            {
+                sum += lhs[d] * rhs[d];
+            }
+            return sum;
+        }
+
+        inline size_t GetMaxKernelTasksPerBatch()
+        {
+            const size_t max_tiles_per_bucket = (static_cast<size_t>(max_doc_per_bucket) + kKernelRowTile - 1) / kKernelRowTile;
+            return static_cast<size_t>(valid_bucket_num_base) * max_tiles_per_bucket;
+        }
+
+        void LogAclCleanupError(const char *op, aclError ret, int device_id, int group_id = -1)
+        {
+            std::cerr << "[NPU] " << op << " failed";
+            if (device_id >= 0)
+            {
+                std::cerr << ", device=" << device_id;
+            }
+            if (group_id >= 0)
+            {
+                std::cerr << ", group=" << group_id;
+            }
+            std::cerr << ", code=" << ret << std::endl;
+        }
+
+        void ResetRuntimeState()
+        {
+            g_devices.clear();
+            g_group_ctxs.clear();
+            g_bucket_metas.clear();
+            g_bucket_doc_ids.clear();
+            g_host_vectors = nullptr;
+            g_initialized = false;
+            g_debug_batch_counter.store(0, std::memory_order_relaxed);
+        }
+
+        void FreeDeviceBuffer(void *&ptr, const char *label, int device_id, int group_id = -1)
+        {
+            if (!ptr)
+            {
+                return;
+            }
+            const auto ret = aclrtFree(ptr);
+            if (ret != ACL_SUCCESS)
+            {
+                LogAclCleanupError(label, ret, device_id, group_id);
+            }
+            ptr = nullptr;
+        }
+
+        void FreeHostFlag(bool *&ptr, int device_id, int group_id)
+        {
+            if (!ptr)
+            {
+                return;
+            }
+            const auto ret = aclrtFreeHost(ptr);
+            if (ret != ACL_SUCCESS)
+            {
+                LogAclCleanupError("aclrtFreeHost(h_flag)", ret, device_id, group_id);
+            }
+            ptr = nullptr;
+        }
+    } // namespace
+
+    // --- Pinned Memory Helper ---
+    void AllocateHostPinned(void** ptr, size_t size)
+    {
+        // aclrtMallocHost 分配的是 Pinned Memory，物理地址连续，支持 Device 直接 DMA 访问
+        auto ret = aclrtMallocHost(ptr, size);
+        if (ret != ACL_SUCCESS) {
+            std::cerr << "[NPU] aclrtMallocHost failed, code: " << ret << std::endl;
+        }
+    }
+
+    void FreeHostPinned(void* ptr)
+    {
+        if (!ptr)
+        {
+            return;
+        }
+        auto ret = aclrtFreeHost(ptr);
+        if (ret != ACL_SUCCESS)
+        {
+            std::cerr << "[NPU] aclrtFreeHost failed, code: " << ret << std::endl;
+        }
+    }
+
+    void Init(const InputDataset &dataset, const BucketDocTable &bucket_doc_table)
+    {
+        if (g_initialized)
+            return;
+
+        g_devices.resize(npu_device_count);
+        g_group_ctxs.resize(group_count);
+        g_bucket_metas.resize(total_bucket_num);
+
+        auto ret = aclInit(nullptr);
+        if (ret != ACL_SUCCESS)
+        {
+            std::cout << "aclInit fail: " << ret << std::endl;
+            return;
+        }
+        g_acl_initialized = true;
+        std::cout << "[NPU] Init: Loading Data..." << std::endl;
+        g_host_vectors = dataset.vectors;
+        g_bucket_doc_ids.clear();
+
+        size_t total_stored_docs = 0;
+        for (const auto &bucket_docs : bucket_doc_table)
+        {
+            total_stored_docs += bucket_docs.size();
+        }
+
+        if (npu_debug_verify != 0)
+        {
+            g_bucket_doc_ids.reserve(total_stored_docs);
+            std::cout << "[NPU][Debug] CPU verification is enabled. abs_tol="
+                      << npu_debug_verify_abs_tol
+                      << ", rel_tol=" << npu_debug_verify_rel_tol
+                      << ", max_report=" << npu_debug_verify_max_report
+                      << std::endl;
+        }
+
+        size_t total_elements = total_stored_docs * static_cast<size_t>(vector_dim);
+        for (int i = 0; i < total_bucket_num; ++i)
+            g_bucket_metas[i].doc_num = static_cast<uint32_t>(bucket_doc_table[i].size());
+
+        std::vector<uint16_t> host_buffer(total_elements);
+        size_t cursor = 0;
+        size_t current_byte_offset = 0;
+
+        for (int bid = 0; bid < total_bucket_num; ++bid)
+        {
+            const auto &bucket_docs = bucket_doc_table[bid];
+            g_bucket_metas[bid].byte_offset = current_byte_offset;
+            if (npu_debug_verify != 0)
+            {
+                g_bucket_metas[bid].doc_id_offset = g_bucket_doc_ids.size();
+            }
+            for (uint32_t doc_id : bucket_docs)
+            {
+                if (npu_debug_verify != 0)
+                {
+                    g_bucket_doc_ids.push_back(doc_id);
+                }
+                const float *src_vec = dataset.vectors + (size_t)doc_id * vector_dim;
+                for (int d = 0; d < vector_dim; ++d)
+                {
+                    host_buffer[cursor++] = Float32ToFp16(src_vec[d]);
+                }
+            }
+            current_byte_offset += g_bucket_metas[bid].doc_num * vector_dim * sizeof(uint16_t);
+        }
+        //  (f32toFp16数据转换结束) 
+
+        size_t total_bytes = total_elements * sizeof(uint16_t);
+        std::cout << "[NPU] StoredDocRefs=" << total_stored_docs
+                  << ", HBMVectorBytesPerDevice=" << total_bytes
+                  << std::endl;
+        uint32_t max_docs_in_batch = valid_bucket_num_base * max_doc_per_bucket;
+
+        size_t ws_query_size = 64 * 16 * sizeof(uint16_t); //每个query向量都要padding到64x16
+        
+        // 结果按完整的 [doc_num, 16] ND 矩阵写回，Host 侧只读取每行第 0 列。
+        size_t ws_result_size = max_docs_in_batch * 16 * sizeof(float);
+        
+        // Task Workspace: 一个 bucket 可能被拆成多个 row-tile task。
+        size_t ws_task_size = GetMaxKernelTasksPerBatch() * sizeof(BatchTaskData);
+
+        for (int dev_id = npu_device_id_start; dev_id < npu_device_id_start + npu_device_count; ++dev_id)
+        {
+            int local_idx = dev_id - npu_device_id_start;
+            g_devices[local_idx].device_id = dev_id;
+            aclrtSetDevice(dev_id);
+
+            for (int j = 0; j < groups_per_device; ++j)
+            {
+                int group_id = local_idx * groups_per_device + j;
+                aclrtStream s = nullptr;
+                aclrtCreateStream(&s);
+                g_devices[local_idx].streams.push_back(s);
+
+                aclrtMalloc(&g_group_ctxs[group_id].d_query_ws, ws_query_size, ACL_MEM_MALLOC_HUGE_FIRST);
+                aclrtMalloc(&g_group_ctxs[group_id].d_result_ws, ws_result_size, ACL_MEM_MALLOC_HUGE_FIRST);
+                aclrtMalloc(&g_group_ctxs[group_id].d_task_ws, ws_task_size, ACL_MEM_MALLOC_HUGE_FIRST);
+
+                // --- Flag 资源初始化 ---
+                // 1. Host Flag (Pinned)
+                AllocateHostPinned((void**)&g_group_ctxs[group_id].h_flag, sizeof(bool));
+                *g_group_ctxs[group_id].h_flag = true; // 初始为 busy
+
+                // 2. Device False Flag (Constant Source)
+                aclrtMalloc(&g_group_ctxs[group_id].d_flag_false, sizeof(bool), ACL_MEM_MALLOC_HUGE_FIRST);
+                bool false_val = false;
+                aclrtMemcpy(g_group_ctxs[group_id].d_flag_false, sizeof(bool), 
+                            &false_val, sizeof(bool), ACL_MEMCPY_HOST_TO_DEVICE);
+            }
+
+            aclrtMalloc(&g_devices[local_idx].dev_base_addr, total_bytes, ACL_MEM_MALLOC_HUGE_FIRST);
+            aclrtMemcpy(g_devices[local_idx].dev_base_addr, total_bytes, host_buffer.data(), total_bytes, ACL_MEMCPY_HOST_TO_DEVICE);
+        }
+        g_initialized = true;
+    }
+
+    Stream GetGroupStream(int group_id)
+    {
+        int dev_idx = group_id / groups_per_device;
+        int stream_idx = group_id % groups_per_device;
+        return g_devices[dev_idx].streams[stream_idx];
+    }
+
+    volatile bool* GetGroupFlag(int group_id) {
+        return g_group_ctxs[group_id].h_flag;
+    }
+
+    void ResetGroupFlag(int group_id) {
+        // CPU 重置 Flag 为 true，表示任务开始
+        *g_group_ctxs[group_id].h_flag = true;
+    }
+
+    void SynchronizeStream(Stream s) { aclrtSynchronizeStream(s); }   //优化后这个函数不再被使用
+    void Finalize()
+    {
+        if (!g_acl_initialized)
+        {
+            ResetRuntimeState();
+            return;
+        }
+
+        for (int local_idx = 0; local_idx < static_cast<int>(g_devices.size()); ++local_idx)
+        {
+            auto &device = g_devices[local_idx];
+            const int device_id = device.device_id;
+            const bool valid_device = (device_id >= 0);
+            bool device_ready = false;
+
+            if (valid_device)
+            {
+                const auto ret = aclrtSetDevice(device_id);
+                if (ret != ACL_SUCCESS)
+                {
+                    LogAclCleanupError("aclrtSetDevice", ret, device_id);
+                }
+                else
+                {
+                    device_ready = true;
+                }
+            }
+
+            const int group_begin = local_idx * groups_per_device;
+            for (int j = 0; j < groups_per_device; ++j)
+            {
+                const int group_id = group_begin + j;
+                if (group_id >= static_cast<int>(g_group_ctxs.size()))
+                {
+                    break;
+                }
+
+                if (device_ready && j < static_cast<int>(device.streams.size()) && device.streams[j] != nullptr)
+                {
+                    const auto ret = aclrtSynchronizeStream(device.streams[j]);
+                    if (ret != ACL_SUCCESS)
+                    {
+                        LogAclCleanupError("aclrtSynchronizeStream", ret, device_id, group_id);
+                    }
+                }
+            }
+
+            for (int j = 0; j < groups_per_device; ++j)
+            {
+                const int group_id = group_begin + j;
+                if (group_id >= static_cast<int>(g_group_ctxs.size()))
+                {
+                    break;
+                }
+
+                auto &group = g_group_ctxs[group_id];
+                if (device_ready)
+                {
+                    FreeDeviceBuffer(group.d_query_ws, "aclrtFree(d_query_ws)", device_id, group_id);
+                    FreeDeviceBuffer(group.d_result_ws, "aclrtFree(d_result_ws)", device_id, group_id);
+                    FreeDeviceBuffer(group.d_task_ws, "aclrtFree(d_task_ws)", device_id, group_id);
+                    FreeDeviceBuffer(group.d_flag_false, "aclrtFree(d_flag_false)", device_id, group_id);
+                }
+                FreeHostFlag(group.h_flag, device_id, group_id);
+            }
+
+            if (device_ready)
+            {
+                FreeDeviceBuffer(device.dev_base_addr, "aclrtFree(dev_base_addr)", device_id);
+
+                for (size_t stream_idx = 0; stream_idx < device.streams.size(); ++stream_idx)
+                {
+                    if (device.streams[stream_idx] == nullptr)
+                    {
+                        continue;
+                    }
+
+                    const auto ret = aclrtDestroyStream(device.streams[stream_idx]);
+                    if (ret != ACL_SUCCESS)
+                    {
+                        LogAclCleanupError("aclrtDestroyStream",
+                                           ret,
+                                           device_id,
+                                           group_begin + static_cast<int>(stream_idx));
+                    }
+                    device.streams[stream_idx] = nullptr;
+                }
+
+                const auto ret = aclrtResetDevice(device_id);
+                if (ret != ACL_SUCCESS)
+                {
+                    LogAclCleanupError("aclrtResetDevice", ret, device_id);
+                }
+            }
+
+            device.streams.clear();
+            device.dev_base_addr = nullptr;
+        }
+
+        const auto ret = aclFinalize();
+        if (ret != ACL_SUCCESS)
+        {
+            LogAclCleanupError("aclFinalize", ret, -1);
+        }
+
+        g_acl_initialized = false;
+        ResetRuntimeState();
+    }
+
+    // -----------------------------------------------------------
+    // 优化版 LaunchBatchKernel (Async Chain)
+    // -----------------------------------------------------------
+    void LaunchBatchKernel(Stream stream,
+                           const std::vector<uint32_t> &bucket_ids,
+                           const float *query_vector,
+                           float *host_output_buffer, // 接收结果的 Pinned Buffer
+                           int group_id)
+    {
+        int local_idx = group_id / groups_per_device;
+
+        void *d_query = g_group_ctxs[group_id].d_query_ws;
+        void *d_task = g_group_ctxs[group_id].d_task_ws;
+        void *dev_base_doc = g_devices[local_idx].dev_base_addr;
+        void *dev_base_result = g_group_ctxs[group_id].d_result_ws;
+
+        // 1. Prepare Query (Padding to 64x16)
+        static thread_local std::vector<uint16_t> h_query_padded;
+        h_query_padded.assign(64 * 16, 0);
+        for (int i = 0; i < 64; ++i)
+        {
+            h_query_padded[i * 16 + 0] = Float32ToFp16(query_vector[i]);
+        }
+        aclrtMemcpyAsync(d_query, 64 * 16 * sizeof(uint16_t), h_query_padded.data(),
+                         64 * 16 * sizeof(uint16_t), ACL_MEMCPY_HOST_TO_DEVICE, stream);
+
+        // 2. Prepare Task Data
+        // LowLevelMatMul 的参考实现只覆盖较小矩阵。
+        // 这里如果把整桶最多 1024 行一次性塞进单个 task，会把 A1/A2/CO1 的片上 buffer 放大到非常激进的规模。
+        // 因此 host 侧将每个 bucket 切成多个 row-tile task，复用同一个 kernel。
+        static thread_local std::vector<BatchTaskData> h_tasks;
+        h_tasks.clear();
+        h_tasks.reserve(GetMaxKernelTasksPerBatch());
+
+        size_t current_res_offset = 0;
+
+        for (uint32_t bid : bucket_ids)
+        {
+            auto &meta = g_bucket_metas[bid];
+            if (meta.doc_num == 0)
+            {
+                current_res_offset += max_doc_per_bucket * 16 * sizeof(float);
+                continue;
+            }
+
+            for (uint32_t row_begin = 0; row_begin < meta.doc_num; row_begin += kKernelRowTile)
+            {
+                const uint32_t tile_rows = std::min<uint32_t>(kKernelRowTile, meta.doc_num - row_begin);
+                BatchTaskData task;
+                task.offset_A = static_cast<uint32_t>(meta.byte_offset +
+                                static_cast<size_t>(row_begin) * vector_dim * sizeof(uint16_t));
+                task.offset_C = static_cast<uint32_t>(current_res_offset +
+                                static_cast<size_t>(row_begin) * 16 * sizeof(float));
+                task.m = tile_rows;
+                h_tasks.push_back(task);
+            }
+            current_res_offset += max_doc_per_bucket * 16 * sizeof(float);
+        }
+
+        if (h_tasks.empty())
+            return;
+
+        const size_t max_tasks = GetMaxKernelTasksPerBatch();
+        if (h_tasks.size() > max_tasks)
+        {
+            std::cerr << "[NPU] Too many kernel tasks in one batch: "
+                      << h_tasks.size() << " > " << max_tasks << std::endl;
+            return;
+        }
+
+        // 3. Copy Task Data to Device
+        size_t task_data_size = h_tasks.size() * sizeof(BatchTaskData);
+        aclrtMemcpyAsync(d_task, task_data_size, h_tasks.data(), task_data_size, ACL_MEMCPY_HOST_TO_DEVICE, stream);
+
+        // 4. Single Launch
+        ACLRT_LAUNCH_KERNEL(kernel_vector_mmad)(
+            (uint32_t)h_tasks.size(), stream,
+            d_query,         
+            d_task,          
+            dev_base_doc,    
+            dev_base_result, 
+            64);             
+
+        // 5. Async Result Copy (Device -> Host Pinned Buffer)
+        size_t total_result_bytes = bucket_ids.size() * max_doc_per_bucket * 16 * sizeof(float);
+        aclrtMemcpyAsync(host_output_buffer, total_result_bytes, 
+                         dev_base_result, total_result_bytes, 
+                         ACL_MEMCPY_DEVICE_TO_HOST, stream);
+
+        // 6. Async Flag Update (Device False -> Host Flag)
+        // 只有当前面所有操作完成后，Flag 才会变为 false
+        aclrtMemcpyAsync((void*)g_group_ctxs[group_id].h_flag, sizeof(bool),
+                         g_group_ctxs[group_id].d_flag_false, sizeof(bool),
+                         ACL_MEMCPY_DEVICE_TO_HOST, stream);
+    }
+
+    void DebugVerifyBatchResults(const std::vector<uint32_t> &bucket_ids,
+                                 const float *query_vector,
+                                 const float *host_output_buffer,
+                                 int group_id)
+    {
+        if (npu_debug_verify == 0 || !query_vector || !host_output_buffer || !g_host_vectors)
+        {
+            return;
+        }
+
+        const int report_limit = npu_debug_verify_max_report;
+        const int dim = vector_dim;
+        size_t checked_docs = 0;
+        size_t mismatch_count = 0;
+        float max_abs_err = 0.0f;
+        float max_rel_err = 0.0f;
+        DebugMismatch worst_case;
+        std::vector<DebugMismatch> mismatch_reports;
+        if (report_limit > 0)
+        {
+            mismatch_reports.reserve(report_limit);
+        }
+
+        for (size_t bucket_idx = 0; bucket_idx < bucket_ids.size(); ++bucket_idx)
+        {
+            const uint32_t bucket_id = bucket_ids[bucket_idx];
+            if (bucket_id >= g_bucket_metas.size())
+            {
+                continue;
+            }
+
+            const BucketMeta &meta = g_bucket_metas[bucket_id];
+            const uint32_t *doc_ids = g_bucket_doc_ids.data() + meta.doc_id_offset;
+            const float *npu_scores = host_output_buffer + bucket_idx * max_doc_per_bucket * 16;
+
+            for (uint32_t local_doc_idx = 0; local_doc_idx < meta.doc_num; ++local_doc_idx)
+            {
+                const uint32_t global_doc_id = doc_ids[local_doc_idx];
+                const float *doc_vec = g_host_vectors + static_cast<size_t>(global_doc_id) * dim;
+                const float cpu_score = ComputeCpuDotProduct(doc_vec, query_vector, dim);
+                const float npu_score = npu_scores[static_cast<size_t>(local_doc_idx) * 16];
+                const bool invalid = !std::isfinite(cpu_score) || !std::isfinite(npu_score);
+                const float abs_err = invalid ? std::numeric_limits<float>::infinity()
+                                              : std::fabs(cpu_score - npu_score);
+                const float ref_scale = invalid ? 0.0f
+                                                : std::max(std::fabs(cpu_score), std::fabs(npu_score));
+                const float allowed_err = npu_debug_verify_abs_tol + npu_debug_verify_rel_tol * ref_scale;
+                const float rel_err = invalid ? std::numeric_limits<float>::infinity()
+                                              : abs_err / std::max(1e-6f, std::fabs(cpu_score));
+
+                ++checked_docs;
+                if (checked_docs == 1 || abs_err > max_abs_err)
+                {
+                    max_abs_err = abs_err;
+                    max_rel_err = rel_err;
+                    worst_case = {bucket_id, local_doc_idx, global_doc_id, cpu_score, npu_score, abs_err, allowed_err};
+                }
+                else if (rel_err > max_rel_err)
+                {
+                    max_rel_err = rel_err;
+                }
+
+                if (invalid || abs_err > allowed_err)
+                {
+                    ++mismatch_count;
+                    if (report_limit > 0 && static_cast<int>(mismatch_reports.size()) < report_limit)
+                    {
+                        mismatch_reports.push_back({bucket_id, local_doc_idx, global_doc_id,
+                                                    cpu_score, npu_score, abs_err, allowed_err});
+                    }
+                }
+            }
+        }
+
+        const uint64_t batch_id = g_debug_batch_counter.fetch_add(1, std::memory_order_relaxed) + 1;
+        std::lock_guard<std::mutex> lock(g_debug_log_mutex);
+        std::cout << std::fixed
+                  << "[NPU][Debug] group=" << group_id
+                  << " batch=" << batch_id
+                  << " buckets=" << bucket_ids.size()
+                  << " docs=" << checked_docs
+                  << " mismatches=" << mismatch_count
+                  << " max_abs_err=" << max_abs_err
+                  << " max_rel_err=" << max_rel_err
+                  << std::endl;
+
+        if (checked_docs > 0)
+        {
+            std::cout << "[NPU][Debug] worst_case"
+                      << " bucket=" << worst_case.bucket_id
+                      << " local_doc=" << worst_case.local_doc_idx
+                      << " global_doc=" << worst_case.global_doc_id
+                      << " cpu=" << worst_case.cpu_score
+                      << " npu=" << worst_case.npu_score
+                      << " abs_err=" << worst_case.abs_err
+                      << " allowed=" << worst_case.allowed_err
+                      << std::endl;
+        }
+
+        for (const auto &item : mismatch_reports)
+        {
+            std::cout << "[NPU][Debug][Mismatch]"
+                      << " bucket=" << item.bucket_id
+                      << " local_doc=" << item.local_doc_idx
+                      << " global_doc=" << item.global_doc_id
+                      << " cpu=" << item.cpu_score
+                      << " npu=" << item.npu_score
+                      << " abs_err=" << item.abs_err
+                      << " allowed=" << item.allowed_err
+                      << std::endl;
+        }
+    }
+}
