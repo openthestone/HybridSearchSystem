@@ -33,25 +33,6 @@ static int g_loaded_total_tag_num = 0;
 static int g_loaded_total_bucket_num = 0;
 static int g_loaded_max_doc_per_bucket = 0;
 
-static int RunClusteringStageInProcess(const std::string& name,
-                                       std::vector<std::string> args,
-                                       int (*fn)(int, char**)) {
-    std::vector<char*> argv;
-    argv.reserve(args.size());
-    for (auto& item : args) {
-        argv.push_back(const_cast<char*>(item.c_str()));
-    }
-
-    std::cout << "[Clustering] RUN " << name << "\n";
-    int rc = fn(static_cast<int>(argv.size()), argv.data());
-    if (rc != 0) {
-        std::cerr << "[Clustering] FAIL " << name << ", rc=" << rc << "\n";
-    } else {
-        std::cout << "[Clustering] OK   " << name << "\n";
-    }
-    return rc;
-}
-
 static fs::path ResolveProjectRoot() {
     std::error_code ec;
     fs::path cur = fs::current_path(ec);
@@ -166,113 +147,12 @@ static bool SaveCentroidsDefaultBin(const fs::path& path,
     return true;
 }
 
-static void EnforceBucketCapacityRoundRobin(std::vector<uint32_t>& assignments,
-                                            int bucket_num,
-                                            int max_doc_per_bucket) {
-    if (bucket_num <= 0 || max_doc_per_bucket <= 0 || assignments.empty()) return;
-
-#if defined(_OPENMP)
-#pragma omp parallel for if (assignments.size() > 4096)
-#endif
-    for (size_t i = 0; i < assignments.size(); ++i) {
-        uint32_t bid = assignments[i];
-        if (bid >= static_cast<uint32_t>(bucket_num)) {
-            assignments[i] = bid % static_cast<uint32_t>(bucket_num);
-        }
-    }
-
-    std::vector<int> counts(static_cast<size_t>(bucket_num), 0);
-    std::vector<size_t> overflow_indices;
-    overflow_indices.reserve(assignments.size() / 20 + 1);
-
-    for (size_t i = 0; i < assignments.size(); ++i) {
-        const uint32_t bid = assignments[i];
-        if (counts[static_cast<size_t>(bid)] < max_doc_per_bucket) {
-            counts[static_cast<size_t>(bid)]++;
-        } else {
-            overflow_indices.push_back(i);
-        }
-    }
-
-    if (overflow_indices.empty()) return;
-
-    std::vector<int> candidate_buckets;
-    candidate_buckets.reserve(static_cast<size_t>(bucket_num));
-    for (int bid = 0; bid < bucket_num; ++bid) {
-        if (counts[static_cast<size_t>(bid)] < max_doc_per_bucket) {
-            candidate_buckets.push_back(bid);
-        }
-    }
-
-    size_t candidate_idx = 0;
-    for (size_t doc_idx : overflow_indices) {
-        while (candidate_idx < candidate_buckets.size() &&
-               counts[static_cast<size_t>(candidate_buckets[candidate_idx])] >= max_doc_per_bucket) {
-            ++candidate_idx;
-        }
-        if (candidate_idx >= candidate_buckets.size()) {
-            break;
-        }
-
-        const int new_bid = candidate_buckets[candidate_idx];
-        assignments[doc_idx] = static_cast<uint32_t>(new_bid);
-        counts[static_cast<size_t>(new_bid)]++;
-    }
-}
-
-
-static std::vector<std::vector<int>> BuildCentroidNeighborOrder(const std::vector<float>& centroids,
-                                                                int bucket_num,
-                                                                int vector_dim) {
-    std::vector<std::vector<int>> neighbors(static_cast<size_t>(bucket_num));
-    if (bucket_num <= 1 || vector_dim <= 0) {
-        return neighbors;
-    }
-
-#if defined(_OPENMP)
-#pragma omp parallel for schedule(static)
-#endif
-    for (int bid = 0; bid < bucket_num; ++bid) {
-        std::vector<std::pair<float, int>> dist_to_others;
-        dist_to_others.reserve(static_cast<size_t>(bucket_num - 1));
-
-        const float* center_i = centroids.data() + static_cast<size_t>(bid) * static_cast<size_t>(vector_dim);
-        for (int other = 0; other < bucket_num; ++other) {
-            if (other == bid) continue;
-            const float* center_j = centroids.data() + static_cast<size_t>(other) * static_cast<size_t>(vector_dim);
-
-            float dist = 0.0f;
-            for (int d = 0; d < vector_dim; ++d) {
-                const float diff = center_i[d] - center_j[d];
-                dist += diff * diff;
-            }
-            dist_to_others.emplace_back(dist, other);
-        }
-
-        std::sort(dist_to_others.begin(), dist_to_others.end(),
-                  [](const std::pair<float, int>& lhs, const std::pair<float, int>& rhs) {
-                      if (lhs.first != rhs.first) return lhs.first < rhs.first;
-                      return lhs.second < rhs.second;
-                  });
-
-        auto& cur_neighbors = neighbors[static_cast<size_t>(bid)];
-        cur_neighbors.reserve(dist_to_others.size());
-        for (const auto& item : dist_to_others) {
-            cur_neighbors.push_back(item.second);
-        }
-    }
-
-    return neighbors;
-}
-
-
 static bool SaveBucketsDocIdsBins(const fs::path& buckets_dir,
                                   const std::vector<uint32_t>& assignments,
                                   const std::vector<float>& centroids,
                                   int bucket_num,
                                   int total_docs,
-                                  int vector_dim,
-                                  int bucket_capacity) {
+                                  int vector_dim) {
     if (bucket_num <= 0 || total_docs <= 0) return false;
     if (assignments.size() != static_cast<size_t>(total_docs)) return false;
     if (vector_dim <= 0) return false;
@@ -346,10 +226,6 @@ static bool SaveBucketsDocIdsBins(const fs::path& buckets_dir,
         }
         flat_doc_ids[static_cast<size_t>(pos)] = static_cast<int32_t>(i + 1);
     }
-
-    const std::vector<std::vector<int>> centroid_neighbors =
-        BuildCentroidNeighborOrder(centroids, bucket_num, vector_dim);
-
     std::atomic<bool> write_failed(false);
 #if defined(_OPENMP)
 #pragma omp parallel for schedule(dynamic, 1)
@@ -369,78 +245,19 @@ static bool SaveBucketsDocIdsBins(const fs::path& buckets_dir,
         const uint64_t begin = bucket_offsets[static_cast<size_t>(bid)];
         const uint64_t end = bucket_offsets[static_cast<size_t>(bid + 1)];
         const int64_t base_n = static_cast<int64_t>(end - begin);
-
-        int64_t target_n = base_n;
-        if (bucket_capacity > 0) {
-            target_n = static_cast<int64_t>(bucket_capacity);
-        }
-
-        out.write(reinterpret_cast<const char*>(&target_n), sizeof(target_n));
+        out.write(reinterpret_cast<const char*>(&base_n), sizeof(base_n));
         if (!out) {
             write_failed.store(true, std::memory_order_relaxed);
             continue;
         }
 
-        if (target_n <= 0) {
+        if (base_n <= 0) {
             continue;
         }
 
-        if (base_n >= target_n) {
-            const int32_t* ptr = flat_doc_ids.data() + static_cast<size_t>(begin);
-            out.write(reinterpret_cast<const char*>(ptr),
-                      static_cast<std::streamsize>(target_n * static_cast<int64_t>(sizeof(int32_t))));
-            if (!out) {
-                write_failed.store(true, std::memory_order_relaxed);
-            }
-            continue;
-        }
-
-        std::vector<int32_t> padded_docs(static_cast<size_t>(target_n), 0);
-        int64_t filled = 0;
-        if (base_n > 0) {
-            const int32_t* src = flat_doc_ids.data() + static_cast<size_t>(begin);
-            std::copy(src, src + static_cast<size_t>(base_n), padded_docs.data());
-            filled = base_n;
-        }
-
-        const auto& near_buckets = centroid_neighbors[static_cast<size_t>(bid)];
-        for (int nbid : near_buckets) {
-            if (filled >= target_n) break;
-
-            const uint64_t nb_begin = bucket_offsets[static_cast<size_t>(nbid)];
-            const uint64_t nb_end = bucket_offsets[static_cast<size_t>(nbid + 1)];
-            const int64_t nb_size = static_cast<int64_t>(nb_end - nb_begin);
-            if (nb_size <= 0) continue;
-
-            const int32_t* nb_src = flat_doc_ids.data() + static_cast<size_t>(nb_begin);
-            const int64_t remain = target_n - filled;
-            const int64_t take = std::min<int64_t>(remain, nb_size);
-            const int64_t start = (static_cast<int64_t>(bid) * 1315423911LL + filled) % nb_size;
-            for (int64_t j = 0; j < take; ++j) {
-                padded_docs[static_cast<size_t>(filled + j)] =
-                    nb_src[static_cast<size_t>((start + j) % nb_size)];
-            }
-            filled += take;
-        }
-
-        if (filled < target_n && base_n > 0) {
-            for (int64_t i = filled; i < target_n; ++i) {
-                padded_docs[static_cast<size_t>(i)] =
-                    padded_docs[static_cast<size_t>((i - filled) % base_n)];
-            }
-            filled = target_n;
-        }
-
-        if (filled < target_n) {
-            const int64_t safe_total_docs = std::max<int64_t>(1, static_cast<int64_t>(total_docs));
-            for (int64_t i = filled; i < target_n; ++i) {
-                padded_docs[static_cast<size_t>(i)] =
-                    static_cast<int32_t>((static_cast<int64_t>(bid) + i) % safe_total_docs + 1);
-            }
-        }
-
-        out.write(reinterpret_cast<const char*>(padded_docs.data()),
-                  static_cast<std::streamsize>(target_n * static_cast<int64_t>(sizeof(int32_t))));
+        const int32_t* ptr = flat_doc_ids.data() + static_cast<size_t>(begin);
+        out.write(reinterpret_cast<const char*>(ptr),
+                  static_cast<std::streamsize>(base_n * static_cast<int64_t>(sizeof(int32_t))));
         if (!out) {
             write_failed.store(true, std::memory_order_relaxed);
         }
@@ -524,8 +341,6 @@ static bool RunBalancedSuperKMeansInMain(const fs::path& project_root,
             return false;
         }
 
-        EnforceBucketCapacityRoundRobin(assignments, total_bucket_num, max_doc_per_bucket);
-
         const fs::path centroids_file = project_root / "centroids.bin";
         const fs::path buckets_dir = project_root / "buckets";
 
@@ -538,8 +353,7 @@ static bool RunBalancedSuperKMeansInMain(const fs::path& project_root,
                                  centroids,
                                  total_bucket_num,
                                  total_doc_num,
-                                 vector_dim,
-                                 max_doc_per_bucket)) {
+                                 vector_dim)) {
             std::cerr << "[Clustering] 写入 buckets 失败: " << buckets_dir << "\n";
             return false;
         }

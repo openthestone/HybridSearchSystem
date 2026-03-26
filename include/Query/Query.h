@@ -121,7 +121,7 @@ struct QueryResult
                            "Query.h:merge_batch.merged");
         scratch_buffer.insert(scratch_buffer.end(), topk_results.begin(), topk_results.end());
         scratch_buffer.insert(scratch_buffer.end(), new_items.begin(), new_items.end());
-        DeduplicateAndKeepTopK(scratch_buffer, target_k);
+        KeepTopK(scratch_buffer, target_k);
         topk_results.swap(scratch_buffer);
     }
 };

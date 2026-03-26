@@ -645,9 +645,8 @@ private:
             }
         }
 
-        // 多桶归属场景下，同一 doc 可能在当前 core 负责的多个桶里重复出现。
-        // 先在 core 内去重，再截断到局部 Top-K 后交给 leader。
-        QueryResult::DeduplicateAndKeepTopK(my_res.items, current_query_->expanded_k);
+        // 当前桶划分保证 doc 唯一归属；此处仅做局部 Top-K 截断。
+        QueryResult::KeepTopK(my_res.items, current_query_->expanded_k);
         RecordCapacityGrowth<QueryResult::Item>(session,
                                                kThreadDocResultsItemsLabel,
                                                my_items_old_capacity,
@@ -665,7 +664,7 @@ private:
         for (const auto &tr : thread_doc_results_)
             all_items.insert(all_items.end(), tr.items.begin(), tr.items.end());
 
-        QueryResult::DeduplicateAndKeepTopK(all_items, k);
+        QueryResult::KeepTopK(all_items, k);
         current_query_->merge_batch_results(all_items);
         RecordCapacityGrowth<QueryResult::Item>(session,
                                                kAllItemsLabel,
