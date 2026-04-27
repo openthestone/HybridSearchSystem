@@ -8,6 +8,6 @@ extern "C" __global__ __aicore__ void kernel_vector_mmad(GM_ADDR queryMatrix, GM
     // MatrixB (Query) -> queryMatrix
     // MatrixA (Docs)  -> baseDocAddr 
     // MatrixC (Res)   -> baseResultAddr 
-    op.Init(queryMatrix, taskBuffer, baseDocAddr, baseResultAddr);
+    op.Init(queryMatrix, taskBuffer, baseDocAddr, baseResultAddr, k);
     op.Process();
 }

@@ -10,6 +10,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "utils/DataReader.h"
@@ -142,6 +143,51 @@ inline BucketDocTable BuildBucketDocTableFromOffsets(const std::vector<uint64_t>
     return bucket_doc_table;
 }
 
+inline TwoLevelBucketLayout BuildTwoLevelBucketLayout(BucketDocTable level_1_bucket_doc_table,
+                                                      int max_doc_per_bucket_level_2)
+{
+    if (max_doc_per_bucket_level_2 <= 0)
+    {
+        throw std::invalid_argument("[Clustering] max_doc_per_bucket_level_2 must be > 0.");
+    }
+
+    TwoLevelBucketLayout layout;
+    layout.level_1_bucket_doc_table = std::move(level_1_bucket_doc_table);
+    layout.level_1_to_level_2_offsets.reserve(layout.level_1_bucket_doc_table.size() + 1);
+    layout.level_1_to_level_2_offsets.push_back(0);
+
+    for (size_t level_1_bucket_id = 0;
+         level_1_bucket_id < layout.level_1_bucket_doc_table.size();
+         ++level_1_bucket_id)
+    {
+        const std::vector<uint32_t> &doc_ids = layout.level_1_bucket_doc_table[level_1_bucket_id];
+        size_t cursor = 0;
+        while (cursor < doc_ids.size())
+        {
+            const size_t chunk_end = std::min(cursor + static_cast<size_t>(max_doc_per_bucket_level_2),
+                                              doc_ids.size());
+            std::vector<uint32_t> level_2_docs;
+            level_2_docs.reserve(chunk_end - cursor);
+            for (size_t i = cursor; i < chunk_end; ++i)
+            {
+                const uint32_t doc_id = doc_ids[i];
+                if (doc_id >= static_cast<uint32_t>(total_doc_num))
+                {
+                    throw std::out_of_range("[Clustering] level-1 bucket contains an invalid doc_id.");
+                }
+                level_2_docs.push_back(doc_id);
+            }
+            layout.level_2_bucket_doc_table.push_back(std::move(level_2_docs));
+            cursor = chunk_end;
+        }
+
+        layout.level_1_to_level_2_offsets.push_back(
+            static_cast<uint32_t>(layout.level_2_bucket_doc_table.size()));
+    }
+
+    return layout;
+}
+
 inline size_t CountStoredDocRefs(const BucketDocTable &bucket_doc_table)
 {
     size_t total_refs = 0;
@@ -160,26 +206,18 @@ inline bool ValidatePreparedQueriesAgainstPrealloc(const std::vector<DataReader:
 
     for (const auto &prepared : queries)
     {
-        const long long expanded_k =
-            static_cast<long long>(std::max(prepared.top_k, 0)) * static_cast<long long>(k_expand_param);
-        if (expanded_k > static_cast<long long>(std::numeric_limits<int>::max()))
-        {
-            std::cerr << "[Config] Error: query line " << prepared.line_no
-                      << " has expanded_k=" << expanded_k
-                      << ", which exceeds int range." << std::endl;
-            return false;
-        }
-        if (expanded_k > static_cast<long long>(max_query_topk_prealloc))
+        int expanded_k_value = 0;
+        if (!ComputeExpandedKFromTopK(prepared.top_k, expanded_k_value))
         {
             std::cerr << "[Config] Error: query line " << prepared.line_no
                       << " has top_k=" << prepared.top_k
-                      << ", expanded_k=" << expanded_k
-                      << ", but max_query_topk_prealloc=" << max_query_topk_prealloc
-                      << ". Increase max_query_topk_prealloc (it is the expanded_k preallocation upper bound)."
+                      << ", k_expand_param=" << k_expand_param
+                      << ", and expanded_k exceeds int range."
                       << std::endl;
             return false;
         }
 
+        const long long expanded_k = static_cast<long long>(expanded_k_value);
         if (prepared.top_k > max_seen_top_k)
         {
             max_seen_top_k = prepared.top_k;
@@ -189,6 +227,16 @@ inline bool ValidatePreparedQueriesAgainstPrealloc(const std::vector<DataReader:
             max_seen_expanded_k = expanded_k;
             max_seen_line_no = prepared.line_no;
         }
+    }
+
+    if (max_seen_expanded_k > static_cast<long long>(max_query_topk_prealloc))
+    {
+        const int adjusted = ClampSizeTToInt(static_cast<size_t>(max_seen_expanded_k));
+        std::cout << "[Config] Warning: max_query_topk_prealloc=" << max_query_topk_prealloc
+                  << " is below max query expanded_k=" << max_seen_expanded_k
+                  << " (line " << max_seen_line_no << "); auto-adjusting to "
+                  << adjusted << std::endl;
+        max_query_topk_prealloc = adjusted;
     }
 
     std::cout << "[Query] top_k max=" << max_seen_top_k
@@ -266,6 +314,55 @@ inline bool EnsureOutputDirectory(const fs::path &dir)
                   << ", error=" << ec.message() << "\n";
         return false;
     }
+    return true;
+}
+
+inline bool WriteQueryLoadDiagnosticsFiles(const fs::path &result_root,
+                                           const DataReader::QueryLoadDiagnostics &diagnostics)
+{
+    const fs::path log_dir = result_root / "log";
+    return EnsureOutputDirectory(log_dir) &&
+           WriteMetricFile(log_dir,
+                           "query_missing_syntax_filter.txt",
+                           diagnostics.missing_syntax_filter_queries) &&
+           WriteMetricFile(log_dir,
+                           "query_invalid_syntax_filter.txt",
+                           diagnostics.invalid_syntax_filter_queries) &&
+           WriteMetricFile(log_dir,
+                           "query_missing_vector.txt",
+                           diagnostics.missing_vector_queries);
+}
+
+inline bool WritePreparedQueryFilterFile(const fs::path &result_root,
+                                         const std::vector<DataReader::PreparedQuery> &queries)
+{
+    const fs::path log_dir = result_root / "log";
+    if (!EnsureOutputDirectory(log_dir))
+    {
+        return false;
+    }
+
+    const fs::path output_file = log_dir / "filter.txt";
+    std::ofstream out(output_file, std::ios::out | std::ios::trunc);
+    if (!out.is_open())
+    {
+        std::cerr << "[Writer] Failed to open filter file: " << output_file << "\n";
+        return false;
+    }
+
+    for (const auto &query : queries)
+    {
+        out << query.filter_expr << '\n';
+    }
+
+    if (!out.good())
+    {
+        std::cerr << "[Writer] Failed while writing filter file: " << output_file << "\n";
+        return false;
+    }
+
+    std::cout << "[Loader] Query boolean filters written before processing. file="
+              << output_file << ", count=" << queries.size() << "\n";
     return true;
 }
 } // namespace RunSupport

@@ -19,6 +19,17 @@
 #include "AlignedAllocator.h"
 #include "InputDataset.h"
 
+// ---- §5.2 Global Static Zero Bitmap ----
+// 所有桶共享同一个只读全0位图块，永久驻留L1 Cache。
+// 避免 absent tag 时加载各桶私有零行造成的缓存颠簸。
+// 最大 stride = ceil(10M / 64) = 156250 uint64_t ≈ 1.25 MB.
+namespace BucketInternal {
+constexpr size_t kGlobalZeroBitmapMaxStride = (10'000'000 + 63) / 64;
+extern uint64_t g_global_zero_bitmap[kGlobalZeroBitmapMaxStride];
+// Global all-ones bitmap for inverted absent tags (NOT of global zero = all ones)
+extern uint64_t g_global_ones_bitmap[kGlobalZeroBitmapMaxStride];
+}  // namespace BucketInternal
+
 class Bucket
 {
 public:
@@ -130,16 +141,19 @@ public:
 
             // 使用 NEON SIMD 加速向量模长计算
 #if defined(__aarch64__) || defined(__arm__)
-            // 假设 vector_dim 是 4 的倍数 (例如 32)
-            float32x4_t v_sum = vdupq_n_f32(0.0f);
-            for (; d + 3 < vector_dim; d += 4)
+            // ---- NEON 256-bit: 8 floats/iteration (2x float32x4_t) ----
+            float32x4_t v_sum0 = vdupq_n_f32(0.0f);
+            float32x4_t v_sum1 = vdupq_n_f32(0.0f);
+            for (; d + 7 < vector_dim; d += 8)
             {
-                float32x4_t v = vld1q_f32(vec_ptr + d);
+                float32x4_t v0 = vld1q_f32(vec_ptr + d);
+                float32x4_t v1 = vld1q_f32(vec_ptr + d + 4);
                 // Fused Multiply-Add: v_sum += v * v
-                v_sum = vmlaq_f32(v_sum, v, v);
+                v_sum0 = vmlaq_f32(v_sum0, v0, v0);
+                v_sum1 = vmlaq_f32(v_sum1, v1, v1);
             }
-            // 归约求和
-            norm_sq = vaddvq_f32(v_sum);
+            // 归约求和：256-bit -> 128-bit -> scalar
+            norm_sq = vaddvq_f32(v_sum0) + vaddvq_f32(v_sum1);
 #endif
             // 处理剩余部分
             for (; d < vector_dim; ++d)
@@ -212,16 +226,73 @@ public:
 
     const uint64_t *get_tag_bits(uint32_t tag_id) const
     {
-        if (tag_id >= total_tag_num)
-            return &bitmap_data_[0];
-        uint32_t offset = tag_offsets_[tag_id];
+        if (tag_id >= (uint32_t)total_tag_num || tag_offsets_u16_.empty())
+            return BucketInternal::g_global_zero_bitmap;
 
-        // 如果 offset 为 0，说明该 tag 指向哨兵行（本桶无此 tag），返回全 0 行
-        if (offset == 0)
-            return &bitmap_data_[0];
+        uint16_t slot = tag_offsets_u16_[tag_id];
+        if (slot == 0)
+            return BucketInternal::g_global_zero_bitmap;
 
-        return &bitmap_data_[offset];
+        // slot 是 1-based 索引，bitmap_data_ 中第 (slot-1) 个 tag 的起始位置
+        return &bitmap_data_[static_cast<size_t>(slot - 1) * stride_];
     }
+
+    /**
+     * @brief 双流有序归并批量查找：将 sorted_query_tags 与 sorted_tag_ids_ 归并，
+     *        结果写入 out_ptrs[i] = 对应 tag 的 bitmap 指针（未找到则为 kZero）。
+     * @param sorted_query_tags 已排序的查询 tag_id 数组
+     * @param out_ptrs 输出数组，大小必须 >= sorted_query_tags.size()
+     * @param kZero 全零哨兵指针
+     *
+     * 优势：sorted_tag_ids_ 通常只有 ~200 个元素（800 bytes，全在 L1），
+     * 归并是 O(n+m) 顺序扫描，比 n 次随机访问 tag_offsets_u16_（70KB）更 cache 友好。
+     */
+    void batch_get_tag_bits_sorted(const uint32_t *sorted_query_tags,
+                                   uint32_t query_tag_count,
+                                   const uint64_t **out_ptrs,
+                                   const uint64_t *kZero) const
+    {
+        if (valid_tag_count_ == 0 || query_tag_count == 0)
+        {
+            for (uint32_t i = 0; i < query_tag_count; ++i)
+                out_ptrs[i] = kZero;
+            return;
+        }
+
+        const uint32_t *st = sorted_tag_ids_.data();
+        const uint32_t st_count = valid_tag_count_;
+        const uint64_t *bd = bitmap_data_.data();
+
+        uint32_t qi = 0, si = 0;
+        while (qi < query_tag_count && si < st_count)
+        {
+            uint32_t qt = sorted_query_tags[qi];
+            uint32_t st_id = st[si];
+            if (qt == st_id)
+            {
+                out_ptrs[qi] = bd + static_cast<size_t>(si) * stride_;
+                ++qi;
+                ++si;
+            }
+            else if (qt < st_id)
+            {
+                out_ptrs[qi] = kZero;
+                ++qi;
+            }
+            else
+            {
+                ++si;
+            }
+        }
+        for (; qi < query_tag_count; ++qi)
+            out_ptrs[qi] = kZero;
+    }
+
+    /**
+     * @brief 访问 sorted_tag_ids_ 和 valid_tag_count_，供外部排序查询 tag 使用
+     */
+    const std::vector<uint32_t> &get_sorted_tag_ids() const { return sorted_tag_ids_; }
+    uint32_t get_valid_tag_count() const { return valid_tag_count_; }
 
     // 获取预计算的 Norm 数组
     const float *get_norms() const { return precomputed_norms_.data(); }
@@ -232,10 +303,17 @@ public:
 
     bool Serialize(std::ofstream &out) const
     {
+        return SerializeToStream(out);
+    }
+
+    bool SerializeToStream(std::ostream &out) const
+    {
+        // 紧凑格式：不序列化 tag_offsets_（140KB），而是序列化 sorted_tag_ids_ + bitmap_data_
         return DataReader::WriteBinaryExact(out, &doc_num_, sizeof(doc_num_)) &&
                DataReader::WriteBinaryExact(out, &stride_, sizeof(stride_)) &&
+               DataReader::WriteBinaryExact(out, &valid_tag_count_, sizeof(valid_tag_count_)) &&
                DataReader::WriteBinaryVector(out, global_ids_) &&
-               DataReader::WriteBinaryVector(out, tag_offsets_) &&
+               DataReader::WriteBinaryVector(out, sorted_tag_ids_) &&
                DataReader::WriteBinaryVector(out, bitmap_data_) &&
                DataReader::WriteBinaryVector(out, precomputed_norms_);
     }
@@ -246,8 +324,9 @@ public:
 
         if (!DataReader::ReadBinaryExact(in, &loaded.doc_num_, sizeof(loaded.doc_num_)) ||
             !DataReader::ReadBinaryExact(in, &loaded.stride_, sizeof(loaded.stride_)) ||
+            !DataReader::ReadBinaryExact(in, &loaded.valid_tag_count_, sizeof(loaded.valid_tag_count_)) ||
             !DataReader::ReadBinaryVector(in, loaded.global_ids_) ||
-            !DataReader::ReadBinaryVector(in, loaded.tag_offsets_) ||
+            !DataReader::ReadBinaryVector(in, loaded.sorted_tag_ids_) ||
             !DataReader::ReadBinaryVector(in, loaded.bitmap_data_) ||
             !DataReader::ReadBinaryVector(in, loaded.precomputed_norms_)) {
             return false;
@@ -260,14 +339,22 @@ public:
         if (loaded.global_ids_.size() != static_cast<size_t>(loaded.doc_num_)) {
             return false;
         }
-        if (loaded.tag_offsets_.size() != static_cast<size_t>(total_tag_num)) {
+        if (loaded.sorted_tag_ids_.size() != static_cast<size_t>(loaded.valid_tag_count_)) {
             return false;
         }
         if (loaded.precomputed_norms_.size() != static_cast<size_t>(loaded.doc_num_)) {
             return false;
         }
-        if (loaded.doc_num_ > 0 && loaded.bitmap_data_.size() < static_cast<size_t>(loaded.stride_)) {
+        if (loaded.valid_tag_count_ > 0 &&
+            loaded.bitmap_data_.size() != static_cast<size_t>(loaded.valid_tag_count_) * loaded.stride_) {
             return false;
+        }
+
+        // 重建 uint16_t 紧凑索引（1-based，0=absent）
+        loaded.tag_offsets_u16_.assign(total_tag_num, 0);
+        for (uint32_t i = 0; i < loaded.valid_tag_count_; ++i)
+        {
+            loaded.tag_offsets_u16_[loaded.sorted_tag_ids_[i]] = static_cast<uint16_t>(i + 1);
         }
 
         loaded.current_build_idx_ = loaded.doc_num_;
@@ -280,16 +367,78 @@ public:
         return global_ids_ == expected_global_ids;
     }
 
+public:
+    /**
+     * @brief 构建完成后调用：将 tag_offsets_ 转为紧凑 Sorted Body 布局
+     * 必须在所有 append_doc_tags() 完成后、序列化前调用一次。
+     * 保留 tag_offsets_ 用于 O(1) 查找，但 bitmap_data_ 按紧凑顺序排列。
+     */
+    void FinalizeTagLayout()
+    {
+        // 1. 收集所有有效 tag_id 并排序（tag_offsets_[tid] != 0 表示有效）
+        std::vector<std::pair<uint32_t, uint32_t>> tag_entries; // (tag_id, old_offset)
+        tag_entries.reserve(1024);
+        for (uint32_t tid = 0; tid < total_tag_num; ++tid)
+        {
+            if (tag_offsets_[tid] != 0)
+                tag_entries.push_back({tid, tag_offsets_[tid]});
+        }
+        std::sort(tag_entries.begin(), tag_entries.end());
+
+        valid_tag_count_ = static_cast<uint32_t>(tag_entries.size());
+
+        // 空桶：无有效 tag
+        if (valid_tag_count_ == 0)
+        {
+            tag_offsets_.clear();
+            tag_offsets_.shrink_to_fit();
+            bitmap_data_.clear();
+            bitmap_data_.shrink_to_fit();
+            sorted_tag_ids_.clear();
+            return;
+        }
+
+        // 2. 构建 sorted_tag_ids_ 并重排 bitmap_data_ 为紧凑连续布局
+        std::vector<uint64_t, AlignedAllocator<uint64_t>> new_bitmap;
+        new_bitmap.reserve(static_cast<size_t>(valid_tag_count_) * stride_);
+        sorted_tag_ids_.resize(valid_tag_count_);
+        for (uint32_t i = 0; i < valid_tag_count_; ++i)
+        {
+            sorted_tag_ids_[i] = tag_entries[i].first;
+            uint32_t old_off = tag_entries[i].second;
+            new_bitmap.insert(new_bitmap.end(),
+                             bitmap_data_.begin() + old_off,
+                             bitmap_data_.begin() + old_off + stride_);
+        }
+        bitmap_data_ = std::move(new_bitmap);
+
+        // 3. 构建 uint16_t 紧凑索引（1-based，0=absent）
+        tag_offsets_u16_.assign(total_tag_num, 0);
+        for (uint32_t i = 0; i < valid_tag_count_; ++i)
+        {
+            tag_offsets_u16_[sorted_tag_ids_[i]] = static_cast<uint16_t>(i + 1);
+        }
+
+        // 4. 释放旧 tag_offsets_
+        tag_offsets_.clear();
+        tag_offsets_.shrink_to_fit();
+    }
+
 private:
     uint32_t doc_num_;
     uint32_t stride_;
     uint32_t current_build_idx_;
     std::vector<uint32_t> global_ids_;
 
-    // 从 uint16_t 升级为 uint32_t，消除单桶 tag 种类过多时的溢出风险
+    // ---- 构建时临时使用（FinalizeTagLayout 后清空）----
     std::vector<uint32_t> tag_offsets_;
 
-    // 属性 bitmap 数据
+    // ---- 紧凑查询布局（FinalizeTagLayout 后生效）----
+    uint32_t valid_tag_count_ = 0;         // 有效 Tag 总数
+    std::vector<uint32_t> sorted_tag_ids_; // 升序排列的所有有效 Tag ID（用于序列化）
+    std::vector<uint16_t> tag_offsets_u16_; // uint16_t 紧凑索引，1-based（0=absent）
+
+    // 属性 bitmap 数据（FinalizeTagLayout 后按 sorted_tag_ids_ 顺序排列）
     std::vector<uint64_t, AlignedAllocator<uint64_t>> bitmap_data_;
 
     // 存储 0.5 * ||v||^2，用于 L2 距离修正
@@ -318,3 +467,9 @@ private:
         bitmap_data_.resize(new_start_idx + stride_, 0);
     }
 };
+
+// Definition of the global zero bitmap (all zeros, shared across all buckets)
+uint64_t BucketInternal::g_global_zero_bitmap[BucketInternal::kGlobalZeroBitmapMaxStride] = {};
+// Definition of the global all-ones bitmap (all ones, for NOT of absent tags)
+uint64_t BucketInternal::g_global_ones_bitmap[BucketInternal::kGlobalZeroBitmapMaxStride];
+namespace { const bool kGlobalOnesInit = []{ std::fill_n(BucketInternal::g_global_ones_bitmap, BucketInternal::kGlobalZeroBitmapMaxStride, ~0ULL); return true; }(); }

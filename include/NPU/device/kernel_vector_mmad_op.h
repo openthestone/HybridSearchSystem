@@ -3,8 +3,8 @@
 #include "device_common.h"
 
 /*
-    MatrixA是桶的数据矩阵（ceil(doc_num / 16) * 64 ）
-    MatrixB是查询矩阵（64*16）
+    MatrixA是桶的数据矩阵（ceil(doc_num / 16) * k）
+    MatrixB是查询矩阵（k*16）
     MatrixC是结果矩阵（ceil(doc_num / 16) * 16）
     三者都是HBM上的指针
 */
@@ -18,7 +18,8 @@ public:
     __aicore__ inline KernelVectorMmadOp() {}
 
     __aicore__ inline void Init(GM_ADDR MatrixB, GM_ADDR taskBuffer,
-                                GM_ADDR MatrixA, GM_ADDR MatrixC)
+                                GM_ADDR MatrixA, GM_ADDR MatrixC,
+                                uint32_t vectorDim)
     {
         // 1. 获取当前核的任务信息
         uint32_t taskId = AscendC::GetBlockIdx();
@@ -26,15 +27,15 @@ public:
         __gm__ BatchTaskData *currentTaskGm = &taskPtr[taskId];
 
         // 2. 解析任务参数
-        uint32_t task_offset_A = currentTaskGm->offset_A;
-        uint32_t task_offset_C = currentTaskGm->offset_C;
+        uint64_t task_offset_A = currentTaskGm->offset_A;
+        uint64_t task_offset_C = currentTaskGm->offset_C;
         
         // 维度定义
         // m: 当前桶的文档数量
-        // k: 向量维度 (64)
+        // k: 向量维度
         // n: 查询向量填充后的维度 (16)
         this->m = currentTaskGm->m; 
-        this->k = 64;
+        this->k = vectorDim;
         this->n = 16;
 
         // 计算 Buffer 大小 (需对齐到 16 以防止 DataCopy 越界)
@@ -52,9 +53,9 @@ public:
         // 严格遵循参考代码：KERNEL_TYPE_AIC_ONLY
         KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIC_ONLY);
         
-        aGM.SetGlobalBuffer((__gm__ half *)(MatrixA + (uint64_t)task_offset_A));
+        aGM.SetGlobalBuffer((__gm__ half *)(MatrixA + task_offset_A));
         bGM.SetGlobalBuffer((__gm__ half *)MatrixB);
-        cGM.SetGlobalBuffer((__gm__ float *)(MatrixC + (uint64_t)task_offset_C));
+        cGM.SetGlobalBuffer((__gm__ float *)(MatrixC + task_offset_C));
 
         // 4. 初始化 Pipe 和 Queue
         // 严格遵循参考代码：深度为 1 (单缓冲)
@@ -84,7 +85,7 @@ private:
         AscendC::LocalTensor<half> a1Local = inQueueA1.AllocTensor<half>();
         AscendC::LocalTensor<half> b1Local = inQueueB1.AllocTensor<half>();
 
-        // Matrix A: Doc Vectors [m, 64] -> ND2NZ
+        // Matrix A: Doc Vectors [m, k] -> ND2NZ
         AscendC::Nd2NzParams nd2nzA1Params;
         nd2nzA1Params.ndNum = 1;
         nd2nzA1Params.nValue = m;
@@ -96,7 +97,7 @@ private:
         nd2nzA1Params.dstNzMatrixStride = 0;
         AscendC::DataCopy(a1Local, aGM, nd2nzA1Params);
 
-        // Matrix B: Query Vector [64, 16] -> ND2NZ
+        // Matrix B: Query Vector [k, 16] -> ND2NZ
         AscendC::Nd2NzParams nd2nzB1Params;
         nd2nzB1Params.ndNum = 1;
         nd2nzB1Params.nValue = k;
@@ -180,12 +181,16 @@ private:
     __aicore__ inline void CopyOut()
     {
         AscendC::LocalTensor<float> c1Local = outQueueCO1.DeQue<float>();
-        
+
         AscendC::FixpipeParamsV220 fixpipeParams;
-        fixpipeParams.nSize = n;
+        // Only output column 0 (the dot-product score) to compact HBM layout.
+        // The MMAD computes n=16 columns (hardware block requirement), but
+        // only column 0 is the score. Setting nSize=1 extracts just that column,
+        // reducing D2H transfer by 16×.
+        fixpipeParams.nSize = 1;
         fixpipeParams.mSize = m;
         fixpipeParams.srcStride = m;
-        fixpipeParams.dstStride = n;
+        fixpipeParams.dstStride = 1;
 
         fixpipeParams.ndNum = 1;
         fixpipeParams.srcNdStride = 0;

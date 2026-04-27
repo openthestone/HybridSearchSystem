@@ -39,7 +39,7 @@ public:
     struct RuntimeParams {
         int total_doc_num{0};
         int total_tag_num{0};
-        int total_bucket_num{0};
+        int total_bucket_num_level_1{0};
         int vector_dim{0};
         int max_doc_per_bucket{0};
     };
@@ -67,13 +67,13 @@ public:
 
     void SetRuntimeParams(int total_doc_num,
                           int total_tag_num,
-                          int total_bucket_num,
+                          int total_bucket_num_level_1,
                           int vector_dim,
                           int max_doc_per_bucket) {
         std::lock_guard<std::mutex> lock(mu_);
         runtime_params_.total_doc_num = total_doc_num;
         runtime_params_.total_tag_num = total_tag_num;
-        runtime_params_.total_bucket_num = total_bucket_num;
+        runtime_params_.total_bucket_num_level_1 = total_bucket_num_level_1;
         runtime_params_.vector_dim = vector_dim;
         runtime_params_.max_doc_per_bucket = max_doc_per_bucket;
     }

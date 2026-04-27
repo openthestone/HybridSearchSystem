@@ -8,6 +8,8 @@
 #include <filesystem>
 #include <fstream>
 #include <stdexcept>
+#include <string>
+#include <utility>
 
 #include "utils/DataReader.h"
 #include "Bucket.h"
@@ -19,46 +21,60 @@
 class DataBaseCPU
 {
 public:
-    /**
-     * @brief 构造函数：初始化并构建整个索引系统
-     * @param dataset 包含所有元数据的输入集
-     * @param bucket_doc_table 每个桶包含的全局 doc_id 列表
-     */
-    DataBaseCPU(const InputDataset &dataset, const BucketDocTable &bucket_doc_table)
+    DataBaseCPU(const InputDataset &dataset, TwoLevelBucketLayout bucket_layout)
     {
         std::cout << "[DB] Starting Index Construction..." << std::endl;
 
-        BucketDocTable normalized_bucket_doc_table = NormalizeBucketDocTable(bucket_doc_table);
+        if (bucket_layout.Level1BucketCount() != static_cast<size_t>(total_bucket_num_level_1))
+        {
+            throw std::invalid_argument("[DB] level-1 bucket count does not match total_bucket_num_level_1.");
+        }
+        if (bucket_layout.Level2BucketCount() != static_cast<size_t>(total_bucket_num_level_2))
+        {
+            throw std::invalid_argument("[DB] level-2 bucket count does not match total_bucket_num_level_2.");
+        }
+        if (bucket_layout.level_1_to_level_2_offsets.size() != bucket_layout.Level1BucketCount() + 1)
+        {
+            throw std::invalid_argument("[DB] invalid level_1_to_level_2_offsets size.");
+        }
+        if (bucket_layout.level_1_to_level_2_offsets.back() != bucket_layout.Level2BucketCount())
+        {
+            throw std::invalid_argument("[DB] invalid level_1_to_level_2_offsets tail.");
+        }
 
-        // 将 dataset.vectors 转换成half并上传到 8 张 NPU 的 HBM 中
-        npuAPI::Init(dataset, normalized_bucket_doc_table);
+        ValidateQueryScoreSlotCapacities(bucket_layout.level_1_bucket_doc_table);
+
+        BucketDocTable normalized_level_2_bucket_doc_table =
+            NormalizeLevel2BucketDocTable(std::move(bucket_layout.level_2_bucket_doc_table));
+        level_1_to_level_2_offsets_ = std::move(bucket_layout.level_1_to_level_2_offsets);
+        level_1_bucket_layout_hash_ = ComputeBucketDocTableHash(bucket_layout.level_1_bucket_doc_table);
+        level_2_bucket_layout_hash_ = ComputeBucketDocTableHash(normalized_level_2_bucket_doc_table);
 
         // ==========================================
-        // 1. 存储桶中心向量
+        // 1. 存储一级桶中心向量
         // ==========================================
-        bucket_centroids_.resize(static_cast<size_t>(total_bucket_num) * static_cast<size_t>(vector_dim));
+        bucket_centroids_.resize(static_cast<size_t>(total_bucket_num_level_1) * static_cast<size_t>(vector_dim));
         std::memcpy(bucket_centroids_.data(),
                     dataset.bucket_centroids,
-                    static_cast<size_t>(total_bucket_num) * static_cast<size_t>(vector_dim) * sizeof(float));
+                    static_cast<size_t>(total_bucket_num_level_1) * static_cast<size_t>(vector_dim) * sizeof(float));
 
         // ==========================================
-        // 2. CPU 侧索引优先从文件加载，失败时回退到重建
+        // 2. CPU 侧索引：优先从文件加载，否则从 dataset 重建
         // ==========================================
-        if (TryLoadCpuIndexes(normalized_bucket_doc_table))
+        if (!TryLoadCpuIndexes(normalized_level_2_bucket_doc_table))
         {
-            std::cout << "[DB] CPU indexes loaded from cache files." << std::endl;
-            std::cout << "[DB] Index Construction Complete." << std::endl;
-            return;
+            std::cout << "[DB] CPU index cache unavailable. Rebuilding from dataset..." << std::endl;
+            BuildCpuIndexesFromDataset(dataset,
+                                       bucket_layout.level_1_bucket_doc_table,
+                                       normalized_level_2_bucket_doc_table);
+            if (!SaveCpuIndexes())
+            {
+                std::cout << "[DB] Warning: Failed to persist CPU indexes. "
+                          << "Next run will rebuild them again." << std::endl;
+            }
         }
 
-        std::cout << "[DB] CPU index cache unavailable. Rebuilding from dataset..." << std::endl;
-        BuildCpuIndexesFromDataset(dataset, normalized_bucket_doc_table);
-        if (!SaveCpuIndexes())
-        {
-            std::cout << "[DB] Warning: Failed to persist CPU indexes. "
-                      << "Next run will rebuild them again." << std::endl;
-        }
-
+        npuAPI::Init(dataset, normalized_level_2_bucket_doc_table);
         std::cout << "[DB] Index Construction Complete." << std::endl;
     }
 
@@ -69,15 +85,15 @@ public:
     }
 
     /**
-     * @brief 获取指定桶的引用
+     * @brief 获取指定二级桶的引用
      */
-    const Bucket &get_bucket(uint32_t bucket_id) const
+    const Bucket &get_bucket(uint32_t level_2_bucket_id) const
     {
-        return buckets_[bucket_id];
+        return buckets_[level_2_bucket_id];
     }
 
     /**
-     * @brief 获取桶级倒排索引
+     * @brief 获取一级桶级倒排索引
      */
     const BucketLevelIVF &get_bucket_level_ivf() const
     {
@@ -85,33 +101,108 @@ public:
     }
 
     /**
-     * @brief 获取所有桶中心向量的数组首地址
+     * @brief 获取所有一级桶中心向量的数组首地址
      */
     const float *get_centroids() const
     {
         return bucket_centroids_.data();
     }
 
-private:
-    static constexpr uint32_t kBucketIvfIndexFileVersion = 1;
-    static constexpr uint32_t kBucketIndexFileVersion = 1;
+    uint32_t get_level_2_bucket_begin(uint32_t level_1_bucket_id) const
+    {
+        return level_1_to_level_2_offsets_[level_1_bucket_id];
+    }
 
-    static DataReader::BucketIvfIndexFileHeaderDisk MakeBucketIvfIndexFileHeader(const BucketLevelIVF &ivf)
+    uint32_t get_level_2_bucket_end(uint32_t level_1_bucket_id) const
+    {
+        return level_1_to_level_2_offsets_[level_1_bucket_id + 1];
+    }
+
+    // Compute total number of L2 buckets for a contiguous range of L1 bucket IDs.
+    // Enables pre-allocation of L2 enumeration vector in caller.
+    uint32_t get_total_level_2_bucket_count(uint32_t level_1_bucket_id_first, uint32_t level_1_count) const
+    {
+        const uint32_t begin_offset = level_1_to_level_2_offsets_[level_1_bucket_id_first];
+        const uint32_t end_offset = level_1_to_level_2_offsets_[level_1_bucket_id_first + level_1_count];
+        return end_offset - begin_offset;
+    }
+
+private:
+    static constexpr uint32_t kBucketIvfIndexFileVersion = 2;
+    static constexpr uint32_t kBucketIndexFileVersion = 5;
+    static constexpr size_t kQueryScoreCols = 16;
+
+    static void ValidateQueryScoreSlotCapacities(const BucketDocTable &level_1_bucket_doc_table)
+    {
+        std::vector<size_t> level_1_doc_counts;
+        level_1_doc_counts.reserve(level_1_bucket_doc_table.size());
+        for (const auto &bucket_docs : level_1_bucket_doc_table)
+        {
+            level_1_doc_counts.push_back(bucket_docs.size());
+        }
+        std::sort(level_1_doc_counts.begin(), level_1_doc_counts.end(), std::greater<size_t>());
+
+        auto sum_top_doc_counts = [&](size_t top_n) -> size_t
+        {
+            const size_t limit = std::min(top_n, level_1_doc_counts.size());
+            size_t total_docs = 0;
+            for (size_t i = 0; i < limit; ++i)
+            {
+                total_docs += level_1_doc_counts[i];
+            }
+            return total_docs;
+        };
+
+        const size_t first_round_required_floats =
+            sum_top_doc_counts(static_cast<size_t>(std::max(valid_bucket_num_base_level_1, 0))) * kQueryScoreCols;
+        const size_t incremental_required_floats =
+            sum_top_doc_counts(static_cast<size_t>(std::max(valid_bucket_num_incremental_level_1, 0))) * kQueryScoreCols;
+
+        const size_t first_round_slot_capacity_floats =
+            static_cast<size_t>(valid_bucket_num_base_level_1) *
+            static_cast<size_t>(max_process_bucket_num_level_2) *
+            static_cast<size_t>(max_doc_per_bucket_level_2) *
+            kQueryScoreCols;
+        const size_t incremental_slot_capacity_floats =
+            static_cast<size_t>(valid_bucket_num_incremental_level_1) *
+            static_cast<size_t>(max_process_bucket_num_level_2) *
+            static_cast<size_t>(max_doc_per_bucket_level_2) *
+            kQueryScoreCols;
+
+        if (first_round_required_floats > first_round_slot_capacity_floats)
+        {
+            throw std::invalid_argument("[DB] first-round score slot capacity is insufficient: required_floats=" +
+                                        std::to_string(first_round_required_floats) +
+                                        ", capacity_floats=" +
+                                        std::to_string(first_round_slot_capacity_floats));
+        }
+        if (incremental_required_floats > incremental_slot_capacity_floats)
+        {
+            throw std::invalid_argument("[DB] incremental score slot capacity is insufficient: required_floats=" +
+                                        std::to_string(incremental_required_floats) +
+                                        ", capacity_floats=" +
+                                        std::to_string(incremental_slot_capacity_floats));
+        }
+    }
+
+    static DataReader::BucketIvfIndexFileHeaderDisk MakeBucketIvfIndexFileHeader(const BucketLevelIVF &ivf,
+                                                                                 uint64_t layout_hash)
     {
         DataReader::BucketIvfIndexFileHeaderDisk header{};
         const char magic[8] = "BIVFIDX";
         std::memcpy(header.magic, magic, sizeof(header.magic));
         header.version = kBucketIvfIndexFileVersion;
         header.total_tag_num = static_cast<uint32_t>(total_tag_num);
-        header.total_bucket_num = static_cast<uint32_t>(total_bucket_num);
+        header.total_bucket_num = static_cast<uint32_t>(total_bucket_num_level_1);
         header.cores_per_group = static_cast<uint32_t>(cores_per_group);
         header.cpu_cache_line_size = static_cast<uint32_t>(cpu_cache_line_size);
         header.buckets_per_core = ivf.get_buckets_per_core();
         header.aligned_stride = ivf.get_aligned_stride();
+        header.layout_hash = layout_hash;
         return header;
     }
 
-    static DataReader::BucketIndexFileHeaderDisk MakeBucketIndexFileHeader()
+    static DataReader::BucketIndexFileHeaderDisk MakeBucketIndexFileHeader(uint64_t layout_hash)
     {
         DataReader::BucketIndexFileHeaderDisk header{};
         const char magic[8] = "BKTIDX1";
@@ -119,92 +210,131 @@ private:
         header.version = kBucketIndexFileVersion;
         header.total_doc_num = static_cast<uint32_t>(total_doc_num);
         header.total_tag_num = static_cast<uint32_t>(total_tag_num);
-        header.total_bucket_num = static_cast<uint32_t>(total_bucket_num);
+        header.total_bucket_num = static_cast<uint32_t>(total_bucket_num_level_2);
         header.vector_dim = static_cast<uint32_t>(vector_dim);
-        header.max_doc_per_bucket = static_cast<uint32_t>(max_doc_per_bucket);
+        header.max_doc_per_bucket = static_cast<uint32_t>(max_doc_per_bucket_level_2);
+        header.layout_hash = layout_hash;
         return header;
     }
 
     static bool IsValidBucketIvfIndexFileHeader(const DataReader::BucketIvfIndexFileHeaderDisk &header,
-                                                const BucketLevelIVF &ivf)
+                                                const BucketLevelIVF &ivf,
+                                                uint64_t expected_layout_hash)
     {
         const char expected_magic[8] = "BIVFIDX";
         return std::memcmp(header.magic, expected_magic, sizeof(header.magic)) == 0 &&
                header.version == kBucketIvfIndexFileVersion &&
                header.total_tag_num == static_cast<uint32_t>(total_tag_num) &&
-               header.total_bucket_num == static_cast<uint32_t>(total_bucket_num) &&
+               header.total_bucket_num == static_cast<uint32_t>(total_bucket_num_level_1) &&
                header.cores_per_group == static_cast<uint32_t>(cores_per_group) &&
                header.cpu_cache_line_size == static_cast<uint32_t>(cpu_cache_line_size) &&
                header.buckets_per_core == ivf.get_buckets_per_core() &&
-               header.aligned_stride == ivf.get_aligned_stride();
+               header.aligned_stride == ivf.get_aligned_stride() &&
+               header.layout_hash == expected_layout_hash;
     }
 
-    static bool IsValidBucketIndexFileHeader(const DataReader::BucketIndexFileHeaderDisk &header)
+    static bool IsValidBucketIndexFileHeader(const DataReader::BucketIndexFileHeaderDisk &header,
+                                             uint64_t expected_layout_hash)
     {
         const char expected_magic[8] = "BKTIDX1";
         return std::memcmp(header.magic, expected_magic, sizeof(header.magic)) == 0 &&
                header.version == kBucketIndexFileVersion &&
                header.total_doc_num == static_cast<uint32_t>(total_doc_num) &&
                header.total_tag_num == static_cast<uint32_t>(total_tag_num) &&
-               header.total_bucket_num == static_cast<uint32_t>(total_bucket_num) &&
+               header.total_bucket_num == static_cast<uint32_t>(total_bucket_num_level_2) &&
                header.vector_dim == static_cast<uint32_t>(vector_dim) &&
-               header.max_doc_per_bucket == static_cast<uint32_t>(max_doc_per_bucket);
+               header.max_doc_per_bucket == static_cast<uint32_t>(max_doc_per_bucket_level_2) &&
+               header.layout_hash == expected_layout_hash;
+    }
+
+    static void ComputeAggMasksForDocs(const InputDataset &dataset,
+                                       const std::vector<uint32_t> &doc_ids,
+                                       uint32_t input_bitmap_stride,
+                                       std::vector<uint64_t> &out_or_mask,
+                                       std::vector<uint64_t> &out_and_mask)
+    {
+        std::fill(out_or_mask.begin(), out_or_mask.end(), 0ULL);
+        std::fill(out_and_mask.begin(), out_and_mask.end(), ~0ULL);
+
+        for (uint32_t doc_id : doc_ids)
+        {
+            const uint64_t *doc_bitmap =
+                dataset.tag_bitmaps + static_cast<size_t>(doc_id) * static_cast<size_t>(input_bitmap_stride);
+
+            uint32_t word_idx = 0;
+#if defined(__aarch64__) || defined(__arm__)
+            for (; word_idx + 1 < input_bitmap_stride; word_idx += 2)
+            {
+                const uint64x2_t doc_vec = vld1q_u64(doc_bitmap + word_idx);
+                uint64x2_t or_vec = vld1q_u64(out_or_mask.data() + word_idx);
+                uint64x2_t and_vec = vld1q_u64(out_and_mask.data() + word_idx);
+
+                or_vec = vorrq_u64(or_vec, doc_vec);
+                and_vec = vandq_u64(and_vec, doc_vec);
+
+                vst1q_u64(out_or_mask.data() + word_idx, or_vec);
+                vst1q_u64(out_and_mask.data() + word_idx, and_vec);
+            }
+#endif
+            for (; word_idx < input_bitmap_stride; ++word_idx)
+            {
+                out_or_mask[word_idx] |= doc_bitmap[word_idx];
+                out_and_mask[word_idx] &= doc_bitmap[word_idx];
+            }
+        }
     }
 
     void BuildCpuIndexesFromDataset(const InputDataset &dataset,
-                                    const BucketDocTable &normalized_bucket_doc_table)
+                                    const BucketDocTable &level_1_bucket_doc_table,
+                                    const BucketDocTable &normalized_level_2_bucket_doc_table)
     {
         buckets_.clear();
-        buckets_.reserve(static_cast<size_t>(total_bucket_num));
+        buckets_.resize(static_cast<size_t>(total_bucket_num_level_2));
 
-        uint32_t input_bitmap_stride = (total_tag_num + 63) / 64;
+        const uint32_t input_bitmap_stride = (total_tag_num + 63) / 64;
+
+#pragma omp parallel num_threads(GetNonQueryOpenMpThreadCount())
+        {
+            std::vector<uint64_t> agg_or_mask(input_bitmap_stride);
+            std::vector<uint64_t> agg_and_mask(input_bitmap_stride);
+
+#pragma omp for schedule(dynamic, 16)
+            for (int bid = 0; bid < total_bucket_num_level_2; ++bid)
+            {
+                Bucket current_bucket(normalized_level_2_bucket_doc_table[static_cast<size_t>(bid)]);
+
+                if (current_bucket.get_doc_num() == 0)
+                {
+                    buckets_[static_cast<size_t>(bid)] = std::move(current_bucket);
+                    continue;
+                }
+
+                current_bucket.ImportDataAndComputeStats(dataset,
+                                                        input_bitmap_stride,
+                                                        agg_or_mask,
+                                                        agg_and_mask);
+                current_bucket.FinalizeTagLayout();
+                buckets_[static_cast<size_t>(bid)] = std::move(current_bucket);
+            }
+        }
+
         std::vector<uint64_t> agg_or_mask(input_bitmap_stride);
         std::vector<uint64_t> agg_and_mask(input_bitmap_stride);
-        /*
-            agg意为聚合
-            agg_or_mask：
-                操作：对桶内所有文档的bitmap进行 或 运算
-                结果含义：如果某一位是 1，表示桶内至少有一个文档拥有该 Tag
-                用于构建 table_and_or（桶级倒排索引的其中一张表）
-            agg_and_mask：
-                操作：对桶内所有文档的bitmap进行 与 运算
-                结果含义：如果某一位是 1，表示桶内所有文档都拥有该 Tag
-                用于推导 table_not（桶级倒排索引的另一张表）
 
-            构建BucketLevelIVF的过程如下：
-                遍历所有桶：
-                    每个桶都会遍历自己桶内的所有doc并聚合得出长度为total_tag_num个bit（向uint64_t取整）的两个agg_mask，然后将其注册到BucketLevelIVF中
-        */
-
-        for (uint32_t bid = 0; bid < total_bucket_num; ++bid)
+        for (uint32_t bid = 0; bid < total_bucket_num_level_1; ++bid)
         {
-            // 1. 初始化 Bucket
-            buckets_.emplace_back(normalized_bucket_doc_table[bid]);
-            Bucket &current_bucket = buckets_.back();
-            /*
-              在 buckets_ 容器的末尾构造一个新的 Bucket 对象。
-              normalized_bucket_doc_table[bid] 存放了属于当前桶（bid）的所有 doc 的全局 ID，
-              且已经过排序、去重和容量校验。
-            */
-
-            // 如果桶为空，直接跳过后续处理
-            if (current_bucket.get_doc_num() == 0)
+            const std::vector<uint32_t> &doc_ids = level_1_bucket_doc_table[bid];
+            if (doc_ids.empty())
             {
-                std::cout << "Warning: Bucket " << bid << " is empty. Skipping.\n";
                 continue;
             }
 
-            // 2. current_bucket基于自己桶内所有doc的全局ID和dataset，完成自我构建，并聚合得到agg_or_mask和agg_and_mask
-            // 注意：虽然向量数据主要在 NPU 使用，但 CPU 这里仍需访问 dataset.vectors
-            // 来计算模长 (Norm) 并存储在 Bucket 对象中，这是 L2 距离分解计算所必需的。
-            current_bucket.ImportDataAndComputeStats(dataset, input_bitmap_stride, agg_or_mask, agg_and_mask);
-
-            // 3. current_bucket将统计信息注册到 BucketLevelIVF 中
+            ComputeAggMasksForDocs(dataset, doc_ids, input_bitmap_stride, agg_or_mask, agg_and_mask);
             bucket_level_ivf_.RegisterBucket(bid, agg_or_mask, agg_and_mask);
         }
     }
 
-    bool TryLoadCpuIndexes(const BucketDocTable &normalized_bucket_doc_table)
+    bool TryLoadCpuIndexes(const BucketDocTable &normalized_level_2_bucket_doc_table)
     {
         if (bucket_ivf_index_file.empty() || bucket_index_file.empty())
         {
@@ -236,7 +366,8 @@ private:
 
         std::vector<Bucket> loaded_buckets;
         if (!LoadBucketIndexFile(bucket_index_path,
-                                 normalized_bucket_doc_table,
+                                 normalized_level_2_bucket_doc_table,
+                                 level_2_bucket_layout_hash_,
                                  loaded_buckets))
         {
             std::cout << "[DB] Warning: bucket index file parameter mismatch: "
@@ -245,7 +376,9 @@ private:
         }
 
         BucketLevelIVF loaded_bucket_level_ivf;
-        if (!LoadBucketIvfIndexFile(bucket_ivf_path, loaded_bucket_level_ivf))
+        if (!LoadBucketIvfIndexFile(bucket_ivf_path,
+                                    level_1_bucket_layout_hash_,
+                                    loaded_bucket_level_ivf))
         {
             std::cout << "[DB] Warning: bucket IVF index file parameter mismatch: "
                       << bucket_ivf_path << std::endl;
@@ -269,6 +402,7 @@ private:
     }
 
     static bool LoadBucketIvfIndexFile(const std::filesystem::path &path,
+                                       uint64_t expected_layout_hash,
                                        BucketLevelIVF &bucket_level_ivf)
     {
         std::ifstream in(path, std::ios::binary);
@@ -278,7 +412,7 @@ private:
 
         DataReader::BucketIvfIndexFileHeaderDisk header{};
         if (!DataReader::ReadBinaryExact(in, &header, sizeof(header)) ||
-            !IsValidBucketIvfIndexFileHeader(header, bucket_level_ivf)) {
+            !IsValidBucketIvfIndexFileHeader(header, bucket_level_ivf, expected_layout_hash)) {
             return false;
         }
 
@@ -286,7 +420,8 @@ private:
     }
 
     static bool LoadBucketIndexFile(const std::filesystem::path &path,
-                                    const BucketDocTable &normalized_bucket_doc_table,
+                                    const BucketDocTable &normalized_level_2_bucket_doc_table,
+                                    uint64_t expected_layout_hash,
                                     std::vector<Bucket> &buckets_out)
     {
         std::ifstream in(path, std::ios::binary);
@@ -297,25 +432,67 @@ private:
         DataReader::BucketIndexFileHeaderDisk header{};
         uint64_t bucket_count = 0;
         if (!DataReader::ReadBinaryExact(in, &header, sizeof(header)) ||
-            !IsValidBucketIndexFileHeader(header) ||
+            !IsValidBucketIndexFileHeader(header, expected_layout_hash) ||
             !DataReader::ReadBinaryExact(in, &bucket_count, sizeof(bucket_count))) {
             return false;
         }
 
-        if (bucket_count != normalized_bucket_doc_table.size()) {
+        if (bucket_count != normalized_level_2_bucket_doc_table.size()) {
             return false;
         }
 
-        std::vector<Bucket> loaded_buckets;
-        loaded_buckets.reserve(static_cast<size_t>(bucket_count));
-        for (size_t bid = 0; bid < static_cast<size_t>(bucket_count); ++bid)
+        std::vector<DataReader::BucketIndexEntryDisk> entries(static_cast<size_t>(bucket_count));
+        if (!DataReader::ReadBinaryExact(in,
+                                         entries.data(),
+                                         entries.size() * sizeof(DataReader::BucketIndexEntryDisk))) {
+            return false;
+        }
+
+        std::vector<Bucket> loaded_buckets(static_cast<size_t>(bucket_count));
+        std::vector<uint8_t> load_ok(static_cast<size_t>(bucket_count), 0);
+        int stream_open_failed = 0;
+#pragma omp parallel num_threads(GetNonQueryOpenMpThreadCount())
         {
-            Bucket bucket;
-            if (!bucket.Deserialize(in) ||
-                !bucket.MatchesGlobalIds(normalized_bucket_doc_table[bid])) {
+            std::ifstream bucket_stream(path, std::ios::binary);
+            if (!bucket_stream.is_open()) {
+                #pragma omp atomic write
+                stream_open_failed = 1;
+            }
+#pragma omp for schedule(static, 256)
+            for (int bid = 0; bid < static_cast<int>(bucket_count); ++bid)
+            {
+                int local_stream_open_failed = 0;
+                #pragma omp atomic read
+                local_stream_open_failed = stream_open_failed;
+                if (local_stream_open_failed) {
+                    continue;
+                }
+                const auto &entry = entries[static_cast<size_t>(bid)];
+                bucket_stream.clear();
+                bucket_stream.seekg(static_cast<std::streamoff>(entry.offset), std::ios::beg);
+                if (!bucket_stream.good()) {
+                    continue;
+                }
+
+                if (!loaded_buckets[static_cast<size_t>(bid)].Deserialize(bucket_stream)) {
+                    continue;
+                }
+                load_ok[static_cast<size_t>(bid)] = 1;
+            }
+        }
+
+        if (stream_open_failed != 0)
+        {
+            return false;
+        }
+
+        for (size_t bid = 0; bid < loaded_buckets.size(); ++bid)
+        {
+            if (!load_ok[bid] ||
+                loaded_buckets[bid].get_doc_num() != normalized_level_2_bucket_doc_table[bid].size())
+            {
                 return false;
             }
-            loaded_buckets.push_back(std::move(bucket));
         }
 
         buckets_out = std::move(loaded_buckets);
@@ -334,7 +511,8 @@ private:
             return false;
         }
 
-        const DataReader::BucketIvfIndexFileHeaderDisk header = MakeBucketIvfIndexFileHeader(bucket_level_ivf_);
+        const DataReader::BucketIvfIndexFileHeaderDisk header =
+            MakeBucketIvfIndexFileHeader(bucket_level_ivf_, level_1_bucket_layout_hash_);
         const bool ok = DataReader::WriteBinaryExact(out, &header, sizeof(header)) &&
                         bucket_level_ivf_.Serialize(out);
         out.flush();
@@ -361,13 +539,38 @@ private:
             return false;
         }
 
-        const DataReader::BucketIndexFileHeaderDisk header = MakeBucketIndexFileHeader();
+        const DataReader::BucketIndexFileHeaderDisk header =
+            MakeBucketIndexFileHeader(level_2_bucket_layout_hash_);
         const uint64_t bucket_count = static_cast<uint64_t>(buckets_.size());
+        std::vector<DataReader::BucketIndexEntryDisk> entries(static_cast<size_t>(bucket_count));
+        const uint64_t entry_table_bytes = static_cast<uint64_t>(entries.size() * sizeof(DataReader::BucketIndexEntryDisk));
+        uint64_t current_offset = static_cast<uint64_t>(sizeof(header)) + sizeof(bucket_count) + entry_table_bytes;
+
+        // Pre-calculate each bucket's serialized size and offset
+        for (size_t bid = 0; bid < buckets_.size(); ++bid)
+        {
+            std::ostringstream bucket_stream(std::ios::binary);
+            if (!buckets_[bid].SerializeToStream(bucket_stream))
+            {
+                return false;
+            }
+            const std::string payload = bucket_stream.str();
+            entries[bid].offset = current_offset;
+            entries[bid].size = static_cast<uint64_t>(payload.size());
+            current_offset += entries[bid].size;
+        }
+
+        // Write header + bucket_count + entry_table
         bool ok = DataReader::WriteBinaryExact(out, &header, sizeof(header)) &&
-                  DataReader::WriteBinaryExact(out, &bucket_count, sizeof(bucket_count));
+                  DataReader::WriteBinaryExact(out, &bucket_count, sizeof(bucket_count)) &&
+                  DataReader::WriteBinaryExact(out,
+                                               entries.data(),
+                                               entries.size() * sizeof(DataReader::BucketIndexEntryDisk));
+
+        // Write each bucket's serialized data at its offset
         for (const Bucket &bucket : buckets_)
         {
-            ok = ok && bucket.Serialize(out);
+            ok = ok && bucket.SerializeToStream(out);
         }
         out.flush();
         const bool final_ok = ok && out.good();
@@ -381,14 +584,14 @@ private:
         return DataReader::ReplaceBinaryFileAtomically(temp_path, path);
     }
 
-    static BucketDocTable NormalizeBucketDocTable(const BucketDocTable &bucket_doc_table)
+    static BucketDocTable NormalizeLevel2BucketDocTable(BucketDocTable bucket_doc_table)
     {
-        if (bucket_doc_table.size() != static_cast<size_t>(total_bucket_num))
+        if (bucket_doc_table.size() != static_cast<size_t>(total_bucket_num_level_2))
         {
-            throw std::invalid_argument("[DB] bucket_doc_table size does not match total_bucket_num.");
+            throw std::invalid_argument("[DB] level-2 bucket_doc_table size does not match total_bucket_num_level_2.");
         }
 
-        BucketDocTable normalized(bucket_doc_table);
+        BucketDocTable normalized(std::move(bucket_doc_table));
         size_t total_stored_doc_refs = 0;
 
         for (size_t bid = 0; bid < normalized.size(); ++bid)
@@ -397,9 +600,9 @@ private:
             std::sort(doc_ids.begin(), doc_ids.end());
             doc_ids.erase(std::unique(doc_ids.begin(), doc_ids.end()), doc_ids.end());
 
-            if (doc_ids.size() > static_cast<size_t>(max_doc_per_bucket))
+            if (doc_ids.size() > static_cast<size_t>(max_doc_per_bucket_level_2))
             {
-                throw std::runtime_error("[DB] bucket_doc_table contains a bucket that exceeds max_doc_per_bucket.");
+                throw std::runtime_error("[DB] level-2 bucket_doc_table contains a bucket that exceeds max_doc_per_bucket_level_2.");
             }
 
             for (uint32_t doc_id : doc_ids)
@@ -416,14 +619,18 @@ private:
         std::cout << "[DB] BucketDocTable normalized. StoredDocRefs="
                   << total_stored_doc_refs
                   << ", MaxAllowedRefs="
-                  << static_cast<size_t>(total_bucket_num) * static_cast<size_t>(max_doc_per_bucket)
+                  << static_cast<size_t>(total_bucket_num_level_2) *
+                         static_cast<size_t>(max_doc_per_bucket_level_2)
                   << std::endl;
         return normalized;
     }
 
     std::vector<Bucket> buckets_;
     BucketLevelIVF bucket_level_ivf_;
+    std::vector<uint32_t> level_1_to_level_2_offsets_;
 
     // 扁平化存储的桶中心向量
     std::vector<float, AlignedAllocator<float>> bucket_centroids_;
+    uint64_t level_1_bucket_layout_hash_ = 0;
+    uint64_t level_2_bucket_layout_hash_ = 0;
 };

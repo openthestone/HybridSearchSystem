@@ -20,7 +20,7 @@ public:
     BucketLevelIVF()
     {
         // 1. 计算每个 Core 负责的桶数量 (向上取整)
-        buckets_per_core_ = (total_bucket_num + cores_per_group - 1) / cores_per_group;
+        buckets_per_core_ = (total_bucket_num_level_1 + cores_per_group - 1) / cores_per_group;
 
         // 2. 计算每个 Core 需要的 bits 和 uint64 数量
         uint32_t bits_per_core = buckets_per_core_;

@@ -62,8 +62,9 @@ namespace npuAPI
         void *d_task_ws = nullptr;    // 存放CPU发来的BatchTaskData 数组（比如有200个element）
 
         // --- Flag 同步资源 ---
-        bool *h_flag = nullptr;       // Host 侧 Flag (Pinned Memory)
-        void *d_flag_false = nullptr; // Device 侧存放 "false" 值的内存
+        uint32_t *h_flags[kGroupFlagSlotCount] = {}; // Host 侧 Flag 槽位 (Pinned Memory)
+        aclrtEvent completion_events[kGroupFlagSlotCount] = {}; // Stream 尾部完成事件
+        void *d_flag_zero = nullptr; // Device 侧存放 0 值的内存
     };
 
     struct BucketMeta
@@ -92,7 +93,12 @@ namespace npuAPI
 
     namespace
     {
-        constexpr uint32_t kKernelRowTile = 256;
+        constexpr uint32_t kKernelResultCols = 16;
+        constexpr uint32_t kKernelMinRowTile = 16;
+        constexpr uint32_t kKernelReferenceVectorDim = 64;
+        constexpr uint32_t kKernelReferenceRowTile = 256;
+        constexpr uint32_t kKernelATileElementBudget =
+            kKernelReferenceVectorDim * kKernelReferenceRowTile;
 
         struct DebugMismatch
         {
@@ -115,10 +121,32 @@ namespace npuAPI
             return sum;
         }
 
+        inline uint32_t RoundDownToMultiple(uint32_t value, uint32_t multiple)
+        {
+            return (multiple == 0) ? value : (value / multiple) * multiple;
+        }
+
+        inline uint32_t GetKernelRowTile()
+        {
+            if (vector_dim <= 0)
+            {
+                return kKernelMinRowTile;
+            }
+
+            uint32_t row_tile =
+                kKernelATileElementBudget / static_cast<uint32_t>(vector_dim);
+            row_tile = std::max<uint32_t>(kKernelMinRowTile, row_tile);
+            row_tile = std::max<uint32_t>(kKernelMinRowTile,
+                                          RoundDownToMultiple(row_tile, kKernelMinRowTile));
+            return std::min<uint32_t>(row_tile, static_cast<uint32_t>(max_doc_per_bucket_level_2));
+        }
+
         inline size_t GetMaxKernelTasksPerBatch()
         {
-            const size_t max_tiles_per_bucket = (static_cast<size_t>(max_doc_per_bucket) + kKernelRowTile - 1) / kKernelRowTile;
-            return static_cast<size_t>(valid_bucket_num_base) * max_tiles_per_bucket;
+            const uint32_t row_tile = GetKernelRowTile();
+            const size_t max_tiles_per_bucket =
+                (static_cast<size_t>(max_doc_per_bucket_level_2) + row_tile - 1) / row_tile;
+            return static_cast<size_t>(max_process_bucket_num_level_2) * max_tiles_per_bucket;
         }
 
         void LogAclCleanupError(const char *op, aclError ret, int device_id, int group_id = -1)
@@ -160,7 +188,7 @@ namespace npuAPI
             ptr = nullptr;
         }
 
-        void FreeHostFlag(bool *&ptr, int device_id, int group_id)
+        void FreeHostFlag(uint32_t *&ptr, int device_id, int group_id)
         {
             if (!ptr)
             {
@@ -205,7 +233,7 @@ namespace npuAPI
 
         g_devices.resize(npu_device_count);
         g_group_ctxs.resize(group_count);
-        g_bucket_metas.resize(total_bucket_num);
+        g_bucket_metas.resize(total_bucket_num_level_2);
 
         auto ret = aclInit(nullptr);
         if (ret != ACL_SUCCESS)
@@ -235,14 +263,14 @@ namespace npuAPI
         }
 
         size_t total_elements = total_stored_docs * static_cast<size_t>(vector_dim);
-        for (int i = 0; i < total_bucket_num; ++i)
+        for (int i = 0; i < total_bucket_num_level_2; ++i)
             g_bucket_metas[i].doc_num = static_cast<uint32_t>(bucket_doc_table[i].size());
 
         std::vector<uint16_t> host_buffer(total_elements);
         size_t cursor = 0;
         size_t current_byte_offset = 0;
 
-        for (int bid = 0; bid < total_bucket_num; ++bid)
+        for (int bid = 0; bid < total_bucket_num_level_2; ++bid)
         {
             const auto &bucket_docs = bucket_doc_table[bid];
             g_bucket_metas[bid].byte_offset = current_byte_offset;
@@ -264,19 +292,21 @@ namespace npuAPI
             }
             current_byte_offset += g_bucket_metas[bid].doc_num * vector_dim * sizeof(uint16_t);
         }
-        //  (f32toFp16数据转换结束) 
+        //  (f32toFp16数据转换结束)
 
         size_t total_bytes = total_elements * sizeof(uint16_t);
         std::cout << "[NPU] StoredDocRefs=" << total_stored_docs
                   << ", HBMVectorBytesPerDevice=" << total_bytes
                   << std::endl;
-        uint32_t max_docs_in_batch = valid_bucket_num_base * max_doc_per_bucket;
+        uint32_t max_docs_in_batch =
+            static_cast<uint32_t>(max_process_bucket_num_level_2 * max_doc_per_bucket_level_2);
 
-        size_t ws_query_size = 64 * 16 * sizeof(uint16_t); //每个query向量都要padding到64x16
-        
-        // 结果按完整的 [doc_num, 16] ND 矩阵写回，Host 侧只读取每行第 0 列。
-        size_t ws_result_size = max_docs_in_batch * 16 * sizeof(float);
-        
+        size_t ws_query_size =
+            static_cast<size_t>(vector_dim) * kKernelResultCols * sizeof(uint16_t); // 每个query向量都要padding到[k,16]
+
+        // 结果按紧凑 [doc_num, 1] 布局写回（Fixpipe nSize=1 仅输出 column 0）。
+        size_t ws_result_size = max_docs_in_batch * sizeof(float);
+
         // Task Workspace: 一个 bucket 可能被拆成多个 row-tile task。
         size_t ws_task_size = GetMaxKernelTasksPerBatch() * sizeof(BatchTaskData);
 
@@ -286,9 +316,10 @@ namespace npuAPI
             g_devices[local_idx].device_id = dev_id;
             aclrtSetDevice(dev_id);
 
-            for (int j = 0; j < groups_per_device; ++j)
+            const int dev_group_count = GroupCountForDevice(local_idx);
+            for (int j = 0; j < dev_group_count; ++j)
             {
-                int group_id = local_idx * groups_per_device + j;
+                int group_id = GroupIdForDeviceStream(local_idx, j);
                 aclrtStream s = nullptr;
                 aclrtCreateStream(&s);
                 g_devices[local_idx].streams.push_back(s);
@@ -298,15 +329,19 @@ namespace npuAPI
                 aclrtMalloc(&g_group_ctxs[group_id].d_task_ws, ws_task_size, ACL_MEM_MALLOC_HUGE_FIRST);
 
                 // --- Flag 资源初始化 ---
-                // 1. Host Flag (Pinned)
-                AllocateHostPinned((void**)&g_group_ctxs[group_id].h_flag, sizeof(bool));
-                *g_group_ctxs[group_id].h_flag = true; // 初始为 busy
+                for (int slot_id = 0; slot_id < kGroupFlagSlotCount; ++slot_id)
+                {
+                    AllocateHostPinned((void**)&g_group_ctxs[group_id].h_flags[slot_id], sizeof(uint32_t));
+                    *g_group_ctxs[group_id].h_flags[slot_id] = 0U; // 初始为 idle
+                    aclrtEvent event;
+                    aclrtCreateEvent(&event);
+                    g_group_ctxs[group_id].completion_events[slot_id] = event;
+                }
 
-                // 2. Device False Flag (Constant Source)
-                aclrtMalloc(&g_group_ctxs[group_id].d_flag_false, sizeof(bool), ACL_MEM_MALLOC_HUGE_FIRST);
-                bool false_val = false;
-                aclrtMemcpy(g_group_ctxs[group_id].d_flag_false, sizeof(bool), 
-                            &false_val, sizeof(bool), ACL_MEMCPY_HOST_TO_DEVICE);
+                aclrtMalloc(&g_group_ctxs[group_id].d_flag_zero, sizeof(uint32_t), ACL_MEM_MALLOC_HUGE_FIRST);
+                const uint32_t zero_val = 0U;
+                aclrtMemcpy(g_group_ctxs[group_id].d_flag_zero, sizeof(uint32_t),
+                            &zero_val, sizeof(uint32_t), ACL_MEMCPY_HOST_TO_DEVICE);
             }
 
             aclrtMalloc(&g_devices[local_idx].dev_base_addr, total_bytes, ACL_MEM_MALLOC_HUGE_FIRST);
@@ -317,18 +352,86 @@ namespace npuAPI
 
     Stream GetGroupStream(int group_id)
     {
-        int dev_idx = group_id / groups_per_device;
-        int stream_idx = group_id % groups_per_device;
+        int dev_idx = g_group_to_device[group_id];
+        int stream_idx = g_group_to_stream[group_id];
         return g_devices[dev_idx].streams[stream_idx];
     }
 
-    volatile bool* GetGroupFlag(int group_id) {
-        return g_group_ctxs[group_id].h_flag;
+    void UploadQuery(const float *query_vector,
+                     const uint16_t *mmad_query_padded_fp16,
+                     int group_id)
+    {
+        Stream stream = GetGroupStream(group_id);
+        void *d_query = g_group_ctxs[group_id].d_query_ws;
+
+        const size_t query_bytes = static_cast<size_t>(vector_dim) * kKernelResultCols * sizeof(uint16_t);
+        if (mmad_query_padded_fp16 != nullptr)
+        {
+            aclrtMemcpyAsync(d_query, query_bytes, mmad_query_padded_fp16,
+                             query_bytes, ACL_MEMCPY_HOST_TO_DEVICE, stream);
+            return;
+        }
+
+        static thread_local std::vector<uint16_t> h_query_padded;
+        h_query_padded.assign(static_cast<size_t>(vector_dim) * kKernelResultCols, 0);
+        for (int i = 0; i < vector_dim; ++i)
+        {
+            h_query_padded[static_cast<size_t>(i) * kKernelResultCols] = Float32ToFp16(query_vector[i]);
+        }
+        aclrtMemcpyAsync(d_query, query_bytes, h_query_padded.data(),
+                         query_bytes, ACL_MEMCPY_HOST_TO_DEVICE, stream);
     }
 
-    void ResetGroupFlag(int group_id) {
-        // CPU 重置 Flag 为 true，表示任务开始
-        *g_group_ctxs[group_id].h_flag = true;
+    volatile uint32_t* GetGroupFlag(int group_id, int slot_id) {
+        return g_group_ctxs[group_id].h_flags[slot_id];
+    }
+
+    void ClearGroupFlag(int group_id, int slot_id) {
+        *g_group_ctxs[group_id].h_flags[slot_id] = 0U;
+    }
+
+    void ResetGroupFlag(int group_id, int slot_id) {
+        *g_group_ctxs[group_id].h_flags[slot_id] = 1U;
+    }
+
+    double EnqueueGroupCompletion(Stream stream, int group_id, int slot_id)
+    {
+        auto start = std::chrono::high_resolution_clock::now();
+        aclrtEvent event = g_group_ctxs[group_id].completion_events[slot_id];
+        aclError ret = (event == nullptr)
+                           ? ACL_SUCCESS
+                           : aclrtRecordEvent(event, stream);
+        auto end = std::chrono::high_resolution_clock::now();
+        if (ret != ACL_SUCCESS)
+        {
+            std::cerr << "[NPU] completion event submit failed for group=" << group_id
+                      << " slot=" << slot_id << " code=" << ret << std::endl;
+            return -1.0;
+        }
+        return std::chrono::duration<double, std::milli>(end - start).count();
+    }
+
+    bool IsGroupCompletionReady(int group_id, int slot_id)
+    {
+        aclrtEvent event = g_group_ctxs[group_id].completion_events[slot_id];
+        if (event == nullptr)
+        {
+            return *g_group_ctxs[group_id].h_flags[slot_id] == 0U;
+        }
+
+        aclrtEventRecordedStatus status = ACL_EVENT_RECORDED_STATUS_NOT_READY;
+        const aclError ret = aclrtQueryEventStatus(event, &status);
+        if (ret != ACL_SUCCESS)
+        {
+            return *g_group_ctxs[group_id].h_flags[slot_id] == 0U;
+        }
+
+        if (status == ACL_EVENT_RECORDED_STATUS_COMPLETE)
+        {
+            *g_group_ctxs[group_id].h_flags[slot_id] = 0U;
+            return true;
+        }
+        return false;
     }
 
     void SynchronizeStream(Stream s) { aclrtSynchronizeStream(s); }   //优化后这个函数不再被使用
@@ -360,10 +463,10 @@ namespace npuAPI
                 }
             }
 
-            const int group_begin = local_idx * groups_per_device;
-            for (int j = 0; j < groups_per_device; ++j)
+            const int dev_group_count = GroupCountForDevice(local_idx);
+            for (int j = 0; j < dev_group_count; ++j)
             {
-                const int group_id = group_begin + j;
+                const int group_id = GroupIdForDeviceStream(local_idx, j);
                 if (group_id >= static_cast<int>(g_group_ctxs.size()))
                 {
                     break;
@@ -379,9 +482,9 @@ namespace npuAPI
                 }
             }
 
-            for (int j = 0; j < groups_per_device; ++j)
+            for (int j = 0; j < dev_group_count; ++j)
             {
-                const int group_id = group_begin + j;
+                const int group_id = GroupIdForDeviceStream(local_idx, j);
                 if (group_id >= static_cast<int>(g_group_ctxs.size()))
                 {
                     break;
@@ -393,9 +496,18 @@ namespace npuAPI
                     FreeDeviceBuffer(group.d_query_ws, "aclrtFree(d_query_ws)", device_id, group_id);
                     FreeDeviceBuffer(group.d_result_ws, "aclrtFree(d_result_ws)", device_id, group_id);
                     FreeDeviceBuffer(group.d_task_ws, "aclrtFree(d_task_ws)", device_id, group_id);
-                    FreeDeviceBuffer(group.d_flag_false, "aclrtFree(d_flag_false)", device_id, group_id);
+                    FreeDeviceBuffer(group.d_flag_zero, "aclrtFree(d_flag_zero)", device_id, group_id);
                 }
-                FreeHostFlag(group.h_flag, device_id, group_id);
+                for (int slot_id = 0; slot_id < kGroupFlagSlotCount; ++slot_id)
+                {
+                    FreeHostFlag(group.h_flags[slot_id], device_id, group_id);
+                    if (group.completion_events[slot_id] != nullptr)
+                    {
+                        aclrtEvent event = group.completion_events[slot_id];
+                        aclrtDestroyEvent(event);
+                        group.completion_events[slot_id] = nullptr;
+                    }
+                }
             }
 
             if (device_ready)
@@ -415,7 +527,7 @@ namespace npuAPI
                         LogAclCleanupError("aclrtDestroyStream",
                                            ret,
                                            device_id,
-                                           group_begin + static_cast<int>(stream_idx));
+                                           GroupIdForDeviceStream(local_idx, static_cast<int>(stream_idx)));
                     }
                     device.streams[stream_idx] = nullptr;
                 }
@@ -442,38 +554,26 @@ namespace npuAPI
     }
 
     // -----------------------------------------------------------
-    // 优化版 LaunchBatchKernel (Async Chain)
+    // 优化版 LaunchBatchKernel (Async Chain, no query upload)
+    // 前置条件：已调用 UploadQuery 上传 query 向量
     // -----------------------------------------------------------
     void LaunchBatchKernel(Stream stream,
                            const std::vector<uint32_t> &bucket_ids,
-                           const float *query_vector,
-                           float *host_output_buffer, // 接收结果的 Pinned Buffer
+                           float *host_output_buffer,
                            int group_id)
     {
-        int local_idx = group_id / groups_per_device;
+        int local_idx = g_group_to_device[group_id];
 
         void *d_query = g_group_ctxs[group_id].d_query_ws;
         void *d_task = g_group_ctxs[group_id].d_task_ws;
         void *dev_base_doc = g_devices[local_idx].dev_base_addr;
         void *dev_base_result = g_group_ctxs[group_id].d_result_ws;
 
-        // 1. Prepare Query (Padding to 64x16)
-        static thread_local std::vector<uint16_t> h_query_padded;
-        h_query_padded.assign(64 * 16, 0);
-        for (int i = 0; i < 64; ++i)
-        {
-            h_query_padded[i * 16 + 0] = Float32ToFp16(query_vector[i]);
-        }
-        aclrtMemcpyAsync(d_query, 64 * 16 * sizeof(uint16_t), h_query_padded.data(),
-                         64 * 16 * sizeof(uint16_t), ACL_MEMCPY_HOST_TO_DEVICE, stream);
-
-        // 2. Prepare Task Data
-        // LowLevelMatMul 的参考实现只覆盖较小矩阵。
-        // 这里如果把整桶最多 1024 行一次性塞进单个 task，会把 A1/A2/CO1 的片上 buffer 放大到非常激进的规模。
-        // 因此 host 侧将每个 bucket 切成多个 row-tile task，复用同一个 kernel。
+        // 1. Prepare Task Data (compact offset_C layout)
         static thread_local std::vector<BatchTaskData> h_tasks;
         h_tasks.clear();
         h_tasks.reserve(GetMaxKernelTasksPerBatch());
+        const uint32_t kernel_row_tile = GetKernelRowTile();
 
         size_t current_res_offset = 0;
 
@@ -482,22 +582,23 @@ namespace npuAPI
             auto &meta = g_bucket_metas[bid];
             if (meta.doc_num == 0)
             {
-                current_res_offset += max_doc_per_bucket * 16 * sizeof(float);
                 continue;
             }
 
-            for (uint32_t row_begin = 0; row_begin < meta.doc_num; row_begin += kKernelRowTile)
+            for (uint32_t row_begin = 0; row_begin < meta.doc_num; row_begin += kernel_row_tile)
             {
-                const uint32_t tile_rows = std::min<uint32_t>(kKernelRowTile, meta.doc_num - row_begin);
+                const uint32_t tile_rows = std::min<uint32_t>(kernel_row_tile, meta.doc_num - row_begin);
                 BatchTaskData task;
-                task.offset_A = static_cast<uint32_t>(meta.byte_offset +
-                                static_cast<size_t>(row_begin) * vector_dim * sizeof(uint16_t));
-                task.offset_C = static_cast<uint32_t>(current_res_offset +
-                                static_cast<size_t>(row_begin) * 16 * sizeof(float));
+                task.offset_A = static_cast<uint64_t>(meta.byte_offset) +
+                                static_cast<size_t>(row_begin) * static_cast<size_t>(vector_dim) * sizeof(uint16_t);
+                // Compact offset_C: kernel outputs only column 0 (stride-1)
+                task.offset_C = static_cast<uint64_t>(current_res_offset) +
+                                static_cast<size_t>(row_begin) * sizeof(float);
                 task.m = tile_rows;
                 h_tasks.push_back(task);
             }
-            current_res_offset += max_doc_per_bucket * 16 * sizeof(float);
+            current_res_offset +=
+                static_cast<size_t>(meta.doc_num) * sizeof(float);
         }
 
         if (h_tasks.empty())
@@ -511,30 +612,26 @@ namespace npuAPI
             return;
         }
 
-        // 3. Copy Task Data to Device
+        // 2. Copy Task Data to Device
         size_t task_data_size = h_tasks.size() * sizeof(BatchTaskData);
         aclrtMemcpyAsync(d_task, task_data_size, h_tasks.data(), task_data_size, ACL_MEMCPY_HOST_TO_DEVICE, stream);
 
-        // 4. Single Launch
+        // 3. Single Launch
         ACLRT_LAUNCH_KERNEL(kernel_vector_mmad)(
             (uint32_t)h_tasks.size(), stream,
-            d_query,         
-            d_task,          
-            dev_base_doc,    
-            dev_base_result, 
-            64);             
+            d_query,
+            d_task,
+            dev_base_doc,
+            dev_base_result,
+            static_cast<uint32_t>(vector_dim));
 
-        // 5. Async Result Copy (Device -> Host Pinned Buffer)
-        size_t total_result_bytes = bucket_ids.size() * max_doc_per_bucket * 16 * sizeof(float);
-        aclrtMemcpyAsync(host_output_buffer, total_result_bytes, 
-                         dev_base_result, total_result_bytes, 
-                         ACL_MEMCPY_DEVICE_TO_HOST, stream);
-
-        // 6. Async Flag Update (Device False -> Host Flag)
-        // 只有当前面所有操作完成后，Flag 才会变为 false
-        aclrtMemcpyAsync((void*)g_group_ctxs[group_id].h_flag, sizeof(bool),
-                         g_group_ctxs[group_id].d_flag_false, sizeof(bool),
-                         ACL_MEMCPY_DEVICE_TO_HOST, stream);
+        // 4. Single D2H copy (compact layout: device and host use same offsets)
+        if (current_res_offset > 0)
+        {
+            aclrtMemcpyAsync(host_output_buffer, current_res_offset,
+                             dev_base_result, current_res_offset,
+                             ACL_MEMCPY_DEVICE_TO_HOST, stream);
+        }
     }
 
     void DebugVerifyBatchResults(const std::vector<uint32_t> &bucket_ids,
@@ -570,14 +667,14 @@ namespace npuAPI
 
             const BucketMeta &meta = g_bucket_metas[bucket_id];
             const uint32_t *doc_ids = g_bucket_doc_ids.data() + meta.doc_id_offset;
-            const float *npu_scores = host_output_buffer + bucket_idx * max_doc_per_bucket * 16;
+            const float *npu_scores = host_output_buffer;
 
             for (uint32_t local_doc_idx = 0; local_doc_idx < meta.doc_num; ++local_doc_idx)
             {
                 const uint32_t global_doc_id = doc_ids[local_doc_idx];
                 const float *doc_vec = g_host_vectors + static_cast<size_t>(global_doc_id) * dim;
                 const float cpu_score = ComputeCpuDotProduct(doc_vec, query_vector, dim);
-                const float npu_score = npu_scores[static_cast<size_t>(local_doc_idx) * 16];
+                const float npu_score = npu_scores[local_doc_idx];
                 const bool invalid = !std::isfinite(cpu_score) || !std::isfinite(npu_score);
                 const float abs_err = invalid ? std::numeric_limits<float>::infinity()
                                               : std::fabs(cpu_score - npu_score);
@@ -609,6 +706,7 @@ namespace npuAPI
                     }
                 }
             }
+            host_output_buffer += meta.doc_num;
         }
 
         const uint64_t batch_id = g_debug_batch_counter.fetch_add(1, std::memory_order_relaxed) + 1;

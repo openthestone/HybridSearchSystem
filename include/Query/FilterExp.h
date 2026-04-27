@@ -18,10 +18,10 @@ struct RPNItem
 
 namespace FilterOp8
 {
-    // Operators definitions (Values 0-255)
-    // 0 is reserved or unused
-    const uint8_t OP_AND = 1;
-    const uint8_t OP_OR = 2;
+    // §2.2B: OP_AND=0, OP_OR=1 enables branchless XOR flip: op ^ inverted
+    // 0 is used for OP_AND, 1 for OP_OR (XOR semantics)
+    const uint8_t OP_AND = 0;
+    const uint8_t OP_OR = 1;
 
     // IVF Specific Ops
     const uint8_t OP_IVF_LOAD_EXIST = 3;   // Load Tag
@@ -38,6 +38,11 @@ public:
 
     // BucketLevelIVF_RPN: 用于桶级属性过滤
     std::vector<RPNItem> BucketLevelIVF_RPN;
+
+    // ---- Sorted unique tag IDs for merge-based batch lookup ----
+    // 在 CompileFrom 中一次性计算，查询时复用
+    std::vector<uint32_t> sorted_unique_tag_ids;   // 升序去重的 tag ID 列表
+    std::vector<uint32_t> rpn_tag_to_sorted_idx;   // RPN 中每个 tag 在 sorted_unique_tag_ids 中的索引
 
     FilterExp() = default;
 

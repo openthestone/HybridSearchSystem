@@ -1,13 +1,15 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
-#include <fstream>
 #include <cmath>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <memory>
+#include <random>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "utils/RunSupport.h"
@@ -146,6 +148,29 @@ bool LoadPreparedQueriesFromFvec(const std::vector<std::string> &query_paths,
     return false;
 }
 
+bool WriteProcessRoundCountFile(const fs::path &output_file,
+                                const std::vector<size_t> &level_1_counts,
+                                const std::vector<size_t> &level_2_counts)
+{
+    if (level_1_counts.size() != level_2_counts.size())
+    {
+        return false;
+    }
+
+    std::ofstream out(output_file, std::ios::out | std::ios::trunc);
+    if (!out.is_open())
+    {
+        return false;
+    }
+
+    out << "process_round_count_level_1\tprocess_round_count_level_2\n";
+    for (size_t i = 0; i < level_1_counts.size(); ++i)
+    {
+        out << level_1_counts[i] << '\t' << level_2_counts[i] << '\n';
+    }
+
+    return out.good();
+}
 
 class QueryPool
 {
@@ -198,7 +223,8 @@ struct DeferredMetricFiles
         total_end_to_end_ms.resize(expected_queries);
         ground_truth_count.resize(expected_queries);
         engine_result_count.resize(expected_queries);
-        process_round_count.resize(expected_queries);
+        process_round_count_level_1.resize(expected_queries);
+        process_round_count_level_2.resize(expected_queries);
         recall_rate_percent.resize(expected_queries);
         bucket_level_ivf_ms.resize(expected_queries);
         candidate_bucket_merge_ms.resize(expected_queries);
@@ -218,7 +244,10 @@ struct DeferredMetricFiles
         total_end_to_end_ms[query_index] = total_ms;
         ground_truth_count[query_index] = query.ground_truth_results.size();
         engine_result_count[query_index] = query.result.topk_results.size();
-        process_round_count[query_index] = static_cast<size_t>(query.process_round_count);
+        process_round_count_level_1[query_index] =
+            static_cast<size_t>(query.process_round_count_level_1);
+        process_round_count_level_2[query_index] =
+            static_cast<size_t>(query.process_round_count_level_2);
         recall_rate_percent[query_index] = static_cast<double>(query.recall_rate) * 100.0;
         bucket_level_ivf_ms[query_index] = query.timing_metrics.bucket_level_ivf_ms;
         candidate_bucket_merge_ms[query_index] = query.timing_metrics.candidate_bucket_merge_ms;
@@ -251,14 +280,17 @@ struct DeferredMetricFiles
                RunSupport::WriteMetricFile(latency_dir, "wait_npu_flag_ms.txt", wait_npu_flag_ms) &&
                RunSupport::WriteMetricFile(latency_dir, "result_collection_ms.txt", result_collection_ms) &&
                RunSupport::WriteMetricFile(latency_dir, "final_merge_ms.txt", final_merge_ms) &&
-               RunSupport::WriteMetricFile(log_dir, "process_round_count.txt", process_round_count);
+               WriteProcessRoundCountFile(log_dir / "process_round_count.txt",
+                                          process_round_count_level_1,
+                                          process_round_count_level_2);
     }
 
     std::vector<double> query_construction_ms;
     std::vector<double> total_end_to_end_ms;
     std::vector<size_t> ground_truth_count;
     std::vector<size_t> engine_result_count;
-    std::vector<size_t> process_round_count;
+    std::vector<size_t> process_round_count_level_1;
+    std::vector<size_t> process_round_count_level_2;
     std::vector<double> recall_rate_percent;
     std::vector<double> bucket_level_ivf_ms;
     std::vector<double> candidate_bucket_merge_ms;
@@ -271,13 +303,14 @@ struct DeferredMetricFiles
 } // namespace
 
 int main() {
-    constexpr const char *kDatasetFile = "../../dataset_DEEP.bin";
+    constexpr const char *kDatasetFile = "../../dataset_HW.bin";
     constexpr int kDefaultTopK = 100;
+    constexpr int QueryNum = 10000;
     const std::vector<std::string> kQueryPaths = {
-        "datasets/DEEP/deep1B_queries.fvecs",
-        "../datasets/DEEP/deep1B_queries.fvecs",
-        "../../datasets/DEEP/deep1B_queries.fvecs",
-        "../../../datasets/DEEP/deep1B_queries.fvecs"
+        "datasets/hw_queries.fvecs",
+        "../datasets/hw_queries.fvecs",
+        "../../datasets/hw_queries.fvecs",
+        "../../../datasets/hw_queries.fvecs"
     };
 
     const fs::path config_path = RunSupport::ResolveConfigPath();
@@ -299,7 +332,7 @@ int main() {
     std::cout << "[Loader] Dataset loaded. Docs=" << total_doc_num
               << ", Dim=" << vector_dim
               << ", Tags=" << total_tag_num
-              << ", Buckets=" << total_bucket_num << "\n";
+              << ", Buckets(Level1)=" << total_bucket_num_level_1 << "\n";
 
     std::cout << "[Loader] Loading queries...\n";
     std::vector<DataReader::PreparedQuery> queries;
@@ -319,6 +352,61 @@ int main() {
         return 0;
     }
     std::cout << "[Loader] Prepared query count: " << queries.size() << "\n";
+
+    // Step 1: Ensure queries vector has exactly QueryNum items
+    if (queries.size() > QueryNum) {
+        queries.resize(QueryNum);
+        std::cout << "[Loader] Truncated queries: " << queries.size() << "\n";
+    } else if (queries.size() < QueryNum) {
+        const size_t original_count = queries.size();
+        queries.reserve(QueryNum);
+        for (size_t i = original_count; i < QueryNum; ++i) {
+            queries.push_back(queries[i % original_count]);
+        }
+        std::cout << "[Loader] Expanded queries: " << original_count << " -> " << queries.size() << "\n";
+    }
+
+    // Step 2: Load filter expressions: read 10 from file, replicate to QueryNum
+    {
+        std::vector<std::string> filter_exprs_10;
+        const fs::path filter_expr_path = config_path.has_parent_path()
+                                              ? (config_path.parent_path() / "filter_expr_example.txt")
+                                              : fs::path("filter_expr_example.txt");
+        {
+            std::ifstream fexpr_file(filter_expr_path);
+            std::string line;
+            while (std::getline(fexpr_file, line)) {
+                if (!line.empty()) {
+                    filter_exprs_10.push_back(line);
+                }
+            }
+        }
+        if (filter_exprs_10.empty()) {
+            std::cerr << "[Warn] filter_expr_example.txt not found or empty at " << filter_expr_path
+                      << ". Using empty filters for all queries.\n";
+        } else if (filter_exprs_10.size() < 10) {
+            std::cerr << "[Warn] filter_expr_example.txt has fewer than 10 lines. Using available expressions.\n";
+        }
+
+        std::vector<std::string> filter_exprs_N;
+        filter_exprs_N.reserve(QueryNum);
+        if (!filter_exprs_10.empty()) {
+            std::mt19937 rng(42);
+            std::uniform_int_distribution<size_t> dist(0, filter_exprs_10.size() - 1);
+            for (size_t i = 0; i < QueryNum; ++i) {
+                filter_exprs_N.push_back(filter_exprs_10[dist(rng)]);
+            }
+        } else {
+            filter_exprs_N.assign(QueryNum, std::string());
+        }
+
+        for (size_t i = 0; i < queries.size(); ++i) {
+            queries[i].filter_expr = filter_exprs_N[i];
+            // queries[i].filter_expr = "";
+        }
+        std::cout << "[Loader] Assigned filter expressions to all " << queries.size() << " queries\n";
+    }
+
     if (!RunSupport::ValidatePreparedQueriesAgainstPrealloc(queries)) {
         return -1;
     }
@@ -356,11 +444,11 @@ int main() {
                                                     bucket_doc_offsets,
                                                     bucket_doc_ids,
                                                     dataset_buffers.centroids,
-                                                    total_bucket_num,
+                                                    total_bucket_num_level_1,
                                                     total_tag_num,
                                                     vector_dim,
                                                     total_doc_num,
-                                                    max_doc_per_bucket);
+                                                    max_doc_per_bucket_level_2);
     if (sync_result != 0)
     {
         std::cerr << "[Fatal] Failed to run or load clustering outputs (centroids.bin/buckets).\n";
@@ -374,28 +462,29 @@ int main() {
     }
 
     const size_t clustered_bucket_count = bucket_doc_offsets.size() - 1;
-    if (clustered_bucket_count != static_cast<size_t>(total_bucket_num))
+    if (clustered_bucket_count != static_cast<size_t>(total_bucket_num_level_1))
     {
-        std::cout << "[Clustering] bucket count updated by clustering: "
-                  << total_bucket_num << " -> " << clustered_bucket_count << "\n";
-        total_bucket_num = static_cast<int>(clustered_bucket_count);
+        std::cerr << "[Fatal] Invalid clustering output: config total_bucket_num_level_1="
+                  << total_bucket_num_level_1
+                  << ", but clustering produced "
+                  << clustered_bucket_count
+                  << " level-1 buckets.\n";
+        return -1;
     }
 
-    if (dataset_buffers.centroids.size() != static_cast<size_t>(total_bucket_num) * static_cast<size_t>(vector_dim))
+    if (dataset_buffers.centroids.size() !=
+        static_cast<size_t>(total_bucket_num_level_1) * static_cast<size_t>(vector_dim))
     {
         std::cerr << "[Fatal] Invalid clustering output: centroids size mismatch.\n";
         return -1;
     }
-    if (!FinalizePreallocationParams())
-    {
-        return -1;
-    }
 
     InputDataset dataset = DataReader::BuildInputDataset(dataset_buffers);
-    BucketDocTable bucket_doc_table;
+    BucketDocTable level_1_bucket_doc_table;
     try
     {
-        bucket_doc_table = RunSupport::BuildBucketDocTableFromOffsets(bucket_doc_offsets, bucket_doc_ids);
+        level_1_bucket_doc_table =
+            RunSupport::BuildBucketDocTableFromOffsets(bucket_doc_offsets, bucket_doc_ids);
     }
     catch (const std::exception &e)
     {
@@ -403,26 +492,46 @@ int main() {
         return -1;
     }
 
-    std::cout << "[Loader] BucketDocTable built. StoredDocRefs="
-              << RunSupport::CountStoredDocRefs(bucket_doc_table)
-              << ", BucketCount=" << bucket_doc_table.size() << "\n";
+    TwoLevelBucketLayout bucket_layout;
+    try
+    {
+        bucket_layout = RunSupport::BuildTwoLevelBucketLayout(std::move(level_1_bucket_doc_table),
+                                                              max_doc_per_bucket_level_2);
+    }
+    catch (const std::exception &e)
+    {
+        std::cerr << "[Fatal] Failed to adapt clustering output into two-level buckets: "
+                  << e.what() << "\n";
+        return -1;
+    }
+
+    total_bucket_num_level_2 = static_cast<int>(bucket_layout.Level2BucketCount());
+    if (!FinalizePreallocationParams())
+    {
+        return -1;
+    }
+
+    std::cout << "[Loader] Two-level bucket layout built. StoredDocRefs="
+              << RunSupport::CountStoredDocRefs(bucket_layout.level_1_bucket_doc_table)
+              << ", Level1BucketCount=" << bucket_layout.Level1BucketCount()
+              << ", Level2BucketCount=" << bucket_layout.Level2BucketCount() << "\n";
 
     std::cout << "[System] Initializing DataBaseCPU...\n";
-    DataBaseCPU db(dataset, bucket_doc_table);
+    DataBaseCPU db(dataset, std::move(bucket_layout));
 
     std::cout << "[System] Launching worker threads...\n";
     Scheduler scheduler;
     std::vector<std::unique_ptr<WorkerGroup>> groups;
-    std::vector<std::thread> threads;
-    QueryPool query_pool(static_cast<size_t>(query_pool_capacity));
-
     for (int i = 0; i < group_count; ++i) {
         groups.push_back(std::make_unique<WorkerGroup>(i, &db, &scheduler));
     }
+    std::vector<std::thread> threads;
+    threads.reserve(static_cast<size_t>(cpu_core_count));
     for (int i = 0; i < cpu_core_count; ++i) {
         const int gid = GetGroupId(i);
         threads.emplace_back(&WorkerGroup::Run, groups[gid].get(), i);
     }
+    QueryPool query_pool(static_cast<size_t>(query_pool_capacity));
 
     for (size_t idx = 0; idx < queries.size(); ++idx) {
         const auto &prepared = queries[idx];
@@ -444,10 +553,7 @@ int main() {
         auto start_loop = std::chrono::high_resolution_clock::now();
         scheduler.Push(q);
 
-        Query *completed_q = nullptr;
-        while (completed_q == nullptr) {
-            completed_q = scheduler.PopResult();
-        }
+        Query *completed_q = scheduler.PopResult();  // 阻塞等待，无 CPU 浪费
 
         auto end_loop = std::chrono::high_resolution_clock::now();
         std::chrono::duration<double, std::milli> loop_ms = end_loop - start_loop;
@@ -483,7 +589,9 @@ int main() {
         completed_q->AppendMemoryEventLogs(memory_log_collector);
 
         query_pool.Release(completed_q);
-        std::cout << (idx + 1) << "/" << queries.size() << std::endl;
+        if ((idx + 1) % 100 == 0 || idx + 1 == queries.size()) {
+            std::cout << (idx + 1) << "/" << queries.size() << std::endl;
+        }
     }
 
     for (auto &g : groups) {

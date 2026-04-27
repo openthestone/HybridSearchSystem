@@ -121,15 +121,9 @@ private:
 
     void emitBinary(uint8_t op, bool inverted, FilterExp &output)
     {
-        uint8_t final_op = op;
-        if (inverted)
-        {
-            if (op == FilterOp8::OP_AND) {
-                final_op = FilterOp8::OP_OR;
-            } else if (op == FilterOp8::OP_OR) {
-                final_op = FilterOp8::OP_AND;
-            }
-        }
+        // §2.2B: XOR-based branchless flip: inverted flips AND↔OR
+        // Requires OP_AND=0, OP_OR=1. Then op^1 = NOT op.
+        uint8_t final_op = inverted ? (op ^ 1) : op;
         output.Bucket_RPN.push_back({true, final_op, 0});
         output.BucketLevelIVF_RPN.push_back({true, final_op, 0});
     }
@@ -315,11 +309,107 @@ inline FilterExp::FilterExp(std::string_view query_filter)
     CompileFrom(query_filter);
 }
 
+// ---- LSD Radix Sort for uint32_t ----
+// 4-pass × 8-bit digit, O(n) comparison-free. Optimal for small N (< 1000).
+inline void radix_sort_u32(uint32_t *data, uint32_t *temp, size_t n)
+{
+    if (n <= 1) return;
+
+    uint32_t *src = data, *dst = temp;
+    for (int shift = 0; shift < 32; shift += 8)
+    {
+        uint32_t count[256] = {};
+        for (size_t i = 0; i < n; ++i)
+            count[(src[i] >> shift) & 0xFF]++;
+
+        // Prefix sum → starting offset
+        uint32_t total = 0;
+        for (int i = 0; i < 256; ++i)
+        {
+            uint32_t c = count[i];
+            count[i] = total;
+            total += c;
+        }
+
+        for (size_t i = 0; i < n; ++i)
+        {
+            uint32_t val = src[i];
+            dst[count[(val >> shift) & 0xFF]++] = val;
+        }
+
+        std::swap(src, dst);
+    }
+
+    // If odd number of passes (4 = even), final result is in data[] already.
+    // If result ended in temp, copy back.
+    if (src != data)
+        std::memcpy(data, temp, n * sizeof(uint32_t));
+}
+
+// Sort + dedup using radix sort (returns sorted unique count)
+inline size_t radix_sort_dedup_u32(std::vector<uint32_t> &arr)
+{
+    const size_t n = arr.size();
+    if (n <= 1) return n;
+
+    std::vector<uint32_t> temp(n);
+    radix_sort_u32(arr.data(), temp.data(), n);
+
+    // Dedup in-place
+    size_t out = 0;
+    for (size_t i = 1; i < n; ++i)
+    {
+        if (arr[i] != arr[out])
+            arr[++out] = arr[i];
+    }
+    arr.resize(out + 1);
+    return out + 1;
+}
+
 inline void FilterExp::CompileFrom(std::string_view query_filter)
 {
     Bucket_RPN.clear();
     BucketLevelIVF_RPN.clear();
+    sorted_unique_tag_ids.clear();
+    rpn_tag_to_sorted_idx.clear();
     if (query_filter.empty())
         return;
     FilterExpCompiler::run(query_filter, *this);
+
+    // Build sorted unique tag IDs and RPN-to-sorted index mapping
+    // Step 1: Collect all tag IDs from Bucket_RPN
+    std::vector<uint32_t> all_tags;
+    all_tags.reserve(Bucket_RPN.size());
+    for (const auto &item : Bucket_RPN)
+    {
+        if (!item.is_op)
+            all_tags.push_back(item.value);
+    }
+
+    // Step 2: Sort and dedup via radix sort (O(n), branch-free)
+    radix_sort_dedup_u32(all_tags);
+    sorted_unique_tag_ids = std::move(all_tags);
+
+    // Step 3: Build RPN-to-sorted mapping using linear scan
+    // (both arrays are sorted by tag_id, so merge-style scan is O(n))
+    rpn_tag_to_sorted_idx.reserve(Bucket_RPN.size());
+    {
+        const uint32_t *sorted = sorted_unique_tag_ids.data();
+        const size_t sorted_n = sorted_unique_tag_ids.size();
+        size_t hint = 0; // monotonic hint — tags in RPN tend to repeat, so this helps
+        for (const auto &item : Bucket_RPN)
+        {
+            if (!item.is_op)
+            {
+                // Linear scan from hint (monotonic since sorted tags are unique & ascending)
+                while (hint < sorted_n && sorted[hint] < item.value)
+                    ++hint;
+                rpn_tag_to_sorted_idx.push_back(static_cast<uint32_t>(hint));
+            }
+            else
+            {
+                rpn_tag_to_sorted_idx.push_back(UINT32_MAX);
+            }
+        }
+    }
 }

@@ -10,6 +10,7 @@
 #include <iostream>
 #include <functional>
 #include <chrono>
+#include <atomic>
 #include <iomanip>
 #include <limits>
 #include <queue>
@@ -31,12 +32,41 @@
 #include "DataBaseCPU/AlignedAllocator.h"
 #include "Query/FilterExpCompiler.h"
 
+// FP32 to FP16 conversion for query vectors
+inline uint16_t QueryFloat32ToFp16(float value)
+{
+    uint32_t f32;
+    std::memcpy(&f32, &value, sizeof(float));
+    uint16_t f16 = 0;
+    uint32_t sign = (f32 >> 16) & 0x8000;
+    int16_t exponent = ((f32 >> 23) & 0xFF) - 127;
+    uint32_t mantissa = f32 & 0x007FFFFF;
+    if (exponent > 15)
+    {
+        f16 = sign | 0x7C00;
+    }
+    else if (exponent <= -15)
+    {
+        f16 = sign;
+    }
+    else
+    {
+        exponent += 15;
+        mantissa >>= 13;
+        f16 = sign | (exponent << 10) | mantissa;
+    }
+    return f16;
+}
+
 struct QueryResult
 {
     struct Item
     {
         uint32_t doc_id;
         float score;
+
+        Item() = default;
+        Item(uint32_t d, float s) : doc_id(d), score(s) {}
 
         // 用于 TopK 排序 (分数降序，越大越好，适配向量内积)
         bool operator>(const Item &other) const { return score > other.score; }
@@ -51,28 +81,6 @@ struct QueryResult
         return a.doc_id < b.doc_id;
     }
 
-    static void DeduplicateByDoc(std::vector<Item> &items)
-    {
-        if (items.size() < 2) {
-            return;
-        }
-
-        std::sort(items.begin(), items.end(), [](const Item &a, const Item &b) {
-            if (a.doc_id != b.doc_id) {
-                return a.doc_id < b.doc_id;
-            }
-            return QueryResult::BetterItem(a, b);
-        });
-
-        size_t write = 0;
-        for (size_t read = 0; read < items.size(); ++read) {
-            if (write == 0 || items[read].doc_id != items[write - 1].doc_id) {
-                items[write++] = items[read];
-            }
-        }
-        items.resize(write);
-    }
-
     static void KeepTopK(std::vector<Item> &items, int target_k)
     {
         if (target_k <= 0) {
@@ -82,22 +90,13 @@ struct QueryResult
 
         if (items.size() > static_cast<size_t>(target_k))
         {
-            std::nth_element(items.begin(),
+            std::partial_sort(items.begin(),
                              items.begin() + target_k,
                              items.end(),
-                             QueryResult::BetterItem);
+                             BetterItem);
             items.resize(target_k);
         }
-
-        std::sort(items.begin(), items.end(), QueryResult::BetterItem);
     }
-
-    static void DeduplicateAndKeepTopK(std::vector<Item> &items, int target_k)
-    {
-        DeduplicateByDoc(items);
-        KeepTopK(items, target_k);
-    }
-
     // 最终的 TopK 结果 (按向量内积 score 降序排列)
     std::vector<Item> topk_results;
 
@@ -147,12 +146,16 @@ public:
         bool is_temp = false;
     };
 
+    // search_bucket diagnostic counters removed (atomic overhead was too high)
+
     std::vector<float> query_vector; // 查询向量
+    std::vector<uint16_t> mmad_query_padded_fp16; // MMAD [k,16] padded query payload
     FilterExp filter_exp;            // Filter 表达式
     int target_k = 0;                // 最终返回的 Top-K
     int expanded_k = 0;              // 实际检索阶段使用的扩展 K
     size_t query_id = 0;             // 查询编号（使用查询文件行号）
-    int process_round_count = 0;     // 当前查询实际执行的搜索轮数
+    int process_round_count_level_1 = 0; // 当前查询实际执行的一级桶扩搜轮数
+    int process_round_count_level_2 = 0; // 当前查询实际执行的二级桶处理子批次数
     QueryResult result;              // 查询结果
 
     // ==========================================
@@ -190,7 +193,8 @@ public:
         target_k = k;
         expanded_k = k;
         query_id = query_id_in;
-        process_round_count = 0;
+        process_round_count_level_1 = 0;
+        process_round_count_level_2 = 0;
         recall_rate = 0.0f;
         timing_metrics = QueryTimingMetrics{};
         start_time = std::chrono::steady_clock::now();
@@ -208,16 +212,39 @@ public:
                            "Query.h:query_vector");
         query_vector.insert(query_vector.end(), vec.begin(), vec.end());
 
+        // Pre-compute MMAD query payload (FP16 padded to [dim, 16])
+        constexpr size_t kKernelResultCols = 16;
+        const size_t padded_size = static_cast<size_t>(vector_dim) * kKernelResultCols;
+        mmad_query_padded_fp16.clear();
+        mmad_query_padded_fp16.resize(padded_size, 0);
+#if defined(__aarch64__) || defined(__arm__)
+        size_t i = 0;
+        for (; i + 3 < vector_dim; i += 4)
+        {
+            float32x4_t vf32 = vld1q_f32(query_vector.data() + i);
+            float16x4_t vf16 = vcvt_f16_f32(vf32);
+            uint16x4_t vi16 = vreinterpret_u16_f16(vf16);
+            vst1_lane_u16(mmad_query_padded_fp16.data() + (i + 0) * kKernelResultCols, vi16, 0);
+            vst1_lane_u16(mmad_query_padded_fp16.data() + (i + 1) * kKernelResultCols, vi16, 1);
+            vst1_lane_u16(mmad_query_padded_fp16.data() + (i + 2) * kKernelResultCols, vi16, 2);
+            vst1_lane_u16(mmad_query_padded_fp16.data() + (i + 3) * kKernelResultCols, vi16, 3);
+        }
+        for (; i < vector_dim; ++i)
+        {
+            mmad_query_padded_fp16[i * kKernelResultCols] = QueryFloat32ToFp16(query_vector[i]);
+        }
+#else
+        for (size_t i = 0; i < static_cast<size_t>(vector_dim); ++i)
+        {
+            mmad_query_padded_fp16[i * kKernelResultCols] = QueryFloat32ToFp16(query_vector[i]);
+        }
+#endif
+
         filter_exp.CompileFrom(filter_expr_text);
 
-        const long long expanded =
-            static_cast<long long>(std::max(k, 0)) * static_cast<long long>(k_expand_param);
-        expanded_k = (expanded > static_cast<long long>(std::numeric_limits<int>::max()))
-                         ? std::numeric_limits<int>::max()
-                         : static_cast<int>(expanded);
-        if (expanded_k < target_k)
+        if (!ComputeExpandedKFromTopK(k, expanded_k))
         {
-            expanded_k = target_k;
+            expanded_k = std::numeric_limits<int>::max();
         }
     }
 
@@ -363,12 +390,17 @@ public:
                     {
                         uint32_t j = 0;
 #if defined(__aarch64__) || defined(__arm__)
-                        for (; j + 1 < block_len; j += 2)
+                        // ---- NEON 256-bit: 4 uint64/iteration (2x uint64x2_t) ----
+                        for (; j + 3 < block_len; j += 4)
                         {
-                            uint64x2_t v1 = vld1q_u64(left.ptr + j);
-                            uint64x2_t v2 = vld1q_u64(right.ptr + j);
-                            uint64x2_t vres = vandq_u64(v1, v2);
-                            vst1q_u64(res_ptr + j, vres);
+                            uint64x2_t v1_0 = vld1q_u64(left.ptr + j);
+                            uint64x2_t v1_1 = vld1q_u64(left.ptr + j + 2);
+                            uint64x2_t v2_0 = vld1q_u64(right.ptr + j);
+                            uint64x2_t v2_1 = vld1q_u64(right.ptr + j + 2);
+                            uint64x2_t vres_0 = vandq_u64(v1_0, v2_0);
+                            uint64x2_t vres_1 = vandq_u64(v1_1, v2_1);
+                            vst1q_u64(res_ptr + j, vres_0);
+                            vst1q_u64(res_ptr + j + 2, vres_1);
                         }
 #endif
                         for (; j < block_len; ++j)
@@ -378,12 +410,17 @@ public:
                     {
                         uint32_t j = 0;
 #if defined(__aarch64__) || defined(__arm__)
-                        for (; j + 1 < block_len; j += 2)
+                        // ---- NEON 256-bit: 4 uint64/iteration (2x uint64x2_t) ----
+                        for (; j + 3 < block_len; j += 4)
                         {
-                            uint64x2_t v1 = vld1q_u64(left.ptr + j);
-                            uint64x2_t v2 = vld1q_u64(right.ptr + j);
-                            uint64x2_t vres = vorrq_u64(v1, v2);
-                            vst1q_u64(res_ptr + j, vres);
+                            uint64x2_t v1_0 = vld1q_u64(left.ptr + j);
+                            uint64x2_t v1_1 = vld1q_u64(left.ptr + j + 2);
+                            uint64x2_t v2_0 = vld1q_u64(right.ptr + j);
+                            uint64x2_t v2_1 = vld1q_u64(right.ptr + j + 2);
+                            uint64x2_t vres_0 = vorrq_u64(v1_0, v2_0);
+                            uint64x2_t vres_1 = vorrq_u64(v1_1, v2_1);
+                            vst1q_u64(res_ptr + j, vres_0);
+                            vst1q_u64(res_ptr + j + 2, vres_1);
                         }
 #endif
                         for (; j < block_len; ++j)
@@ -436,6 +473,30 @@ public:
         MemoryEventSession *session = GetActiveMemoryEventSession();
         const size_t stack_old_capacity = session == nullptr ? 0 : stack.capacity();
 
+        // Sentinel pointers for short-circuit optimization
+        const uint64_t *kZero = BucketInternal::g_global_zero_bitmap;
+        const uint64_t *kOnes = BucketInternal::g_global_ones_bitmap;
+
+        // ---- OPT: Pre-cache tag bitmap pointers outside block loop ----
+        const size_t rpn_size = rpn.size();
+        std::vector<const uint64_t *> tag_base_ptrs;
+        tag_base_ptrs.reserve(rpn_size);
+        for (size_t i = 0; i < rpn_size; ++i)
+        {
+            if (!rpn[i].is_op)
+            {
+                const uint64_t *base = bucket.get_tag_bits(rpn[i].value);
+                if ((rpn[i].flags & 1) && base == kZero)
+                    tag_base_ptrs.push_back(kOnes);
+                else
+                    tag_base_ptrs.push_back(base);
+            }
+            else
+            {
+                tag_base_ptrs.push_back(nullptr);
+            }
+        }
+
         for (uint32_t block_start = 0; block_start < stride; block_start += block_u64)
         {
             uint32_t block_len = std::min(block_u64, stride - block_start);
@@ -443,8 +504,7 @@ public:
             size_t needed_size = rpn.size() * block_len;
             if (scratch_buffer.size() < needed_size)
             {
-                // 仅为了 Debug
-                // scratch_buffer.resize(needed_size);
+                scratch_buffer.resize(needed_size + 1024);
             }
 
             auto alloc_scratch = [&](uint32_t len) -> uint64_t *
@@ -460,34 +520,67 @@ public:
 
             stack.clear();
 
-            for (const auto &item : rpn)
+            for (size_t rpn_idx = 0; rpn_idx < rpn.size(); ++rpn_idx)
             {
+                const auto &item = rpn[rpn_idx];
                 if (!item.is_op)
                 {
-                    const uint64_t *tag_bits = bucket.get_tag_bits(item.value) + block_start;
+                    const uint64_t *tag_base = tag_base_ptrs[rpn_idx];
+
+                    // Prefetch next few tag bitmaps (lookahead 4 in RPN order)
+                    {
+                        size_t look = rpn_idx + 1;
+                        int issued = 0;
+                        while (look < rpn.size() && issued < 4)
+                        {
+                            if (!rpn[look].is_op)
+                            {
+                                const uint64_t *look_base = tag_base_ptrs[look];
+                                if (look_base != kZero && look_base != kOnes)
+                                    __builtin_prefetch(look_base + block_start, 0, 1);
+                                ++issued;
+                            }
+                            ++look;
+                        }
+                    }
 
                     if (item.flags & 1)
                     {
-                        uint64_t *res_ptr = alloc_scratch(block_len);
-
-                        uint32_t i = 0;
-#if defined(__aarch64__) || defined(__arm__)
-                        uint64x2_t all_ones = vdupq_n_u64(~0ULL);
-                        for (; i + 1 < block_len; i += 2)
+                        if (tag_base == kOnes)
                         {
-                            uint64x2_t v = vld1q_u64(tag_bits + i);
-                            uint64x2_t vres = veorq_u64(v, all_ones);
-                            vst1q_u64(res_ptr + i, vres);
+                            stack.push_back({kOnes, false});
                         }
+                        else
+                        {
+                            const uint64_t *tag_bits = tag_base + block_start;
+                            uint64_t *res_ptr = alloc_scratch(block_len);
+                            uint32_t i = 0;
+#if defined(__aarch64__) || defined(__arm__)
+                            uint64x2_t all_ones = vdupq_n_u64(~0ULL);
+                            for (; i + 3 < block_len; i += 4)
+                            {
+                                uint64x2_t v_0 = vld1q_u64(tag_bits + i);
+                                uint64x2_t v_1 = vld1q_u64(tag_bits + i + 2);
+                                vst1q_u64(res_ptr + i, veorq_u64(v_0, all_ones));
+                                vst1q_u64(res_ptr + i + 2, veorq_u64(v_1, all_ones));
+                            }
 #endif
-                        for (; i < block_len; ++i)
-                            res_ptr[i] = ~tag_bits[i];
-
-                        stack.push_back({res_ptr, true});
+                            for (; i < block_len; ++i)
+                                res_ptr[i] = ~tag_bits[i];
+                            stack.push_back({res_ptr, true});
+                        }
                     }
                     else
                     {
-                        stack.push_back({tag_bits, false});
+                        if (tag_base == kZero)
+                        {
+                            stack.push_back({kZero, false});
+                        }
+                        else
+                        {
+                            const uint64_t *tag_bits = tag_base + block_start;
+                            stack.push_back({tag_bits, false});
+                        }
                     }
                 }
                 else
@@ -497,39 +590,164 @@ public:
                     auto left = stack.back();
                     stack.pop_back();
 
-                    uint64_t *res_ptr = alloc_scratch(block_len);
-
                     if (item.value == FilterOp8::OP_AND)
                     {
-                        uint32_t i = 0;
-#if defined(__aarch64__) || defined(__arm__)
-                        for (; i + 1 < block_len; i += 2)
+                        // ---- Short-circuit for AND ----
+                        if (left.ptr == kZero || right.ptr == kZero)
                         {
-                            uint64x2_t v1 = vld1q_u64(left.ptr + i);
-                            uint64x2_t v2 = vld1q_u64(right.ptr + i);
-                            uint64x2_t vres = vandq_u64(v1, v2);
-                            vst1q_u64(res_ptr + i, vres);
+                            // 0 AND X = 0
+                            stack.push_back({kZero, false});
                         }
+                        else if (left.ptr == kOnes)
+                        {
+                            // all-ones AND X = X
+                            stack.push_back(right);
+                        }
+                        else if (right.ptr == kOnes)
+                        {
+                            // X AND all-ones = X
+                            stack.push_back(left);
+                        }
+                        else if (left.is_temp)
+                        {
+                            // In-place AND into left's temp buffer (saves alloc + write)
+                            uint64_t *dst = const_cast<uint64_t*>(left.ptr);
+                            uint32_t i = 0;
+#if defined(__aarch64__) || defined(__arm__)
+                            for (; i + 3 < block_len; i += 4)
+                            {
+                                uint64x2_t vl_0 = vld1q_u64(dst + i);
+                                uint64x2_t vl_1 = vld1q_u64(dst + i + 2);
+                                uint64x2_t vr_0 = vld1q_u64(right.ptr + i);
+                                uint64x2_t vr_1 = vld1q_u64(right.ptr + i + 2);
+                                vst1q_u64(dst + i, vandq_u64(vl_0, vr_0));
+                                vst1q_u64(dst + i + 2, vandq_u64(vl_1, vr_1));
+                            }
 #endif
-                        for (; i < block_len; ++i)
-                            res_ptr[i] = left.ptr[i] & right.ptr[i];
+                            for (; i < block_len; ++i)
+                                dst[i] &= right.ptr[i];
+                            stack.push_back({left.ptr, true});
+                        }
+                        else if (right.is_temp)
+                        {
+                            // In-place AND into right's temp buffer
+                            uint64_t *dst = const_cast<uint64_t*>(right.ptr);
+                            uint32_t i = 0;
+#if defined(__aarch64__) || defined(__arm__)
+                            for (; i + 3 < block_len; i += 4)
+                            {
+                                uint64x2_t vl_0 = vld1q_u64(left.ptr + i);
+                                uint64x2_t vl_1 = vld1q_u64(left.ptr + i + 2);
+                                uint64x2_t vr_0 = vld1q_u64(dst + i);
+                                uint64x2_t vr_1 = vld1q_u64(dst + i + 2);
+                                vst1q_u64(dst + i, vandq_u64(vl_0, vr_0));
+                                vst1q_u64(dst + i + 2, vandq_u64(vl_1, vr_1));
+                            }
+#endif
+                            for (; i < block_len; ++i)
+                                dst[i] &= left.ptr[i];
+                            stack.push_back({right.ptr, true});
+                        }
+                        else
+                        {
+                            // Neither is temp: allocate scratch
+                            uint64_t *res_ptr = alloc_scratch(block_len);
+                            uint32_t i = 0;
+#if defined(__aarch64__) || defined(__arm__)
+                            for (; i + 3 < block_len; i += 4)
+                            {
+                                uint64x2_t vl_0 = vld1q_u64(left.ptr + i);
+                                uint64x2_t vl_1 = vld1q_u64(left.ptr + i + 2);
+                                uint64x2_t vr_0 = vld1q_u64(right.ptr + i);
+                                uint64x2_t vr_1 = vld1q_u64(right.ptr + i + 2);
+                                vst1q_u64(res_ptr + i, vandq_u64(vl_0, vr_0));
+                                vst1q_u64(res_ptr + i + 2, vandq_u64(vl_1, vr_1));
+                            }
+#endif
+                            for (; i < block_len; ++i)
+                                res_ptr[i] = left.ptr[i] & right.ptr[i];
+                            stack.push_back({res_ptr, true});
+                        }
                     }
-                    else
+                    else  // OP_OR
                     {
-                        uint32_t i = 0;
-#if defined(__aarch64__) || defined(__arm__)
-                        for (; i + 1 < block_len; i += 2)
+                        // ---- Short-circuit for OR ----
+                        if (left.ptr == kOnes || right.ptr == kOnes)
                         {
-                            uint64x2_t v1 = vld1q_u64(left.ptr + i);
-                            uint64x2_t v2 = vld1q_u64(right.ptr + i);
-                            uint64x2_t vres = vorrq_u64(v1, v2);
-                            vst1q_u64(res_ptr + i, vres);
+                            // all-ones OR X = all-ones
+                            stack.push_back({kOnes, false});
                         }
+                        else if (left.ptr == kZero)
+                        {
+                            // 0 OR X = X
+                            stack.push_back(right);
+                        }
+                        else if (right.ptr == kZero)
+                        {
+                            // X OR 0 = X
+                            stack.push_back(left);
+                        }
+                        else if (left.is_temp)
+                        {
+                            // In-place OR into left's temp buffer
+                            uint64_t *dst = const_cast<uint64_t*>(left.ptr);
+                            uint32_t i = 0;
+#if defined(__aarch64__) || defined(__arm__)
+                            for (; i + 3 < block_len; i += 4)
+                            {
+                                uint64x2_t vl_0 = vld1q_u64(dst + i);
+                                uint64x2_t vl_1 = vld1q_u64(dst + i + 2);
+                                uint64x2_t vr_0 = vld1q_u64(right.ptr + i);
+                                uint64x2_t vr_1 = vld1q_u64(right.ptr + i + 2);
+                                vst1q_u64(dst + i, vorrq_u64(vl_0, vr_0));
+                                vst1q_u64(dst + i + 2, vorrq_u64(vl_1, vr_1));
+                            }
 #endif
-                        for (; i < block_len; ++i)
-                            res_ptr[i] = left.ptr[i] | right.ptr[i];
+                            for (; i < block_len; ++i)
+                                dst[i] |= right.ptr[i];
+                            stack.push_back({left.ptr, true});
+                        }
+                        else if (right.is_temp)
+                        {
+                            // In-place OR into right's temp buffer
+                            uint64_t *dst = const_cast<uint64_t*>(right.ptr);
+                            uint32_t i = 0;
+#if defined(__aarch64__) || defined(__arm__)
+                            for (; i + 3 < block_len; i += 4)
+                            {
+                                uint64x2_t vl_0 = vld1q_u64(left.ptr + i);
+                                uint64x2_t vl_1 = vld1q_u64(left.ptr + i + 2);
+                                uint64x2_t vr_0 = vld1q_u64(dst + i);
+                                uint64x2_t vr_1 = vld1q_u64(dst + i + 2);
+                                vst1q_u64(dst + i, vorrq_u64(vl_0, vr_0));
+                                vst1q_u64(dst + i + 2, vorrq_u64(vl_1, vr_1));
+                            }
+#endif
+                            for (; i < block_len; ++i)
+                                dst[i] |= left.ptr[i];
+                            stack.push_back({right.ptr, true});
+                        }
+                        else
+                        {
+                            // Neither is temp: allocate scratch
+                            uint64_t *res_ptr = alloc_scratch(block_len);
+                            uint32_t i = 0;
+#if defined(__aarch64__) || defined(__arm__)
+                            for (; i + 3 < block_len; i += 4)
+                            {
+                                uint64x2_t vl_0 = vld1q_u64(left.ptr + i);
+                                uint64x2_t vl_1 = vld1q_u64(left.ptr + i + 2);
+                                uint64x2_t vr_0 = vld1q_u64(right.ptr + i);
+                                uint64x2_t vr_1 = vld1q_u64(right.ptr + i + 2);
+                                vst1q_u64(res_ptr + i, vorrq_u64(vl_0, vr_0));
+                                vst1q_u64(res_ptr + i + 2, vorrq_u64(vl_1, vr_1));
+                            }
+#endif
+                            for (; i < block_len; ++i)
+                                res_ptr[i] = left.ptr[i] | right.ptr[i];
+                            stack.push_back({res_ptr, true});
+                        }
                     }
-                    stack.push_back({res_ptr, true});
                 }
             }
 
@@ -537,7 +755,19 @@ public:
                 return;
 
             const uint64_t *final_res = stack.back().ptr;
-            std::memcpy(valid_docs_out.data() + block_start, final_res, block_len * sizeof(uint64_t));
+            // Handle sentinel pointers in final memcpy
+            if (final_res == kZero)
+            {
+                std::memset(valid_docs_out.data() + block_start, 0, block_len * sizeof(uint64_t));
+            }
+            else if (final_res == kOnes)
+            {
+                std::memset(valid_docs_out.data() + block_start, 0xFF, block_len * sizeof(uint64_t));
+            }
+            else
+            {
+                std::memcpy(valid_docs_out.data() + block_start, final_res, block_len * sizeof(uint64_t));
+            }
         }
 
         RecordCapacityGrowth<EvalStackItem>(session,
