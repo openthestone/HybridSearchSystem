@@ -147,13 +147,13 @@ bool LoadPreparedQueriesFromFvec(const std::vector<std::string> &query_paths,
 
 int main()
 {
-    constexpr const char *kDatasetFile = "../../dataset_DEEP.bin";
+    constexpr const char *kDatasetFile = "../../dataset_HW.bin";
     constexpr int kDefaultTopK = 100;
     const std::vector<std::string> kQueryPaths = {
-        "datasets/DEEP/deep1B_queries.fvecs",
-        "../datasets/DEEP/deep1B_queries.fvecs",
-        "../../datasets/DEEP/deep1B_queries.fvecs",
-        "../../../datasets/DEEP/deep1B_queries.fvecs"
+        "datasets/hw_queries.fvecs",
+        "../datasets/hw_queries.fvecs",
+        "../../datasets/hw_queries.fvecs",
+        "../../../datasets/hw_queries.fvecs"
     };
 
     const fs::path config_path = RunSupport::ResolveConfigPath();
