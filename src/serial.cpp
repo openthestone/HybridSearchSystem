@@ -303,15 +303,22 @@ struct DeferredMetricFiles
 } // namespace
 
 int main() {
-    constexpr const char *kDatasetFile = "../../dataset_HW.bin";
     constexpr int kDefaultTopK = 100;
     constexpr int QueryNum = 10000;
+    constexpr const char *kDatasetFile = "../../dataset_HW.bin";
     const std::vector<std::string> kQueryPaths = {
         "datasets/hw_queries.fvecs",
         "../datasets/hw_queries.fvecs",
         "../../datasets/hw_queries.fvecs",
         "../../../datasets/hw_queries.fvecs"
     };
+    // constexpr const char *kDatasetFile = "../../dataset_DEEP.bin";
+    // const std::vector<std::string> kQueryPaths = {
+    //     "queries/deep1B_queries.fvecs",
+    //     "../queries/deep1B_queries.fvecs",
+    //     "../../queries/deep1B_queries.fvecs",
+    //     "../../../queries/deep1B_queries.fvecs"
+    // };
 
     const fs::path config_path = RunSupport::ResolveConfigPath();
     std::cout << "[System] Loading config from " << config_path << "...\n";
@@ -370,8 +377,8 @@ int main() {
     {
         std::vector<std::string> filter_exprs_10;
         const fs::path filter_expr_path = config_path.has_parent_path()
-                                              ? (config_path.parent_path() / "filter_expr_example.txt")
-                                              : fs::path("filter_expr_example.txt");
+                                              ? (config_path.parent_path() / "filter_expr_600.txt")
+                                              : fs::path("filter_expr_600.txt");
         {
             std::ifstream fexpr_file(filter_expr_path);
             std::string line;
@@ -382,10 +389,10 @@ int main() {
             }
         }
         if (filter_exprs_10.empty()) {
-            std::cerr << "[Warn] filter_expr_example.txt not found or empty at " << filter_expr_path
+            std::cerr << "[Warn] filter_expr.txt not found or empty at " << filter_expr_path
                       << ". Using empty filters for all queries.\n";
         } else if (filter_exprs_10.size() < 10) {
-            std::cerr << "[Warn] filter_expr_example.txt has fewer than 10 lines. Using available expressions.\n";
+            std::cerr << "[Warn] filter_expr.txt has fewer than 10 lines. Using available expressions.\n";
         }
 
         std::vector<std::string> filter_exprs_N;

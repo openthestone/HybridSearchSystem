@@ -21,7 +21,11 @@
 class DataBaseCPU
 {
 public:
-    DataBaseCPU(const InputDataset &dataset, TwoLevelBucketLayout bucket_layout)
+    DataBaseCPU(const InputDataset &dataset,
+                TwoLevelBucketLayout bucket_layout,
+                bool enable_npu_vector_compute = (pure_cpu_compute_enable == 0))
+        : doc_vectors_(dataset.vectors),
+          use_npu_vector_compute_(enable_npu_vector_compute)
     {
         std::cout << "[DB] Starting Index Construction..." << std::endl;
 
@@ -74,14 +78,20 @@ public:
             }
         }
 
-        npuAPI::Init(dataset, normalized_level_2_bucket_doc_table);
+        if (use_npu_vector_compute_)
+        {
+            npuAPI::Init(dataset, normalized_level_2_bucket_doc_table);
+        }
         std::cout << "[DB] Index Construction Complete." << std::endl;
     }
 
     // 析构时清理 NPU 资源
     ~DataBaseCPU()
     {
-        npuAPI::Finalize();
+        if (use_npu_vector_compute_)
+        {
+            npuAPI::Finalize();
+        }
     }
 
     /**
@@ -108,6 +118,16 @@ public:
         return bucket_centroids_.data();
     }
 
+    const float *get_doc_vectors() const
+    {
+        return doc_vectors_;
+    }
+
+    bool UsesNpuVectorCompute() const
+    {
+        return use_npu_vector_compute_;
+    }
+
     uint32_t get_level_2_bucket_begin(uint32_t level_1_bucket_id) const
     {
         return level_1_to_level_2_offsets_[level_1_bucket_id];
@@ -129,7 +149,7 @@ public:
 
 private:
     static constexpr uint32_t kBucketIvfIndexFileVersion = 2;
-    static constexpr uint32_t kBucketIndexFileVersion = 5;
+    static constexpr uint32_t kBucketIndexFileVersion = 2;
     static constexpr size_t kQueryScoreCols = 16;
 
     static void ValidateQueryScoreSlotCapacities(const BucketDocTable &level_1_bucket_doc_table)
@@ -633,4 +653,7 @@ private:
     std::vector<float, AlignedAllocator<float>> bucket_centroids_;
     uint64_t level_1_bucket_layout_hash_ = 0;
     uint64_t level_2_bucket_layout_hash_ = 0;
+
+    const float *doc_vectors_ = nullptr;
+    bool use_npu_vector_compute_ = true;
 };

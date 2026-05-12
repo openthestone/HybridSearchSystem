@@ -25,160 +25,6 @@ namespace fs = RunSupport::fs;
 namespace
 {
 
-// ---- NUMA-aware core mapping ----
-// Auto-detect NPU NUMA affinity and build a core list that places each
-// device's worker groups on CPU cores that are local to that device's NUMA
-// node.  Falls back to sequential cores 0..N-1 when detection fails.
-std::vector<int> BuildNumaAwareCoreMap()
-{
-    // Gather local CPU core lists per logical device.
-    // Ascend logical device IDs map to physical /dev/davinci<id> in ascending order.
-    struct DeviceNumaInfo
-    {
-        int logical_dev_id;
-        int numa_node;
-        std::vector<int> local_cores;
-    };
-
-    std::vector<DeviceNumaInfo> dev_infos;
-    dev_infos.reserve(static_cast<size_t>(npu_device_count));
-
-    // Enumerate available davinci devices to get physical IDs.
-    // Physical IDs are sorted so that logical device 0 = smallest physical ID, etc.
-    std::vector<int> physical_ids;
-    for (int pid = 0; pid < 256; ++pid)
-    {
-        std::string dev = "/dev/davinci" + std::to_string(pid);
-        if (access(dev.c_str(), F_OK) == 0)
-        {
-            physical_ids.push_back(pid);
-        }
-    }
-
-    if (physical_ids.size() < static_cast<size_t>(npu_device_count))
-    {
-        std::cerr << "[NUMA] Cannot enumerate enough davinci devices, falling back to default cores.\n";
-        return {};
-    }
-
-    // Sort to get consistent logical -> physical mapping.
-    std::sort(physical_ids.begin(), physical_ids.end());
-
-    for (int d = npu_device_id_start; d < npu_device_id_start + npu_device_count; ++d)
-    {
-        DeviceNumaInfo info;
-        info.logical_dev_id = d;
-        int physical_id = physical_ids[static_cast<size_t>(d)];
-
-        // Find PCI bus via npu-smi.
-        std::string cmd = "npu-smi info -t board -i " + std::to_string(physical_id) + " 2>/dev/null";
-        FILE *pipe = popen(cmd.c_str(), "r");
-        std::string pci_bus;
-        if (pipe)
-        {
-            char buf[512];
-            while (fgets(buf, sizeof(buf), pipe))
-            {
-                std::string line(buf);
-                auto pos = line.find("PCIe Bus Info");
-                if (pos != std::string::npos)
-                {
-                    // Format: "  PCIe Bus Info                  : 0000:C2:00.0"
-                    // Find the separator " : " after the label.
-                    auto sep = line.find(" : ", pos);
-                    if (sep != std::string::npos)
-                    {
-                        pci_bus = line.substr(sep + 3);
-                        // Trim trailing whitespace / newline
-                        while (!pci_bus.empty() && (pci_bus.back() == ' ' || pci_bus.back() == '\t' || pci_bus.back() == '\n' || pci_bus.back() == '\r'))
-                            pci_bus.pop_back();
-                        // sysfs paths use lowercase hex
-                        std::transform(pci_bus.begin(), pci_bus.end(), pci_bus.begin(),
-                                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-                    }
-                    break;
-                }
-            }
-            pclose(pipe);
-        }
-
-        if (pci_bus.empty())
-        {
-            std::cerr << "[NUMA] Cannot find PCI bus for NPU " << physical_id << ", falling back.\n";
-            return {};
-        }
-
-        // Read NUMA node.
-        std::string numa_path = "/sys/bus/pci/devices/" + pci_bus + "/numa_node";
-        std::ifstream nf(numa_path);
-        if (!nf.is_open() || !(nf >> info.numa_node) || info.numa_node < 0)
-        {
-            std::cerr << "[NUMA] Cannot read NUMA node for " << pci_bus << ", falling back.\n";
-            return {};
-        }
-
-        // Read local CPU list (format: "start-end" or "start,end,...").
-        std::string cpu_path = "/sys/bus/pci/devices/" + pci_bus + "/local_cpulist";
-        std::ifstream cf(cpu_path);
-        std::string cpu_list_str;
-        if (!cf.is_open() || !std::getline(cf, cpu_list_str) || cpu_list_str.empty())
-        {
-            std::cerr << "[NUMA] Cannot read local CPUs for " << pci_bus << ", falling back.\n";
-            return {};
-        }
-
-        // Parse cpulist (e.g. "144-167" or "0-23,48-71").
-        {
-            std::string token;
-            std::istringstream ss(cpu_list_str);
-            while (std::getline(ss, token, ','))
-            {
-                auto dash = token.find('-');
-                if (dash != std::string::npos)
-                {
-                    int start = std::stoi(token.substr(0, dash));
-                    int end = std::stoi(token.substr(dash + 1));
-                    for (int c = start; c <= end; ++c)
-                        info.local_cores.push_back(c);
-                }
-                else
-                {
-                    info.local_cores.push_back(std::stoi(token));
-                }
-            }
-        }
-
-        std::cout << "[NUMA] Device " << d << " (physical NPU " << physical_id
-                  << ", PCI " << pci_bus << ") -> NUMA " << info.numa_node
-                  << ", local_cores=" << info.local_cores.front() << "-" << info.local_cores.back()
-                  << " (" << info.local_cores.size() << " cores)\n";
-        dev_infos.push_back(std::move(info));
-    }
-
-    // Build the core map: for each device, allocate groups_per_device groups,
-    // each consuming cores_per_group cores from the device's local core list.
-    const int cores_needed_per_device = groups_per_device * cores_per_group;
-    std::vector<int> result;
-    result.reserve(static_cast<size_t>(group_count * cores_per_group));
-
-    for (const auto &di : dev_infos)
-    {
-        if (static_cast<int>(di.local_cores.size()) < cores_needed_per_device)
-        {
-            std::cerr << "[NUMA] Device " << di.logical_dev_id << " has only "
-                      << di.local_cores.size() << " local cores, need " << cores_needed_per_device
-                      << ". Falling back.\n";
-            return {};
-        }
-        for (int i = 0; i < cores_needed_per_device; ++i)
-        {
-            result.push_back(di.local_cores[static_cast<size_t>(i)]);
-        }
-    }
-
-    return result;
-}
-
 
 bool LoadPreparedQueriesFromFvec(const std::vector<std::string> &query_paths,
                                  int expected_dim,
@@ -305,10 +151,30 @@ bool LoadPreparedQueriesFromFvec(const std::vector<std::string> &query_paths,
 }
 
 bool CollectParallelLatencyMetrics(const std::vector<std::unique_ptr<Query>> &queries,
-                                   std::vector<double> &total_end_to_end_ms)
+                                   std::vector<double> &total_end_to_end_ms,
+                                   std::vector<double> &bucket_level_ivf_ms,
+                                   std::vector<double> &candidate_bucket_merge_ms,
+                                   std::vector<double> &npu_async_launch_ms,
+                                   std::vector<double> &inbucket_attr_filter_overlapped_ms,
+                                   std::vector<double> &wait_npu_flag_ms,
+                                   std::vector<double> &result_collection_ms,
+                                   std::vector<double> &final_merge_ms,
+                                   std::vector<size_t> &process_round_count_level_1,
+                                   std::vector<size_t> &process_round_count_level_2)
 {
-    total_end_to_end_ms.resize(queries.size());
-    for (size_t i = 0; i < queries.size(); ++i)
+    const size_t n = queries.size();
+    total_end_to_end_ms.resize(n);
+    bucket_level_ivf_ms.resize(n);
+    candidate_bucket_merge_ms.resize(n);
+    npu_async_launch_ms.resize(n);
+    inbucket_attr_filter_overlapped_ms.resize(n);
+    wait_npu_flag_ms.resize(n);
+    result_collection_ms.resize(n);
+    final_merge_ms.resize(n);
+    process_round_count_level_1.resize(n);
+    process_round_count_level_2.resize(n);
+
+    for (size_t i = 0; i < n; ++i)
     {
         const Query &query = *queries[i];
         if (query.start_time_for_parallel_record == std::chrono::steady_clock::time_point{})
@@ -334,6 +200,15 @@ bool CollectParallelLatencyMetrics(const std::vector<std::unique_ptr<Query>> &qu
             std::chrono::duration<double, std::milli>(query.end_time_for_parallel_record -
                                                       query.start_time_for_parallel_record)
                 .count();
+        bucket_level_ivf_ms[i] = query.timing_metrics.bucket_level_ivf_ms;
+        candidate_bucket_merge_ms[i] = query.timing_metrics.candidate_bucket_merge_ms;
+        npu_async_launch_ms[i] = query.timing_metrics.npu_async_launch_ms;
+        inbucket_attr_filter_overlapped_ms[i] = query.timing_metrics.inbucket_attr_filter_overlapped_ms;
+        wait_npu_flag_ms[i] = query.timing_metrics.wait_npu_flag_ms;
+        result_collection_ms[i] = query.timing_metrics.result_collection_ms;
+        final_merge_ms[i] = query.timing_metrics.final_merge_ms;
+        process_round_count_level_1[i] = static_cast<size_t>(query.process_round_count_level_1);
+        process_round_count_level_2[i] = static_cast<size_t>(query.process_round_count_level_2);
     }
 
     return true;
@@ -388,9 +263,42 @@ bool CollectParallelRecallMetrics(const InputDataset &dataset,
     return true;
 }
 
+bool WriteProcessRoundCountFile(const fs::path &output_file,
+                                const std::vector<size_t> &level_1_counts,
+                                const std::vector<size_t> &level_2_counts)
+{
+    if (level_1_counts.size() != level_2_counts.size())
+    {
+        return false;
+    }
+
+    std::ofstream out(output_file, std::ios::out | std::ios::trunc);
+    if (!out.is_open())
+    {
+        return false;
+    }
+
+    out << "process_round_count_level_1\tprocess_round_count_level_2\n";
+    for (size_t i = 0; i < level_1_counts.size(); ++i)
+    {
+        out << level_1_counts[i] << '\t' << level_2_counts[i] << '\n';
+    }
+
+    return out.good();
+}
+
 bool FlushParallelOutputs(const fs::path &result_root,
                           const std::vector<double> &total_end_to_end_ms,
                           const std::vector<double> &recall_rate_percent,
+                          const std::vector<double> &bucket_level_ivf_ms,
+                          const std::vector<double> &candidate_bucket_merge_ms,
+                          const std::vector<double> &npu_async_launch_ms,
+                          const std::vector<double> &inbucket_attr_filter_overlapped_ms,
+                          const std::vector<double> &wait_npu_flag_ms,
+                          const std::vector<double> &result_collection_ms,
+                          const std::vector<double> &final_merge_ms,
+                          const std::vector<size_t> &process_round_count_level_1,
+                          const std::vector<size_t> &process_round_count_level_2,
                           double overall_qps)
 {
     const fs::path recall_dir = result_root / "recall";
@@ -402,6 +310,17 @@ bool FlushParallelOutputs(const fs::path &result_root,
            RunSupport::EnsureOutputDirectory(log_dir) &&
            RunSupport::WriteMetricFile(recall_dir, "recall_rate_percent.txt", recall_rate_percent) &&
            RunSupport::WriteMetricFile(latency_dir, "total_end_to_end_ms.txt", total_end_to_end_ms) &&
+           RunSupport::WriteMetricFile(latency_dir, "bucket_level_ivf_ms.txt", bucket_level_ivf_ms) &&
+           RunSupport::WriteMetricFile(latency_dir, "candidate_bucket_merge_ms.txt", candidate_bucket_merge_ms) &&
+           RunSupport::WriteMetricFile(latency_dir, "npu_async_launch_ms.txt", npu_async_launch_ms) &&
+           RunSupport::WriteMetricFile(latency_dir, "inbucket_attr_filter_overlapped_ms.txt",
+                                       inbucket_attr_filter_overlapped_ms) &&
+           RunSupport::WriteMetricFile(latency_dir, "wait_npu_flag_ms.txt", wait_npu_flag_ms) &&
+           RunSupport::WriteMetricFile(latency_dir, "result_collection_ms.txt", result_collection_ms) &&
+           RunSupport::WriteMetricFile(latency_dir, "final_merge_ms.txt", final_merge_ms) &&
+           WriteProcessRoundCountFile(log_dir / "process_round_count.txt",
+                                      process_round_count_level_1,
+                                      process_round_count_level_2) &&
            RunSupport::WriteMetricFile(log_dir, "QPS.txt", qps_values);
 }
 
@@ -414,16 +333,24 @@ void PrintParallelProgress(size_t completed_count,
 
 int main()
 {
-    constexpr const char *kDatasetFile = "../../dataset_HW.bin";
     constexpr int kDefaultTopK = 100;
     constexpr int QueryNum = 10000;
+    constexpr const char *kDatasetFile = "../../dataset_HW.bin";
     const std::vector<std::string> kQueryPaths = {
         "datasets/hw_queries.fvecs",
         "../datasets/hw_queries.fvecs",
         "../../datasets/hw_queries.fvecs",
         "../../../datasets/hw_queries.fvecs"
     };
-
+    // constexpr const char *kDatasetFile = "../../dataset_DEEP.bin";
+    // const std::vector<std::string> kQueryPaths = {
+    //     "queries/deep1B_queries.fvecs",
+    //     "../queries/deep1B_queries.fvecs",
+    //     "../../queries/deep1B_queries.fvecs",
+    //     "../../../queries/deep1B_queries.fvecs"
+    // };
+    const double target_qps = 10000.0;
+    
     const fs::path config_path = RunSupport::ResolveConfigPath();
     std::cout << "[System] Loading config from " << config_path << "...\n";
     if (!LoadParams(config_path.string(), ResourceConfigProfile::Parallel))
@@ -484,8 +411,8 @@ int main()
     {
         std::vector<std::string> filter_exprs_10;
         const fs::path filter_expr_path = config_path.has_parent_path()
-                                              ? (config_path.parent_path() / "filter_expr_example.txt")
-                                              : fs::path("filter_expr_example.txt");
+                                              ? (config_path.parent_path() / "filter_expr_600.txt")
+                                              : fs::path("filter_expr_600.txt");
         {
             std::ifstream fexpr_file(filter_expr_path);
             std::string line;
@@ -496,10 +423,10 @@ int main()
             }
         }
         if (filter_exprs_10.empty()) {
-            std::cerr << "[Warn] filter_expr_example.txt not found or empty at " << filter_expr_path
+            std::cerr << "[Warn] filter_expr.txt not found or empty at " << filter_expr_path
                       << ". Using empty filters for all queries.\n";
         } else if (filter_exprs_10.size() < 10) {
-            std::cerr << "[Warn] filter_expr_example.txt has fewer than 10 lines. Using available expressions.\n";
+            std::cerr << "[Warn] filter_expr.txt has fewer than 10 lines. Using available expressions.\n";
         }
 
         std::vector<std::string> filter_exprs_N;
@@ -646,16 +573,8 @@ int main()
 
     std::cout << "[System] Launching Worker Threads...\n";
 
-    // NUMA-aware core mapping is disabled: pinning worker threads to NPU-local
-    // NUMA cores (144-167, 96-119) makes all data structures allocated by the
-    // main thread on NUMA 0 remote, which drops QPS from ~1775 to ~727.
-    // g_numa_aware_cores stays empty so BindThreadToCore uses logical core IDs
-    // directly (cores 0-47), keeping data access fast on NUMA 0/1.
-    // g_numa_aware_cores = BuildNumaAwareCoreMap();
     std::cout << "[NUMA] Using default sequential cores 0.." << (cpu_core_count - 1) << "\n";
 
-    // Bind the main thread to a core outside the worker thread range (48+)
-    // to avoid L3 cache and scheduler interference with worker threads on NUMA 0/1.
     {
         cpu_set_t main_cpuset;
         CPU_ZERO(&main_cpuset);
@@ -704,9 +623,8 @@ int main()
 
     std::cout << std::fixed << std::setprecision(5);
     std::cout << "[ParallelTest] Query objects prepared. count=" << query_ptrs.size() << "\n";
-    std::cout << "[ParallelTest] Batch submit begins. target_qps=" << target_qps_parallel << "\n";
+    std::cout << "[ParallelTest] Batch submit begins. target_qps=10000\n";
 
-    const double target_qps = target_qps_parallel;
     const auto batch_start = std::chrono::steady_clock::now();
     for (size_t i = 0; i < query_ptrs.size(); ++i)
     {
@@ -745,23 +663,6 @@ int main()
                                             ? 0.0
                                             : (total_latency_ms.count() / static_cast<double>(query_ptrs.size()));
 
-    // ---- Aggregate per-query pipeline timing ----
-    double agg_ivf = 0, agg_merge = 0, agg_attr = 0, agg_collect = 0, agg_final_merge = 0;
-    int timed_count = 0;
-    for (const auto &q : query_ptrs)
-    {
-        const auto &t = q->timing_metrics;
-        if (t.inbucket_attr_filter_overlapped_ms > 0 || t.bucket_level_ivf_ms > 0)
-        {
-            agg_ivf += t.bucket_level_ivf_ms;
-            agg_merge += t.candidate_bucket_merge_ms;
-            agg_attr += t.inbucket_attr_filter_overlapped_ms;
-            agg_collect += t.result_collection_ms;
-            agg_final_merge += t.final_merge_ms;
-            ++timed_count;
-        }
-    }
-
     std::cout << "\n========================================================\n";
     std::cout << "                Parallel Batch Test Result              \n";
     std::cout << "========================================================\n";
@@ -771,17 +672,6 @@ int main()
     std::cout << "Total Batch Latency            : " << total_latency_ms.count() << " ms\n";
     std::cout << "Overall QPS                    : " << overall_qps << "\n";
     std::cout << "Average Query Latency(Batch/N) : " << avg_query_latency_ms << " ms\n";
-    if (timed_count > 0)
-    {
-        std::cout << "\n--- Per-Query Pipeline Breakdown (avg over " << timed_count << " queries) ---\n";
-        std::cout << "  IVF Filter          : " << std::fixed << std::setprecision(3) << (agg_ivf / timed_count) << " ms\n";
-        std::cout << "  Candidate Merge     : " << std::fixed << std::setprecision(3) << (agg_merge / timed_count) << " ms\n";
-        std::cout << "  Attr Filter (mask)  : " << std::fixed << std::setprecision(3) << (agg_attr / timed_count) << " ms\n";
-        std::cout << "  Collect Results     : " << std::fixed << std::setprecision(3) << (agg_collect / timed_count) << " ms\n";
-        std::cout << "  Final Merge         : " << std::fixed << std::setprecision(3) << (agg_final_merge / timed_count) << " ms\n";
-        double total_cpu = (agg_ivf + agg_merge + agg_attr + agg_collect + agg_final_merge) / timed_count;
-        std::cout << "  Total CPU (sum)     : " << std::fixed << std::setprecision(3) << total_cpu << " ms\n";
-    }
     std::cout << "========================================================\n";
 
     std::cout << "[System] All queries completed. Shutting down worker threads...\n";
@@ -797,42 +687,32 @@ int main()
         }
     }
 
-    // Print per-group query processing statistics
-    std::cout << "\n=== Per-Group Query Processing Stats ===\n";
-    std::vector<uint64_t> dev_totals(npu_device_count, 0);
-    for (int i = 0; i < group_count; ++i)
-    {
-        int dev = npu_device_id_start + g_group_to_device[i];
-        int numa = (i * cores_per_group) / 24;
-        uint64_t cnt = groups[i]->GetProcessedCount();
-        dev_totals[g_group_to_device[i]] += cnt;
-        std::cout << "  Group " << i
-                  << " (cores " << (i * cores_per_group) << "-" << (i * cores_per_group + cores_per_group - 1)
-                  << ", NUMA " << numa
-                  << ", Device " << dev
-                  << "): " << cnt << " queries\n";
-    }
-    for (int d = 0; d < npu_device_count; ++d)
-    {
-        std::cout << "  --- Device " << (npu_device_id_start + d) << " (" << GroupCountForDevice(d) << " groups) total: "
-                  << dev_totals[d] << " queries ---\n";
-    }
-    if (npu_device_count == 2 && dev_totals[0] > 0 && dev_totals[1] > 0)
-    {
-        double ratio = dev_totals[0] > dev_totals[1]
-                           ? (double)dev_totals[0] / dev_totals[1]
-                           : (double)dev_totals[1] / dev_totals[0];
-        std::cout << "  --- Imbalance ratio: " << ratio << "x ---\n";
-    }
-    std::cout << "=========================================\n";
-
     for (const auto &query : queries)
     {
         query->AppendMemoryEventLogs(memory_log_collector);
     }
 
     std::vector<double> total_end_to_end_ms;
-    if (!CollectParallelLatencyMetrics(queries, total_end_to_end_ms))
+    std::vector<double> bucket_level_ivf_ms;
+    std::vector<double> candidate_bucket_merge_ms;
+    std::vector<double> npu_async_launch_ms;
+    std::vector<double> inbucket_attr_filter_overlapped_ms;
+    std::vector<double> wait_npu_flag_ms;
+    std::vector<double> result_collection_ms;
+    std::vector<double> final_merge_ms;
+    std::vector<size_t> process_round_count_level_1;
+    std::vector<size_t> process_round_count_level_2;
+    if (!CollectParallelLatencyMetrics(queries,
+                                       total_end_to_end_ms,
+                                       bucket_level_ivf_ms,
+                                       candidate_bucket_merge_ms,
+                                       npu_async_launch_ms,
+                                       inbucket_attr_filter_overlapped_ms,
+                                       wait_npu_flag_ms,
+                                       result_collection_ms,
+                                       final_merge_ms,
+                                       process_round_count_level_1,
+                                       process_round_count_level_2))
     {
         return -1;
     }
@@ -850,6 +730,15 @@ int main()
     if (!FlushParallelOutputs(query_result_root_dir,
                               total_end_to_end_ms,
                               recall_rate_percent,
+                              bucket_level_ivf_ms,
+                              candidate_bucket_merge_ms,
+                              npu_async_launch_ms,
+                              inbucket_attr_filter_overlapped_ms,
+                              wait_npu_flag_ms,
+                              result_collection_ms,
+                              final_merge_ms,
+                              process_round_count_level_1,
+                              process_round_count_level_2,
                               overall_qps))
     {
         std::cerr << "[Fatal] Failed to write parallel outputs.\n";

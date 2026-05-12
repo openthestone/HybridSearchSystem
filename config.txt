@@ -26,10 +26,9 @@ groups_per_device_serial = 1
 cpu_core_count_parallel = 24
 npu_device_count_parallel = 1
 groups_per_device_parallel = 3
-target_qps_parallel = 10000  // parallel 模式下的目标 QPS（匀速投递间隔 = 1/target_qps 秒）
 
 # NPU 资源
-npu_device_id_start = 1
+npu_device_id_start = 0
 
 cores_per_group = 8
 
@@ -89,6 +88,7 @@ memory_events_log_enable = 0  # 1: 开启查询期动态内存扩容检测并输
 
 
 npu_debug_verify = 0   # npu_debug_verify置为0就不会检测npu计算是否正确，置为1会耗时检测
+pure_cpu_compute_enable = 0   # 置为0使用NPU，置为1纯CPU计算
 npu_debug_verify_abs_tol = 0.1
 npu_debug_verify_rel_tol = 0.02
 npu_debug_verify_max_report = 5

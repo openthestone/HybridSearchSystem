@@ -237,63 +237,6 @@ public:
         return &bitmap_data_[static_cast<size_t>(slot - 1) * stride_];
     }
 
-    /**
-     * @brief 双流有序归并批量查找：将 sorted_query_tags 与 sorted_tag_ids_ 归并，
-     *        结果写入 out_ptrs[i] = 对应 tag 的 bitmap 指针（未找到则为 kZero）。
-     * @param sorted_query_tags 已排序的查询 tag_id 数组
-     * @param out_ptrs 输出数组，大小必须 >= sorted_query_tags.size()
-     * @param kZero 全零哨兵指针
-     *
-     * 优势：sorted_tag_ids_ 通常只有 ~200 个元素（800 bytes，全在 L1），
-     * 归并是 O(n+m) 顺序扫描，比 n 次随机访问 tag_offsets_u16_（70KB）更 cache 友好。
-     */
-    void batch_get_tag_bits_sorted(const uint32_t *sorted_query_tags,
-                                   uint32_t query_tag_count,
-                                   const uint64_t **out_ptrs,
-                                   const uint64_t *kZero) const
-    {
-        if (valid_tag_count_ == 0 || query_tag_count == 0)
-        {
-            for (uint32_t i = 0; i < query_tag_count; ++i)
-                out_ptrs[i] = kZero;
-            return;
-        }
-
-        const uint32_t *st = sorted_tag_ids_.data();
-        const uint32_t st_count = valid_tag_count_;
-        const uint64_t *bd = bitmap_data_.data();
-
-        uint32_t qi = 0, si = 0;
-        while (qi < query_tag_count && si < st_count)
-        {
-            uint32_t qt = sorted_query_tags[qi];
-            uint32_t st_id = st[si];
-            if (qt == st_id)
-            {
-                out_ptrs[qi] = bd + static_cast<size_t>(si) * stride_;
-                ++qi;
-                ++si;
-            }
-            else if (qt < st_id)
-            {
-                out_ptrs[qi] = kZero;
-                ++qi;
-            }
-            else
-            {
-                ++si;
-            }
-        }
-        for (; qi < query_tag_count; ++qi)
-            out_ptrs[qi] = kZero;
-    }
-
-    /**
-     * @brief 访问 sorted_tag_ids_ 和 valid_tag_count_，供外部排序查询 tag 使用
-     */
-    const std::vector<uint32_t> &get_sorted_tag_ids() const { return sorted_tag_ids_; }
-    uint32_t get_valid_tag_count() const { return valid_tag_count_; }
-
     // 获取预计算的 Norm 数组
     const float *get_norms() const { return precomputed_norms_.data(); }
 

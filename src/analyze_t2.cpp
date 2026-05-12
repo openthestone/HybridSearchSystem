@@ -165,6 +165,7 @@ bool WriteDistributionFiles(const fs::path &output_dir,
 int main()
 {
     constexpr const char *kDatasetFile = "../../dataset_HW.bin";
+    // constexpr const char *kDatasetFile = "../../dataset_DEEP.bin";
     constexpr size_t kChunkDocCount = 4096;
     constexpr uint64_t kProgressDocInterval = 1000000ULL;
 

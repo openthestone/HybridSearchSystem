@@ -128,6 +128,9 @@ struct QueryResult
 struct QueryTimingMetrics
 {
     double bucket_level_ivf_ms = 0.0;
+    double bucket_level_ivf_filter_eval_ms = 0.0;
+    double bucket_level_ivf_centroid_score_ms = 0.0;
+    double bucket_level_ivf_result_pack_ms = 0.0;
     double candidate_bucket_merge_ms = 0.0;
     double npu_async_launch_ms = 0.0;
     double inbucket_attr_filter_overlapped_ms = 0.0;
@@ -156,6 +159,8 @@ public:
     size_t query_id = 0;             // 查询编号（使用查询文件行号）
     int process_round_count_level_1 = 0; // 当前查询实际执行的一级桶扩搜轮数
     int process_round_count_level_2 = 0; // 当前查询实际执行的二级桶处理子批次数
+    int searched_bucket_count_level_1 = 0; // 当前查询实际处理的一级桶数量
+    int searched_bucket_count_level_2 = 0; // 当前查询实际处理的二级桶数量
     QueryResult result;              // 查询结果
 
     // ==========================================
@@ -195,6 +200,8 @@ public:
         query_id = query_id_in;
         process_round_count_level_1 = 0;
         process_round_count_level_2 = 0;
+        searched_bucket_count_level_1 = 0;
+        searched_bucket_count_level_2 = 0;
         recall_rate = 0.0f;
         timing_metrics = QueryTimingMetrics{};
         start_time = std::chrono::steady_clock::now();

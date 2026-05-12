@@ -48,9 +48,12 @@ class WorkerGroup
 {
 public:
     WorkerGroup(int group_id, DataBaseCPU *db, Scheduler *sched)
-        : group_id_(group_id), db_(db), sched_(sched)
+        : group_id_(group_id), db_(db), sched_(sched), use_npu_(db != nullptr && db->UsesNpuVectorCompute())
     {
-        npu_stream_ = npuAPI::GetGroupStream(group_id_);
+        if (use_npu_)
+        {
+            npu_stream_ = npuAPI::GetGroupStream(group_id_);
+        }
 
         prefetch_slot_capacity_floats_[kFirstRoundSlotId] =
             static_cast<size_t>(valid_bucket_num_base_level_1) *
@@ -67,10 +70,13 @@ public:
 
         for (int slot_id = 0; slot_id < npuAPI::kGroupFlagSlotCount; ++slot_id)
         {
-            const size_t slot_score_bytes = prefetch_slot_capacity_floats_[slot_id] * sizeof(float);
-            prefetch_slots_[slot_id].flag = npuAPI::GetGroupFlag(group_id_, slot_id);
-            npuAPI::AllocateHostPinned((void **)&prefetch_slots_[slot_id].score_buffer, slot_score_bytes);
-            npuAPI::ClearGroupFlag(group_id_, slot_id);
+            if (use_npu_)
+            {
+                const size_t slot_score_bytes = prefetch_slot_capacity_floats_[slot_id] * sizeof(float);
+                prefetch_slots_[slot_id].flag = npuAPI::GetGroupFlag(group_id_, slot_id);
+                npuAPI::AllocateHostPinned((void **)&prefetch_slots_[slot_id].score_buffer, slot_score_bytes);
+                npuAPI::ClearGroupFlag(group_id_, slot_id);
+            }
         }
 
         tls_scratch_pools_.resize(cores_per_group);
@@ -94,6 +100,8 @@ public:
                                      static_cast<size_t>(group_thread_doc_results_reserve_items_per_rank));
         }
 
+        thread_ivf_step_timings_.resize(cores_per_group);
+
         WarmReserveVectorStorage(sorted_level_1_buckets_,
                                  static_cast<size_t>(group_sorted_buckets_reserve_items));
         for (auto &round_plan : round_plan_buffers_)
@@ -106,12 +114,15 @@ public:
     // 析构函数：释放 Pinned Memory
     ~WorkerGroup()
     {
-        for (int slot_id = 0; slot_id < npuAPI::kGroupFlagSlotCount; ++slot_id)
+        if (use_npu_)
         {
-            if (prefetch_slots_[slot_id].score_buffer)
+            for (int slot_id = 0; slot_id < npuAPI::kGroupFlagSlotCount; ++slot_id)
             {
-                npuAPI::FreeHostPinned(prefetch_slots_[slot_id].score_buffer);
-                prefetch_slots_[slot_id].score_buffer = nullptr;
+                if (prefetch_slots_[slot_id].score_buffer)
+                {
+                    npuAPI::FreeHostPinned(prefetch_slots_[slot_id].score_buffer);
+                    prefetch_slots_[slot_id].score_buffer = nullptr;
+                }
             }
         }
     }
@@ -122,23 +133,21 @@ public:
         running_ = false;
     }
 
-    uint64_t GetProcessedCount() const
-    {
-        return queries_processed_.load(std::memory_order_relaxed);
-    }
-
     // 线程入口
     void Run(int core_id)
     {
         BindThreadToCore(core_id);
 
-        int device_id = npu_device_id_start + g_group_to_device[group_id_];
-        auto ret = aclrtSetDevice(device_id);
-        if (ret != ACL_SUCCESS)
+        if (use_npu_)
         {
-            std::cerr << "Worker Thread " << core_id
-                      << " aclrtSetDevice failed, code: " << ret << std::endl;
-            return;
+            int device_id = npu_device_id_start + g_group_to_device[group_id_];
+            auto ret = aclrtSetDevice(device_id);
+            if (ret != ACL_SUCCESS)
+            {
+                std::cerr << "Worker Thread " << core_id
+                          << " aclrtSetDevice failed, code: " << ret << std::endl;
+                return;
+            }
         }
         bool is_leader = IsLeader(core_id);
         int rank = GetInGroupRank(core_id);
@@ -168,8 +177,6 @@ private:
 
     // 控制线程退出的原子标志，用于安全shut down系统
     std::atomic<bool> running_{true};
-    std::atomic<uint64_t> queries_processed_{0};
-
     Query *current_query_ = nullptr;
 
     enum State
@@ -246,7 +253,14 @@ private:
         uint32_t bucket_id;
         float score;
     };
+    struct IvfStepTiming
+    {
+        double filter_eval_ms = 0.0;
+        double centroid_score_ms = 0.0;
+        double result_pack_ms = 0.0;
+    };
     std::vector<std::vector<CandidateBucket>> thread_bucket_results_;
+    std::vector<IvfStepTiming> thread_ivf_step_timings_;
 
     struct ThreadDocResult
     {
@@ -260,6 +274,8 @@ private:
 
     // Dynamic work distribution: atomic counter for balanced work across workers
     alignas(64) std::atomic<uint32_t> next_work_idx_{0};
+
+    bool use_npu_ = true;
 
     static constexpr const char *kTlsIvfMasksLabel = "WorkerGroup.h:tls_ivf_masks_";
     static constexpr const char *kTlsScratchPoolsLabel = "WorkerGroup.h:tls_scratch_pools_";
@@ -348,15 +364,22 @@ private:
 
     void InitializeQueryPrefetchState()
     {
-        for (int slot_id = 0; slot_id < npuAPI::kGroupFlagSlotCount; ++slot_id)
+        if (use_npu_)
         {
-            npuAPI::ClearGroupFlag(group_id_, slot_id);
+            for (int slot_id = 0; slot_id < npuAPI::kGroupFlagSlotCount; ++slot_id)
+            {
+                npuAPI::ClearGroupFlag(group_id_, slot_id);
+            }
         }
         for (auto &round : round_plan_buffers_)
         {
             ResetRoundPlan(round);
         }
         ClearActiveBatchContext();
+        for (int i = 0; i < static_cast<int>(thread_ivf_step_timings_.size()); ++i)
+        {
+            thread_ivf_step_timings_[i] = IvfStepTiming{};
+        }
     }
 
     bool BuildRoundPlan(RoundPlan &round, int round_index, int &level_1_offset)
@@ -507,15 +530,26 @@ private:
         AssignRoundToSlot(round, slot_id);
 
         auto start = std::chrono::high_resolution_clock::now();
-        npuAPI::ResetGroupFlag(group_id_, slot_id);
-        for (const RoundBatch &batch : round.batches)
+        if (use_npu_)
         {
-            npuAPI::LaunchBatchKernel(npu_stream_,
-                                      batch.bucket_ids,
-                                      prefetch_slots_[slot_id].score_buffer + batch.score_offset_floats,
-                                      group_id_);
+            npuAPI::ResetGroupFlag(group_id_, slot_id);
+            for (const RoundBatch &batch : round.batches)
+            {
+                npuAPI::LaunchBatchKernel(npu_stream_,
+                                          batch.bucket_ids,
+                                          prefetch_slots_[slot_id].score_buffer + batch.score_offset_floats,
+                                          group_id_);
+            }
+            npuAPI::EnqueueGroupCompletion(npu_stream_, group_id_, slot_id);
         }
-        npuAPI::EnqueueGroupCompletion(npu_stream_, group_id_, slot_id);
+        else
+        {
+            for (const RoundBatch &batch : round.batches)
+            {
+                ComputeBatchScoresOnCpu(batch,
+                                        prefetch_slots_[slot_id].score_buffer + batch.score_offset_floats);
+            }
+        }
 
         auto end = std::chrono::high_resolution_clock::now();
         std::chrono::duration<double, std::milli> elapsed = end - start;
@@ -524,6 +558,10 @@ private:
 
     void WaitForSlot(int slot_id)
     {
+        if (!use_npu_)
+        {
+            return;
+        }
         auto start = std::chrono::high_resolution_clock::now();
         // Pure spin on ACL event completion. This keeps the low-overhead wait strategy
         // from the compact-output path, but removes the extra D2H flag-ready copy from
@@ -615,10 +653,13 @@ private:
             active_batch_scores_ = prefetch_slots_[slot_id].score_buffer + batch.score_offset_floats;
             current_batch_size_ = static_cast<uint32_t>(batch.bucket_ids.size());
 
-            npuAPI::DebugVerifyBatchResults(batch.bucket_ids,
-                                           current_query_->query_vector.data(),
-                                           active_batch_scores_,
-                                           group_id_);
+            if (use_npu_)
+            {
+                npuAPI::DebugVerifyBatchResults(batch.bucket_ids,
+                                               current_query_->query_vector.data(),
+                                               active_batch_scores_,
+                                               group_id_);
+            }
 
             auto start = std::chrono::high_resolution_clock::now();
             PublishStage(BATCH_COLLECT_RESULTS);
@@ -663,6 +704,18 @@ private:
         auto end = std::chrono::high_resolution_clock::now();
         std::chrono::duration<double, std::milli> elapsed = end - start;
         current_query_->timing_metrics.bucket_level_ivf_ms = elapsed.count();
+        double max_filter_eval_ms = 0.0;
+        double max_centroid_score_ms = 0.0;
+        double max_result_pack_ms = 0.0;
+        for (const IvfStepTiming &timing : thread_ivf_step_timings_)
+        {
+            max_filter_eval_ms = std::max(max_filter_eval_ms, timing.filter_eval_ms);
+            max_centroid_score_ms = std::max(max_centroid_score_ms, timing.centroid_score_ms);
+            max_result_pack_ms = std::max(max_result_pack_ms, timing.result_pack_ms);
+        }
+        current_query_->timing_metrics.bucket_level_ivf_filter_eval_ms = max_filter_eval_ms;
+        current_query_->timing_metrics.bucket_level_ivf_centroid_score_ms = max_centroid_score_ms;
+        current_query_->timing_metrics.bucket_level_ivf_result_pack_ms = max_result_pack_ms;
 
         start = std::chrono::high_resolution_clock::now();
         CandidateBucketMerge();
@@ -671,11 +724,14 @@ private:
         current_query_->timing_metrics.candidate_bucket_merge_ms = elapsed.count();
 
         // 3. Stage 2 — Upload query to NPU once per query
-        npuAPI::UploadQuery(current_query_->query_vector.data(),
-                            current_query_->mmad_query_padded_fp16.empty()
-                                ? nullptr
-                                : current_query_->mmad_query_padded_fp16.data(),
-                            group_id_);
+        if (use_npu_)
+        {
+            npuAPI::UploadQuery(current_query_->query_vector.data(),
+                                current_query_->mmad_query_padded_fp16.empty()
+                                    ? nullptr
+                                    : current_query_->mmad_query_padded_fp16.data(),
+                                group_id_);
+        }
 
         int level_1_offset = 0;
         int next_round_index = 0;
@@ -799,11 +855,11 @@ private:
         current_query_->timing_metrics.probe_expand_rounds = consumed_round_count;
         current_query_->process_round_count_level_1 = consumed_round_count;
         current_query_->process_round_count_level_2 = process_round_count_level_2;
+        current_query_->searched_bucket_count_level_1 = searched_level_1_count;
         current_query_->finalize_results();
         current_query_->MarkProcessingEnd();
 
         sched_->PushResult(current_query_);
-        queries_processed_.fetch_add(1, std::memory_order_relaxed);
         current_query_ = nullptr;
         ClearActiveBatchContext();
     }
@@ -888,6 +944,7 @@ private:
         std::vector<uint64_t> &local_mask = tls_ivf_masks_[rank];
         const size_t local_mask_old_capacity = session == nullptr ? 0 : local_mask.capacity();
         const size_t scratch_old_capacity = session == nullptr ? 0 : tls_scratch_pools_[rank].capacity();
+        auto step_start = std::chrono::high_resolution_clock::now();
         local_mask.clear();
         current_query_->search_ivf(db_->get_bucket_level_ivf(), local_mask, tls_scratch_pools_[rank], rank);
         RecordCapacityGrowth<uint64_t>(session,
@@ -898,7 +955,12 @@ private:
                                        kTlsScratchPoolsLabel,
                                        scratch_old_capacity,
                                        tls_scratch_pools_[rank].capacity());
+        auto step_end = std::chrono::high_resolution_clock::now();
+        thread_ivf_step_timings_[rank].filter_eval_ms =
+            std::chrono::duration<double, std::milli>(step_end - step_start).count();
         const int local_candidate_limit = db_->get_bucket_level_ivf().get_buckets_per_core();
+
+        step_start = std::chrono::high_resolution_clock::now();
 
         auto cmp = [](const CandidateBucket &a, const CandidateBucket &b)
         { return a.score > b.score; };
@@ -976,6 +1038,9 @@ private:
                 }
             }
         }
+        step_end = std::chrono::high_resolution_clock::now();
+        thread_ivf_step_timings_[rank].centroid_score_ms =
+            std::chrono::duration<double, std::milli>(step_end - step_start).count();
         auto &my_res = thread_bucket_results_[rank];
         const size_t my_res_old_capacity = session == nullptr ? 0 : my_res.capacity();
         my_res.clear();
@@ -983,16 +1048,68 @@ private:
                                               kExecuteIvfHeapLabel,
                                               heap_old_capacity,
                                               heap.capacity());
+        step_start = std::chrono::high_resolution_clock::now();
         while (!heap.empty())
         {
             std::pop_heap(heap.begin(), heap.end(), cmp);
             my_res.push_back(heap.back());
             heap.pop_back();
         }
+        step_end = std::chrono::high_resolution_clock::now();
+        thread_ivf_step_timings_[rank].result_pack_ms =
+            std::chrono::duration<double, std::milli>(step_end - step_start).count();
         RecordCapacityGrowth<CandidateBucket>(session,
                                               kThreadBucketResultsLabel,
                                               my_res_old_capacity,
                                               my_res.capacity());
+    }
+
+    void ComputeBatchScoresOnCpu(const RoundBatch &batch, float *score_buffer)
+    {
+        if (score_buffer == nullptr)
+        {
+            return;
+        }
+
+        const float *query_vec = current_query_->query_vector.data();
+        const float *doc_vectors = db_->get_doc_vectors();
+        for (size_t batch_idx = 0; batch_idx < batch.bucket_ids.size(); ++batch_idx)
+        {
+            const Bucket &bucket = db_->get_bucket(batch.bucket_ids[batch_idx]);
+            const auto &global_ids = bucket.get_global_ids();
+            float *bucket_scores = score_buffer + batch.score_offsets_per_bucket[batch_idx];
+            for (size_t local_idx = 0; local_idx < global_ids.size(); ++local_idx)
+            {
+                const float *doc_vec =
+                    doc_vectors + static_cast<size_t>(global_ids[local_idx]) * static_cast<size_t>(vector_dim);
+                float dot_product = 0.0f;
+#if defined(__aarch64__) || defined(__arm__)
+                float32x4_t sum0 = vdupq_n_f32(0.0f);
+                float32x4_t sum1 = vdupq_n_f32(0.0f);
+                int d = 0;
+                for (; d + 7 < vector_dim; d += 8)
+                {
+                    float32x4_t q0 = vld1q_f32(query_vec + d);
+                    float32x4_t q1 = vld1q_f32(query_vec + d + 4);
+                    float32x4_t v0 = vld1q_f32(doc_vec + d);
+                    float32x4_t v1 = vld1q_f32(doc_vec + d + 4);
+                    sum0 = vfmaq_f32(sum0, q0, v0);
+                    sum1 = vfmaq_f32(sum1, q1, v1);
+                }
+                dot_product = vaddvq_f32(sum0) + vaddvq_f32(sum1);
+                for (; d < vector_dim; ++d)
+                {
+                    dot_product += query_vec[d] * doc_vec[d];
+                }
+#else
+                for (int d = 0; d < vector_dim; ++d)
+                {
+                    dot_product += query_vec[d] * doc_vec[d];
+                }
+#endif
+                bucket_scores[local_idx] = dot_product;
+            }
+        }
     }
 
     void CandidateBucketMerge()

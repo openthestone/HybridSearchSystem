@@ -56,7 +56,6 @@ inline int analyze_t1 = 5;
 inline double k_expand_param = 1.0;
 inline std::vector<double> k_expand_param_test_set;
 inline std::vector<int> max_probe_l1_bucket_num_test_set;
-inline double target_qps_parallel = 2000.0;
 inline std::string dataset_cache_file = "../../dataset.bin";
 inline std::string tag_map_cache_file = "../../tag_map.bin";
 inline std::string query_file = "../../QueryData_10000.txt";
@@ -170,6 +169,7 @@ inline int memory_events_log_enable = 0;
 
 inline int npu_debug_verify = 0;
 inline int npu_debug_verify_max_report = 5;
+inline int pure_cpu_compute_enable = 0;
 inline float npu_debug_verify_abs_tol = 0.1f;
 inline float npu_debug_verify_rel_tol = 0.02f;
 
@@ -646,7 +646,6 @@ inline bool LoadParams(const std::string &config_file, ResourceConfigProfile pro
     bool seen_max_query_tags = false;
     bool seen_max_rpn_length = false;
     bool seen_cpu_cache_line_size = false;
-    bool seen_target_qps_parallel = false;
 
     int cpu_core_count_serial_value = cpu_core_count;
     int npu_device_count_serial_value = npu_device_count;
@@ -856,14 +855,7 @@ inline bool LoadParams(const std::string &config_file, ResourceConfigProfile pro
             seen_k_expand_param = true;
             continue;
         } else if (key == "target_qps_parallel") {
-            double value = 0.0;
-            if (!ParseConfigDouble(value_str, value)) {
-                std::cerr << "[Config] Error parsing value for key: " << key
-                          << ", raw value: " << value_str << std::endl;
-                return false;
-            }
-            target_qps_parallel = value;
-            seen_target_qps_parallel = true;
+            // ignored: QPS is hardcoded in parallel.cpp
             continue;
         } else if (key == "k_expand_param_test_set") {
             continue;
@@ -1001,6 +993,8 @@ inline bool LoadParams(const std::string &config_file, ResourceConfigProfile pro
             npu_debug_verify = value;
         } else if (key == "npu_debug_verify_max_report") {
             npu_debug_verify_max_report = value;
+        } else if (key == "pure_cpu_compute_enable") {
+            pure_cpu_compute_enable = value;
         } else {
             std::cout << "[Config] Warning: Unknown key: " << key << std::endl;
         }
@@ -1027,7 +1021,6 @@ inline bool LoadParams(const std::string &config_file, ResourceConfigProfile pro
     if (!seen_npu_device_id_start) missing_keys.emplace_back("npu_device_id_start");
     if (!seen_max_query_tags) missing_keys.emplace_back("max_query_tags");
     if (!seen_cpu_cache_line_size) missing_keys.emplace_back("cpu_cache_line_size");
-    if (!seen_target_qps_parallel) missing_keys.emplace_back("target_qps_parallel");
 
     if (!missing_keys.empty()) {
         std::cerr << "[Config] Error: Missing required keys:";
@@ -1096,6 +1089,14 @@ inline bool LoadParams(const std::string &config_file, ResourceConfigProfile pro
     }
     if (valid_bucket_num_incremental_level_1 > valid_bucket_num_base_level_1) {
         std::cerr << "[Config] Error: valid_bucket_num_incremental_level_1 must be <= valid_bucket_num_base_level_1" << std::endl;
+        return false;
+    }
+    if (pure_cpu_compute_enable != 0 && pure_cpu_compute_enable != 1) {
+        std::cerr << "[Config] Error: pure_cpu_compute_enable must be 0 or 1" << std::endl;
+        return false;
+    }
+    if (!pure_cpu_compute_enable && npu_device_count <= 0) {
+        std::cerr << "[Config] Error: npu_device_count must be > 0 when pure_cpu_compute_enable=0" << std::endl;
         return false;
     }
 

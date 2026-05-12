@@ -3,7 +3,7 @@ project(HybridRetrievalSystem)
 
 # --- 1. 核心参数 ---
 set(RUN_MODE "npu" CACHE STRING "run mode" FORCE)
-set(SOC_VERSION "Ascend910B4" CACHE STRING "system on chip type" FORCE)
+set(SOC_VERSION "Ascend910B3" CACHE STRING "system on chip type" FORCE)
 set(ASCEND_CANN_PACKAGE_PATH "/usr/local/Ascend/ascend-toolkit/latest" CACHE PATH "ASCEND CANN package path")
 
 if(NOT CMAKE_BUILD_TYPE)
@@ -35,6 +35,7 @@ link_directories(/usr/local/lib /usr/local/lib64)
 find_package(folly CONFIG REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(BLAS REQUIRED)
+find_package(fmt REQUIRED)
 # ================= END =================
 
 if(ENABLE_PROFILING_BUILD)
@@ -58,7 +59,7 @@ include(${ASCENDC_CMAKE_DIR}/ascendc.cmake)
 # --- 4. 编译算子库 ---
 ascendc_library(ascendc_kernels_${RUN_MODE} SHARED ${KERNEL_FILES})
 ascendc_compile_definitions(ascendc_kernels_${RUN_MODE} PRIVATE
-    $<$<BOOL:$<IN_LIST:${SOC_VERSION},Ascend910B1;Ascend910B2;Ascend910B4;Ascend910B4>>:SOC_910B>
+    $<$<BOOL:$<IN_LIST:${SOC_VERSION},Ascend910B1;Ascend910B2;Ascend910B3;Ascend910B4>>:SOC_910B>
 )
 
 # --- 5. 编译 Host 主程序 ---
@@ -101,14 +102,21 @@ function(configure_host_target target_name source_file)
         Folly::folly
         Eigen3::Eigen
         BLAS::BLAS
+        fmt::fmt
     )
 endfunction()
 
 configure_host_target(serial src/serial.cpp)
 configure_host_target(parallel src/parallel.cpp)
 
+# --- 6b. 分析工具 ---
+configure_host_target(analyze_t1 src/analyze_t1.cpp)
+configure_host_target(analyze_t2 src/analyze_t2.cpp)
+configure_host_target(analyze_t3 src/analyze_t3.cpp)
+configure_host_target(analyze_t8 src/analyze_t8.cpp)
+
 # --- 7. 安装 ---
-install(TARGETS serial parallel DESTINATION bin)
+install(TARGETS serial parallel analyze_t1 analyze_t2 analyze_t3 analyze_t8 DESTINATION bin)
 install(TARGETS ascendc_kernels_${RUN_MODE} DESTINATION lib)
 
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/config.txt")

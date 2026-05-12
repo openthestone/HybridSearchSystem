@@ -376,14 +376,21 @@ bool RunParallelRound(const std::vector<DataReader::PreparedQuery> &prepared_que
 
 int main()
 {
-    constexpr const char *kDatasetFile = "../../dataset_HW.bin";
     constexpr int kDefaultTopK = 100;
+    constexpr const char *kDatasetFile = "../../dataset_HW.bin";
     const std::vector<std::string> kQueryPaths = {
         "datasets/hw_queries.fvecs",
         "../datasets/hw_queries.fvecs",
         "../../datasets/hw_queries.fvecs",
         "../../../datasets/hw_queries.fvecs"
     };
+    // constexpr const char *kDatasetFile = "../../dataset_DEEP.bin";
+    // const std::vector<std::string> kQueryPaths = {
+    //     "queries/deep1B_queries.fvecs",
+    //     "../queries/deep1B_queries.fvecs",
+    //     "../../queries/deep1B_queries.fvecs",
+    //     "../../../queries/deep1B_queries.fvecs"
+    // };
 
     const fs::path config_path = RunSupport::ResolveConfigPath();
     std::cout << "[AnalyzeT3] Loading config from " << config_path << "...\n";

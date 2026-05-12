@@ -3,7 +3,7 @@ set -euo pipefail
 
 # --- 核心配置 ---
 RUN_MODE="npu"
-SOC_VERSION="Ascend910B4"
+SOC_VERSION="Ascend910B3"
 ASCEND_INSTALL_PATH="/usr/local/Ascend/ascend-toolkit/latest"
 VARIANT="s"
 PROFILE_MODE="0"
@@ -19,10 +19,10 @@ FLAMEGRAPH=""
 
 usage() {
     cat <<'USAGE'
-Usage: ./run.sh -v [s|p] -p [0|1] -c [0|1]
+Usage: ./run.sh -v [s|p|a1|a2|a3|a8] -p [0|1] -c [0|1]
 
 Options:
-  -v, --variant <s|p>   executable variant: s=serial, p=parallel
+  -v, --variant <s|p|a1|a2|a3|a8>   executable variant: s=serial, p=parallel, a1=analyze_t1, a2=analyze_t2, a3=analyze_t3, a8=analyze_t8
   -p <0|1>              0=正常构建并运行；1=清空 ./profile 后执行 perf 采样并生成火焰图
   -c <0|1>              0=不编译，直接运行已有产物；1=先编译再运行
   -h, --help            show this help
@@ -456,7 +456,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if [[ "${VARIANT}" != "s" && "${VARIANT}" != "p" ]]; then
+if [[ "${VARIANT}" != "s" && "${VARIANT}" != "p" && "${VARIANT}" != "a1" && "${VARIANT}" != "a2" && "${VARIANT}" != "a3" && "${VARIANT}" != "a8" ]]; then
     usage
     exit 1
 fi
@@ -475,8 +475,16 @@ fi
 
 if [[ "${VARIANT}" == "s" ]]; then
     EXECUTABLE_NAME="serial"
-else
+elif [[ "${VARIANT}" == "p" ]]; then
     EXECUTABLE_NAME="parallel"
+elif [[ "${VARIANT}" == "a1" ]]; then
+    EXECUTABLE_NAME="analyze_t1"
+elif [[ "${VARIANT}" == "a2" ]]; then
+    EXECUTABLE_NAME="analyze_t2"
+elif [[ "${VARIANT}" == "a3" ]]; then
+    EXECUTABLE_NAME="analyze_t3"
+elif [[ "${VARIANT}" == "a8" ]]; then
+    EXECUTABLE_NAME="analyze_t8"
 fi
 
 select_npu_ids_for_variant
@@ -517,7 +525,7 @@ if [[ -f "${ASCEND_INSTALL_PATH}/bin/setenv.bash" ]]; then
     set -u
 fi
 
-export LD_LIBRARY_PATH="${OUT_DIR}/lib:/usr/local/lib:/usr/local/lib64:/usr/lib64:${LD_LIBRARY_PATH:-}"
+export LD_LIBRARY_PATH="${OUT_DIR}/lib:/usr/local/lib:/usr/local/lib64:/usr/lib64:/opt/OpenBLAS/lib:/lib:${LD_LIBRARY_PATH:-}"
 
 if [[ "${PROFILE_MODE}" == "1" ]]; then
     echo ">>> Cleaning profile directory: ${PROFILE_DIR}"
