@@ -28,7 +28,7 @@ npu_device_count_parallel = 1
 groups_per_device_parallel = 3
 
 # NPU 资源
-npu_device_id_start = 0
+npu_device_id_start = 1
 
 cores_per_group = 8
 
@@ -36,15 +36,16 @@ cores_per_group = 8
 valid_bucket_num_base_level_1 = 64  // 首轮新增探测的一级桶数
 valid_bucket_num_incremental_level_1 = 8  // 后续每轮新增探测的一级桶数，必须 <= valid_bucket_num_base_level_1
 max_probe_l1_bucket_num_enable = 1  // 1: 启用一级桶累计探测数量上限
-max_probe_l1_bucket_num = 64  // 启用后，搜完一整轮后若累计一级桶数 >= 该值则停止扩搜
-max_process_bucket_num_level_2 = 200  // 单个处理子批次最多展开并处理的二级桶数；NPU/Host workspace 预分配按这个上限计算
+max_probe_l1_bucket_num = 960  // 启用后，搜完一整轮后若累计一级桶数 >= 该值则停止扩搜
+max_process_bucket_num_level_2 = 800  // 单个处理子批次最多展开并处理的二级桶数；NPU/Host workspace 预分配按这个上限计算
 analyze_t1 = 5  // 分析前 analyze_t1 批一级桶的选择率；第1批大小为 valid_bucket_num_base_level_1，后续每批大小为 valid_bucket_num_incremental_level_1
-k_expand_param = 2  // expanded_k = ceil(k_expand_param * topk)
+k_expand_param = 1.4  // expanded_k = ceil(k_expand_param * topk)
 k_expand_param_test_set = [1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8, 1.9, 2]  // analyze_t3 使用的 expanded_k 倍率测试集合
 max_probe_l1_bucket_num_test_set = [64, 128, 256, 512]  // analyze_t4 使用的一级桶累计探测数量上限测试集合
 query_file = ../../QueryData_10000.txt  // 查询文件路径
 query_result_root = ../../result/  // 查询过程结果输出根目录，recall/ latency/ log 子目录会自动创建
 ground_truth_cache_file = ../../ground_truth_cache.bin  // ground-truth缓存文件，设为""可关闭
+bucket_level_ivf_enable = 0  // 1: 跳过一级桶属性过滤，直接对所有一级桶计算 centroid score；0: 正常执行桶级属性过滤
 bucket_ivf_index_file = ../../bucket_ivf_index.bin  // CPU 侧一级桶桶级 IVF 索引文件
 bucket_index_file = ../../bucket_index.bin  // CPU 侧二级桶桶内索引文件
 

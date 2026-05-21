@@ -216,6 +216,8 @@ private:
         size_t score_count_floats = 0;
         // Precomputed score offsets for each bucket in the batch (for dynamic work distribution)
         std::vector<size_t> score_offsets_per_bucket;
+        // Offset into RoundPlan::mask_storage where this batch's masks start (u64 units)
+        size_t mask_offset = 0;
     };
 
     struct RoundPlan
@@ -469,13 +471,18 @@ private:
                 batch.score_offsets_per_bucket[i] = score_off;
                 score_off += static_cast<size_t>(db_->get_bucket(batch.bucket_ids[i]).get_doc_num()) * kScoreCols;
             }
+            batch.mask_offset = total_mask_words;
             total_mask_words += batch_size * max_stride;
         }
 
-        // Allocate shared mask storage
-        if (round.mask_storage.capacity() < total_mask_words)
+        // Allocate shared mask storage for ALL batches
+        if (total_mask_words > 0)
         {
-            round.mask_storage.reserve(total_mask_words);
+            round.mask_storage.resize(total_mask_words, 0);
+        }
+        else
+        {
+            round.mask_storage.clear();
         }
 
         return true;
@@ -500,6 +507,13 @@ private:
         ++consumed_round_count;
         searched_level_1_count += round.level_1_count;
         process_round_count_level_2 += static_cast<int>(round.batches.size());
+        int searched_level_2_count = 0;
+        for (const RoundBatch &batch : round.batches)
+        {
+            searched_level_2_count += static_cast<int>(batch.bucket_ids.size());
+            current_query_->RecordSearchedLevel2Buckets(batch.bucket_ids);
+        }
+        current_query_->searched_bucket_count_level_2 += searched_level_2_count;
     }
 
     void AssignRoundToSlot(RoundPlan &round, int slot_id)
@@ -586,18 +600,10 @@ private:
         if (current_query_->filter_exp.Bucket_RPN.empty())
         {
             // No filter: all masks are 0xFF — skip per-batch barrier syncs entirely.
-            // Allocate mask_storage for the largest batch and fill with all-ones.
-            size_t max_needed = 0;
-            for (const auto &batch : round.batches)
+            // Fill the entire pre-allocated mask_storage with all-ones.
+            if (!round.mask_storage.empty())
             {
-                max_needed = std::max(max_needed,
-                    static_cast<size_t>(batch.bucket_ids.size()) * round.mask_stride);
-            }
-            if (max_needed > 0)
-            {
-                if (round.mask_storage.size() < max_needed)
-                    round.mask_storage.resize(max_needed);
-                std::memset(round.mask_storage.data(), 0xFF, max_needed * sizeof(uint64_t));
+                std::memset(round.mask_storage.data(), 0xFF, round.mask_storage.size() * sizeof(uint64_t));
             }
         }
         else
@@ -610,16 +616,10 @@ private:
                 active_batch_scores_ = nullptr;
                 current_batch_size_ = static_cast<uint32_t>(batch.bucket_ids.size());
 
-                // Allocate shared mask buffer for this batch
+                // Zero this batch's mask region (pre-allocated in BuildRoundPlan)
                 const size_t needed = static_cast<size_t>(current_batch_size_) * round.mask_stride;
-                if (round.mask_storage.size() < needed)
-                {
-                    round.mask_storage.resize(needed, 0);
-                }
-                else
-                {
-                    std::memset(round.mask_storage.data(), 0, needed * sizeof(uint64_t));
-                }
+                std::memset(round.mask_storage.data() + batch.mask_offset, 0,
+                            needed * sizeof(uint64_t));
 
                 PublishStage(BATCH_ATTR_FILTER_MASK);
                 InBucketAttrFilter(0);
@@ -946,7 +946,16 @@ private:
         const size_t scratch_old_capacity = session == nullptr ? 0 : tls_scratch_pools_[rank].capacity();
         auto step_start = std::chrono::high_resolution_clock::now();
         local_mask.clear();
-        current_query_->search_ivf(db_->get_bucket_level_ivf(), local_mask, tls_scratch_pools_[rank], rank);
+        if (bucket_level_ivf_enable)
+        {
+            uint32_t u64_count = db_->get_bucket_level_ivf().get_aligned_stride();
+            local_mask.resize(u64_count);
+            std::fill(local_mask.begin(), local_mask.end(), ~0ULL);
+        }
+        else
+        {
+            current_query_->search_ivf(db_->get_bucket_level_ivf(), local_mask, tls_scratch_pools_[rank], rank);
+        }
         RecordCapacityGrowth<uint64_t>(session,
                                        kTlsIvfMasksLabel,
                                        local_mask_old_capacity,
@@ -1175,7 +1184,7 @@ private:
                                         ", bucket_stride=" + std::to_string(bucket_stride));
             }
             // Write mask to shared buffer at fixed position for this batch index
-            size_t write_offset = static_cast<size_t>(i) * active_round_->mask_stride;
+            size_t write_offset = active_batch_->mask_offset + static_cast<size_t>(i) * active_round_->mask_stride;
             std::memcpy(active_round_->mask_storage.data() + write_offset,
                         temp_doc_mask.data(),
                         static_cast<size_t>(bucket_stride) * sizeof(uint64_t));
@@ -1267,6 +1276,7 @@ private:
                 }
 
                 const uint64_t *pmask64 = active_round_->mask_storage.data() +
+                                          active_batch_->mask_offset +
                                           static_cast<size_t>(i) * active_round_->mask_stride;
 
                 for (uint32_t d = 0; d < bucket_stride; d++)

@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <fstream>
@@ -24,6 +25,121 @@ namespace fs = RunSupport::fs;
 
 namespace
 {
+
+constexpr double kParallelTargetQps = 10000.0;
+constexpr std::chrono::microseconds kInjectorTick(1000);
+
+struct SharedProgressStats
+{
+    std::atomic<size_t> submitted_count{0};
+    std::atomic<size_t> max_task_queue_size{0};
+    std::atomic<unsigned long long> task_queue_size_sum{0};
+    std::atomic<size_t> task_queue_sample_count{0};
+};
+
+struct ParallelRunStats
+{
+    double target_qps = 0.0;
+    size_t query_count = 0;
+    double measure_submit_duration_ms = 0.0;
+    double measure_submit_qps = 0.0;
+    double total_complete_duration_ms = 0.0;
+    double complete_qps = 0.0;
+    double injector_tick_us = 0.0;
+    double max_submit_lag_ms = 0.0;
+    size_t max_task_queue_size = 0;
+    double avg_task_queue_size = 0.0;
+};
+
+struct ParallelRecallSummary
+{
+    double average_recall = 0.0;
+    size_t cache_hit_count = 0;
+    size_t brute_force_count = 0;
+};
+
+void UpdateAtomicMax(std::atomic<size_t> &target,
+                     size_t candidate)
+{
+    size_t current = target.load(std::memory_order_relaxed);
+    while (candidate > current &&
+           !target.compare_exchange_weak(current,
+                                         candidate,
+                                         std::memory_order_relaxed,
+                                         std::memory_order_relaxed))
+    {
+    }
+}
+
+void SampleTaskQueueSize(SharedProgressStats &stats,
+                         size_t queue_size)
+{
+    UpdateAtomicMax(stats.max_task_queue_size, queue_size);
+    stats.task_queue_size_sum.fetch_add(static_cast<unsigned long long>(queue_size),
+                                        std::memory_order_relaxed);
+    stats.task_queue_sample_count.fetch_add(1, std::memory_order_relaxed);
+}
+
+ParallelRunStats RunRateLimitedInjector(const std::vector<Query *> &query_ptrs,
+                                        Scheduler &scheduler,
+                                        SharedProgressStats &progress_stats,
+                                        std::chrono::steady_clock::time_point measure_start)
+{
+    ParallelRunStats run_stats;
+    run_stats.target_qps = kParallelTargetQps;
+    run_stats.query_count = query_ptrs.size();
+    run_stats.injector_tick_us = static_cast<double>(kInjectorTick.count());
+
+    size_t submitted_count = 0;
+    double max_submit_lag_ms = 0.0;
+
+    while (submitted_count < query_ptrs.size())
+    {
+        const auto now = std::chrono::steady_clock::now();
+        const double elapsed_seconds =
+            std::chrono::duration<double>(now - measure_start).count();
+        const size_t expected_submitted = std::min(
+            query_ptrs.size(),
+            static_cast<size_t>(elapsed_seconds * kParallelTargetQps));
+
+        if (expected_submitted <= submitted_count)
+        {
+            std::this_thread::sleep_for(kInjectorTick);
+            continue;
+        }
+
+        while (submitted_count < expected_submitted)
+        {
+            scheduler.Push(query_ptrs[submitted_count]);
+            const auto enqueued_time = std::chrono::steady_clock::now();
+            const auto scheduled_time =
+                measure_start +
+                std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                    std::chrono::duration<double>(
+                        static_cast<double>(submitted_count + 1) / kParallelTargetQps));
+            if (enqueued_time > scheduled_time)
+            {
+                const double lag_ms =
+                    std::chrono::duration<double, std::milli>(enqueued_time - scheduled_time)
+                        .count();
+                max_submit_lag_ms = std::max(max_submit_lag_ms, lag_ms);
+            }
+
+            ++submitted_count;
+            progress_stats.submitted_count.store(submitted_count, std::memory_order_relaxed);
+            SampleTaskQueueSize(progress_stats, scheduler.GetTaskQueueSize());
+        }
+    }
+
+    const auto submit_end = std::chrono::steady_clock::now();
+    run_stats.measure_submit_duration_ms =
+        std::chrono::duration<double, std::milli>(submit_end - measure_start).count();
+    const double submit_seconds = run_stats.measure_submit_duration_ms / 1000.0;
+    run_stats.measure_submit_qps =
+        (submit_seconds > 0.0) ? (static_cast<double>(submitted_count) / submit_seconds) : 0.0;
+    run_stats.max_submit_lag_ms = max_submit_lag_ms;
+    return run_stats;
+}
 
 
 bool LoadPreparedQueriesFromFvec(const std::vector<std::string> &query_paths,
@@ -155,6 +271,11 @@ bool CollectParallelLatencyMetrics(const std::vector<std::unique_ptr<Query>> &qu
                                    std::vector<double> &bucket_level_ivf_ms,
                                    std::vector<double> &candidate_bucket_merge_ms,
                                    std::vector<double> &npu_async_launch_ms,
+                                   std::vector<double> &npu_submit_ms,
+                                   std::vector<double> &npu_kernel_exec_ms,
+                                   std::vector<double> &npu_d2d_gather_ms,
+                                   std::vector<double> &npu_d2h_transfer_ms,
+                                   std::vector<double> &npu_sync_overhead_ms,
                                    std::vector<double> &inbucket_attr_filter_overlapped_ms,
                                    std::vector<double> &wait_npu_flag_ms,
                                    std::vector<double> &result_collection_ms,
@@ -167,6 +288,11 @@ bool CollectParallelLatencyMetrics(const std::vector<std::unique_ptr<Query>> &qu
     bucket_level_ivf_ms.resize(n);
     candidate_bucket_merge_ms.resize(n);
     npu_async_launch_ms.resize(n);
+    npu_submit_ms.resize(n);
+    npu_kernel_exec_ms.resize(n);
+    npu_d2d_gather_ms.resize(n);
+    npu_d2h_transfer_ms.resize(n);
+    npu_sync_overhead_ms.resize(n);
     inbucket_attr_filter_overlapped_ms.resize(n);
     wait_npu_flag_ms.resize(n);
     result_collection_ms.resize(n);
@@ -203,6 +329,11 @@ bool CollectParallelLatencyMetrics(const std::vector<std::unique_ptr<Query>> &qu
         bucket_level_ivf_ms[i] = query.timing_metrics.bucket_level_ivf_ms;
         candidate_bucket_merge_ms[i] = query.timing_metrics.candidate_bucket_merge_ms;
         npu_async_launch_ms[i] = query.timing_metrics.npu_async_launch_ms;
+        npu_submit_ms[i] = query.timing_metrics.npu_submit_ms;
+        npu_kernel_exec_ms[i] = query.timing_metrics.npu_kernel_exec_ms;
+        npu_d2d_gather_ms[i] = query.timing_metrics.npu_d2d_gather_ms;
+        npu_d2h_transfer_ms[i] = query.timing_metrics.npu_d2h_transfer_ms;
+        npu_sync_overhead_ms[i] = query.timing_metrics.npu_sync_overhead_ms;
         inbucket_attr_filter_overlapped_ms[i] = query.timing_metrics.inbucket_attr_filter_overlapped_ms;
         wait_npu_flag_ms[i] = query.timing_metrics.wait_npu_flag_ms;
         result_collection_ms[i] = query.timing_metrics.result_collection_ms;
@@ -218,7 +349,8 @@ bool CollectParallelRecallMetrics(const InputDataset &dataset,
                                   const std::vector<DataReader::PreparedQuery> &prepared_queries,
                                   std::vector<std::unique_ptr<Query>> &queries,
                                   DataReader::GroundTruthCache *ground_truth_cache,
-                                  std::vector<double> &recall_rate_percent)
+                                  std::vector<double> &recall_rate_percent,
+                                  ParallelRecallSummary &summary)
 {
     if (queries.size() != prepared_queries.size())
     {
@@ -228,6 +360,7 @@ bool CollectParallelRecallMetrics(const InputDataset &dataset,
     }
 
     recall_rate_percent.resize(queries.size());
+    double recall_sum = 0.0;
     for (size_t i = 0; i < queries.size(); ++i)
     {
         Query &query = *queries[i];
@@ -241,10 +374,12 @@ bool CollectParallelRecallMetrics(const InputDataset &dataset,
                                        cached_ground_truth))
         {
             query.ground_truth_results = RunSupport::ConvertCacheItemsToQueryResults(cached_ground_truth);
+            ++summary.cache_hit_count;
         }
         else
         {
             query.brute_force_search(dataset);
+            ++summary.brute_force_count;
             if (ground_truth_cache &&
                 !ground_truth_cache->Store(prepared.query_vec,
                                            prepared.filter_expr,
@@ -257,9 +392,12 @@ bool CollectParallelRecallMetrics(const InputDataset &dataset,
         }
 
         query.calculate_recall();
+        recall_sum += static_cast<double>(query.recall_rate);
         recall_rate_percent[i] = static_cast<double>(query.recall_rate) * 100.0;
     }
 
+    summary.average_recall =
+        queries.empty() ? 0.0 : (recall_sum / static_cast<double>(queries.size()));
     return true;
 }
 
@@ -293,6 +431,11 @@ bool FlushParallelOutputs(const fs::path &result_root,
                           const std::vector<double> &bucket_level_ivf_ms,
                           const std::vector<double> &candidate_bucket_merge_ms,
                           const std::vector<double> &npu_async_launch_ms,
+                          const std::vector<double> &npu_submit_ms,
+                          const std::vector<double> &npu_kernel_exec_ms,
+                          const std::vector<double> &npu_d2d_gather_ms,
+                          const std::vector<double> &npu_d2h_transfer_ms,
+                          const std::vector<double> &npu_sync_overhead_ms,
                           const std::vector<double> &inbucket_attr_filter_overlapped_ms,
                           const std::vector<double> &wait_npu_flag_ms,
                           const std::vector<double> &result_collection_ms,
@@ -313,6 +456,11 @@ bool FlushParallelOutputs(const fs::path &result_root,
            RunSupport::WriteMetricFile(latency_dir, "bucket_level_ivf_ms.txt", bucket_level_ivf_ms) &&
            RunSupport::WriteMetricFile(latency_dir, "candidate_bucket_merge_ms.txt", candidate_bucket_merge_ms) &&
            RunSupport::WriteMetricFile(latency_dir, "npu_async_launch_ms.txt", npu_async_launch_ms) &&
+           RunSupport::WriteMetricFile(latency_dir, "npu_submit_ms.txt", npu_submit_ms) &&
+           RunSupport::WriteMetricFile(latency_dir, "npu_kernel_exec_ms.txt", npu_kernel_exec_ms) &&
+           RunSupport::WriteMetricFile(latency_dir, "npu_d2d_gather_ms.txt", npu_d2d_gather_ms) &&
+           RunSupport::WriteMetricFile(latency_dir, "npu_d2h_transfer_ms.txt", npu_d2h_transfer_ms) &&
+           RunSupport::WriteMetricFile(latency_dir, "npu_sync_overhead_ms.txt", npu_sync_overhead_ms) &&
            RunSupport::WriteMetricFile(latency_dir, "inbucket_attr_filter_overlapped_ms.txt",
                                        inbucket_attr_filter_overlapped_ms) &&
            RunSupport::WriteMetricFile(latency_dir, "wait_npu_flag_ms.txt", wait_npu_flag_ms) &&
@@ -324,10 +472,12 @@ bool FlushParallelOutputs(const fs::path &result_root,
            RunSupport::WriteMetricFile(log_dir, "QPS.txt", qps_values);
 }
 
-void PrintParallelProgress(size_t completed_count,
+void PrintParallelProgress(size_t submitted_count,
+                           size_t completed_count,
                            size_t total_count)
 {
-    std::cout << "[Progress] " << completed_count << "/" << total_count << std::endl;
+    std::cout << "[Progress] submitted=" << submitted_count << "/" << total_count
+              << ", completed=" << completed_count << "/" << total_count << std::endl;
 }
 } // namespace
 
@@ -349,8 +499,6 @@ int main()
     //     "../../queries/deep1B_queries.fvecs",
     //     "../../../queries/deep1B_queries.fvecs"
     // };
-    const double target_qps = 10000.0;
-    
     const fs::path config_path = RunSupport::ResolveConfigPath();
     std::cout << "[System] Loading config from " << config_path << "...\n";
     if (!LoadParams(config_path.string(), ResourceConfigProfile::Parallel))
@@ -621,57 +769,90 @@ int main()
         queries.push_back(std::move(query));
     }
 
+    SharedProgressStats progress_stats;
     std::cout << std::fixed << std::setprecision(5);
     std::cout << "[ParallelTest] Query objects prepared. count=" << query_ptrs.size() << "\n";
-    std::cout << "[ParallelTest] Batch submit begins. target_qps=10000\n";
+    std::cout << "[ParallelTest] Sequential rate-limited submit begins. target_qps="
+              << kParallelTargetQps
+              << ", injector_tick_us=" << kInjectorTick.count() << "\n";
 
-    const auto batch_start = std::chrono::steady_clock::now();
-    for (size_t i = 0; i < query_ptrs.size(); ++i)
-    {
-        const auto scheduled_submit_time =
-            batch_start + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-                              std::chrono::duration<double>(static_cast<double>(i) / target_qps));
-        std::this_thread::sleep_until(scheduled_submit_time);
-        scheduler.Push(query_ptrs[i]);
-    }
+    const auto measure_start = std::chrono::steady_clock::now();
+    ParallelRunStats run_stats;
+    std::thread injector([&]() {
+        run_stats = RunRateLimitedInjector(query_ptrs, scheduler, progress_stats, measure_start);
+    });
 
     size_t completed_count = 0;
-    auto next_progress_report = batch_start + std::chrono::seconds(1);
+    auto next_progress_report = measure_start + std::chrono::seconds(1);
     while (completed_count < query_ptrs.size())
     {
-        scheduler.PopResult();  // 阻塞等待，无 CPU 轮询
-        ++completed_count;
+        if (scheduler.PopResult() != nullptr)
+        {
+            ++completed_count;
+            SampleTaskQueueSize(progress_stats, scheduler.GetTaskQueueSize());
+        }
 
         const auto now = std::chrono::steady_clock::now();
         if (now >= next_progress_report)
         {
-            PrintParallelProgress(completed_count, query_ptrs.size());
+            PrintParallelProgress(progress_stats.submitted_count.load(std::memory_order_relaxed),
+                                  completed_count,
+                                  query_ptrs.size());
             do
             {
                 next_progress_report += std::chrono::seconds(1);
             } while (now >= next_progress_report);
         }
+
+        if (completed_count < query_ptrs.size())
+        {
+            std::this_thread::yield();
+        }
+    }
+    if (injector.joinable())
+    {
+        injector.join();
     }
     const auto batch_end = std::chrono::steady_clock::now();
 
-    std::chrono::duration<double, std::milli> total_latency_ms = batch_end - batch_start;
-    const double total_latency_seconds = total_latency_ms.count() / 1000.0;
-    const double overall_qps = (total_latency_seconds > 0.0)
-                                   ? (static_cast<double>(query_ptrs.size()) / total_latency_seconds)
-                                   : 0.0;
-    const double avg_query_latency_ms = query_ptrs.empty()
-                                            ? 0.0
-                                            : (total_latency_ms.count() / static_cast<double>(query_ptrs.size()));
+    std::chrono::duration<double, std::milli> total_latency_ms = batch_end - measure_start;
+    run_stats.total_complete_duration_ms = total_latency_ms.count();
+    const double total_latency_seconds = run_stats.total_complete_duration_ms / 1000.0;
+    run_stats.complete_qps = (total_latency_seconds > 0.0)
+                                 ? (static_cast<double>(query_ptrs.size()) / total_latency_seconds)
+                                 : 0.0;
+    const double avg_query_latency_ms =
+        query_ptrs.empty()
+            ? 0.0
+            : (run_stats.total_complete_duration_ms / static_cast<double>(query_ptrs.size()));
+    const unsigned long long queue_size_sum =
+        progress_stats.task_queue_size_sum.load(std::memory_order_relaxed);
+    const size_t queue_sample_count =
+        progress_stats.task_queue_sample_count.load(std::memory_order_relaxed);
+    run_stats.max_task_queue_size =
+        progress_stats.max_task_queue_size.load(std::memory_order_relaxed);
+    run_stats.avg_task_queue_size =
+        (queue_sample_count > 0)
+            ? (static_cast<double>(queue_size_sum) / static_cast<double>(queue_sample_count))
+            : 0.0;
 
     std::cout << "\n========================================================\n";
-    std::cout << "                Parallel Batch Test Result              \n";
+    std::cout << "             Parallel Rate-Limited Test Result          \n";
     std::cout << "========================================================\n";
     std::cout << "Query Count                    : " << query_ptrs.size() << "\n";
+    std::cout << "Submitted Query Count          : "
+              << progress_stats.submitted_count.load(std::memory_order_relaxed) << "\n";
     std::cout << "Completed Query Count          : " << completed_count << "\n";
-    std::cout << "Target QPS                     : " << target_qps << "\n";
-    std::cout << "Total Batch Latency            : " << total_latency_ms.count() << " ms\n";
-    std::cout << "Overall QPS                    : " << overall_qps << "\n";
+    std::cout << "Measure Submit Duration        : " << run_stats.measure_submit_duration_ms
+              << " ms\n";
+    std::cout << "Measure Submit QPS             : " << run_stats.measure_submit_qps << "\n";
+    std::cout << "Total Complete Duration        : " << run_stats.total_complete_duration_ms
+              << " ms\n";
+    std::cout << "Complete QPS                   : " << run_stats.complete_qps << "\n";
     std::cout << "Average Query Latency(Batch/N) : " << avg_query_latency_ms << " ms\n";
+    std::cout << "Max Submit Lag                 : " << run_stats.max_submit_lag_ms << " ms\n";
+    std::cout << "Max Task Queue Size            : " << run_stats.max_task_queue_size << "\n";
+    std::cout << "Avg Task Queue Size            : " << run_stats.avg_task_queue_size << "\n";
     std::cout << "========================================================\n";
 
     std::cout << "[System] All queries completed. Shutting down worker threads...\n";
@@ -696,6 +877,11 @@ int main()
     std::vector<double> bucket_level_ivf_ms;
     std::vector<double> candidate_bucket_merge_ms;
     std::vector<double> npu_async_launch_ms;
+    std::vector<double> npu_submit_ms;
+    std::vector<double> npu_kernel_exec_ms;
+    std::vector<double> npu_d2d_gather_ms;
+    std::vector<double> npu_d2h_transfer_ms;
+    std::vector<double> npu_sync_overhead_ms;
     std::vector<double> inbucket_attr_filter_overlapped_ms;
     std::vector<double> wait_npu_flag_ms;
     std::vector<double> result_collection_ms;
@@ -707,6 +893,11 @@ int main()
                                        bucket_level_ivf_ms,
                                        candidate_bucket_merge_ms,
                                        npu_async_launch_ms,
+                                       npu_submit_ms,
+                                       npu_kernel_exec_ms,
+                                       npu_d2d_gather_ms,
+                                       npu_d2h_transfer_ms,
+                                       npu_sync_overhead_ms,
                                        inbucket_attr_filter_overlapped_ms,
                                        wait_npu_flag_ms,
                                        result_collection_ms,
@@ -718,14 +909,26 @@ int main()
     }
 
     std::vector<double> recall_rate_percent;
+    ParallelRecallSummary recall_summary;
     if (!CollectParallelRecallMetrics(dataset,
                                       prepared_queries,
                                       queries,
                                       ground_truth_cache.get(),
-                                      recall_rate_percent))
+                                      recall_rate_percent,
+                                      recall_summary))
     {
         return -1;
     }
+
+    std::cout << "\n========================================================\n";
+    std::cout << "                 Parallel Recall Result                 \n";
+    std::cout << "========================================================\n";
+    std::cout << "Average Recall                : " << recall_summary.average_recall << "\n";
+    std::cout << "Average Recall Percent        : "
+              << (recall_summary.average_recall * 100.0) << " %\n";
+    std::cout << "Ground-Truth Cache Hit Count  : " << recall_summary.cache_hit_count << "\n";
+    std::cout << "Ground-Truth BruteForce Count : " << recall_summary.brute_force_count << "\n";
+    std::cout << "========================================================\n";
 
     if (!FlushParallelOutputs(query_result_root_dir,
                               total_end_to_end_ms,
@@ -733,13 +936,18 @@ int main()
                               bucket_level_ivf_ms,
                               candidate_bucket_merge_ms,
                               npu_async_launch_ms,
+                              npu_submit_ms,
+                              npu_kernel_exec_ms,
+                              npu_d2d_gather_ms,
+                              npu_d2h_transfer_ms,
+                              npu_sync_overhead_ms,
                               inbucket_attr_filter_overlapped_ms,
                               wait_npu_flag_ms,
                               result_collection_ms,
                               final_merge_ms,
                               process_round_count_level_1,
                               process_round_count_level_2,
-                              overall_qps))
+                              run_stats.complete_qps))
     {
         std::cerr << "[Fatal] Failed to write parallel outputs.\n";
         return -1;

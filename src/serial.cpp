@@ -229,6 +229,11 @@ struct DeferredMetricFiles
         bucket_level_ivf_ms.resize(expected_queries);
         candidate_bucket_merge_ms.resize(expected_queries);
         npu_async_launch_ms.resize(expected_queries);
+        npu_submit_ms.resize(expected_queries);
+        npu_kernel_exec_ms.resize(expected_queries);
+        npu_d2d_gather_ms.resize(expected_queries);
+        npu_d2h_transfer_ms.resize(expected_queries);
+        npu_sync_overhead_ms.resize(expected_queries);
         inbucket_attr_filter_overlapped_ms.resize(expected_queries);
         wait_npu_flag_ms.resize(expected_queries);
         result_collection_ms.resize(expected_queries);
@@ -252,6 +257,11 @@ struct DeferredMetricFiles
         bucket_level_ivf_ms[query_index] = query.timing_metrics.bucket_level_ivf_ms;
         candidate_bucket_merge_ms[query_index] = query.timing_metrics.candidate_bucket_merge_ms;
         npu_async_launch_ms[query_index] = query.timing_metrics.npu_async_launch_ms;
+        npu_submit_ms[query_index] = query.timing_metrics.npu_submit_ms;
+        npu_kernel_exec_ms[query_index] = query.timing_metrics.npu_kernel_exec_ms;
+        npu_d2d_gather_ms[query_index] = query.timing_metrics.npu_d2d_gather_ms;
+        npu_d2h_transfer_ms[query_index] = query.timing_metrics.npu_d2h_transfer_ms;
+        npu_sync_overhead_ms[query_index] = query.timing_metrics.npu_sync_overhead_ms;
         inbucket_attr_filter_overlapped_ms[query_index] = query.timing_metrics.inbucket_attr_filter_overlapped_ms;
         wait_npu_flag_ms[query_index] = query.timing_metrics.wait_npu_flag_ms;
         result_collection_ms[query_index] = query.timing_metrics.result_collection_ms;
@@ -275,6 +285,11 @@ struct DeferredMetricFiles
                RunSupport::WriteMetricFile(latency_dir, "bucket_level_ivf_ms.txt", bucket_level_ivf_ms) &&
                RunSupport::WriteMetricFile(latency_dir, "candidate_bucket_merge_ms.txt", candidate_bucket_merge_ms) &&
                RunSupport::WriteMetricFile(latency_dir, "npu_async_launch_ms.txt", npu_async_launch_ms) &&
+               RunSupport::WriteMetricFile(latency_dir, "npu_submit_ms.txt", npu_submit_ms) &&
+               RunSupport::WriteMetricFile(latency_dir, "npu_kernel_exec_ms.txt", npu_kernel_exec_ms) &&
+               RunSupport::WriteMetricFile(latency_dir, "npu_d2d_gather_ms.txt", npu_d2d_gather_ms) &&
+               RunSupport::WriteMetricFile(latency_dir, "npu_d2h_transfer_ms.txt", npu_d2h_transfer_ms) &&
+               RunSupport::WriteMetricFile(latency_dir, "npu_sync_overhead_ms.txt", npu_sync_overhead_ms) &&
                RunSupport::WriteMetricFile(latency_dir, "inbucket_attr_filter_overlapped_ms.txt",
                                            inbucket_attr_filter_overlapped_ms) &&
                RunSupport::WriteMetricFile(latency_dir, "wait_npu_flag_ms.txt", wait_npu_flag_ms) &&
@@ -295,6 +310,11 @@ struct DeferredMetricFiles
     std::vector<double> bucket_level_ivf_ms;
     std::vector<double> candidate_bucket_merge_ms;
     std::vector<double> npu_async_launch_ms;
+    std::vector<double> npu_submit_ms;
+    std::vector<double> npu_kernel_exec_ms;
+    std::vector<double> npu_d2d_gather_ms;
+    std::vector<double> npu_d2h_transfer_ms;
+    std::vector<double> npu_sync_overhead_ms;
     std::vector<double> inbucket_attr_filter_overlapped_ms;
     std::vector<double> wait_npu_flag_ms;
     std::vector<double> result_collection_ms;

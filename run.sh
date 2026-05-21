@@ -91,12 +91,7 @@ detect_available_npu_ids() {
 }
 
 select_npu_ids_for_variant() {
-    local required_count=1
     local available_ids=()
-
-    if [[ "${VARIANT}" == "p" ]]; then
-        required_count=8
-    fi
 
     mapfile -t available_ids < <(detect_available_npu_ids)
 
@@ -105,16 +100,53 @@ select_npu_ids_for_variant() {
         exit 1
     fi
 
-    if [[ "${required_count}" -eq 1 ]]; then
-        NPU_IDS=("${available_ids[0]}")
+    local config_file_path="${CONFIG_FILE}"
+
+    local required_count
+    local device_id_start
+
+    if [[ "${VARIANT}" == "p" ]]; then
+        required_count="$(extract_config_value "npu_device_count_parallel" "${config_file_path}")"
     else
-        if [[ "${#available_ids[@]}" -lt "${required_count}" ]]; then
-            echo "[WARN] Only ${#available_ids[@]} NPU(s) detected, less than expected ${required_count} for parallel mode."
-            NPU_IDS=("${available_ids[@]}")
-        else
-            NPU_IDS=("${available_ids[@]:0:${required_count}}")
-        fi
+        required_count="$(extract_config_value "npu_device_count_serial" "${config_file_path}")"
     fi
+    device_id_start="$(extract_config_value "npu_device_id_start" "${config_file_path}")"
+
+    if [[ -z "${required_count}" ]]; then
+        echo "[ERROR] Failed to read npu_device_count from config.txt"
+        exit 1
+    fi
+    if [[ -z "${device_id_start}" ]]; then
+        echo "[ERROR] Failed to read npu_device_id_start from config.txt"
+        exit 1
+    fi
+
+    # shellcheck disable=SC2015
+    [[ "${required_count}" =~ ^[0-9]+$ ]] && [[ "${required_count}" -gt 0 ]] || {
+        echo "[ERROR] Invalid npu_device_count value: '${required_count}'"
+        exit 1
+    }
+    # shellcheck disable=SC2015
+    [[ "${device_id_start}" =~ ^[0-9]+$ ]] && [[ "${device_id_start}" -ge 0 ]] || {
+        echo "[ERROR] Invalid npu_device_id_start value: '${device_id_start}'"
+        exit 1
+    }
+
+    local available_count="${#available_ids[@]}"
+    if [[ "${device_id_start}" -ge "${available_count}" ]]; then
+        echo "[ERROR] npu_device_id_start=${device_id_start} exceeds available NPU count=${available_count}."
+        echo "        Available NPU IDs: ${available_ids[*]}"
+        exit 1
+    fi
+
+    local end_index=$((device_id_start + required_count))
+    if [[ "${end_index}" -gt "${available_count}" ]]; then
+        echo "[ERROR] npu_device_id_start(${device_id_start}) + npu_device_count(${required_count}) = ${end_index} exceeds available NPU count=${available_count}."
+        echo "        Available NPU IDs: ${available_ids[*]}"
+        exit 1
+    fi
+
+    NPU_IDS=("${available_ids[@]:${device_id_start}:${required_count}}")
 }
 
 start_cpu_monitor() {
@@ -487,6 +519,9 @@ elif [[ "${VARIANT}" == "a8" ]]; then
     EXECUTABLE_NAME="analyze_t8"
 fi
 
+CURRENT_DIR="$(cd "$(dirname "${BASH_SOURCE:-$0}")" && pwd)"
+CONFIG_FILE="${CURRENT_DIR}/config.txt"
+
 select_npu_ids_for_variant
 
 if [[ "${PROFILE_MODE}" == "1" ]]; then
@@ -497,21 +532,19 @@ else
     ENABLE_PROFILING_BUILD="OFF"
 fi
 
-CURRENT_DIR="$(cd "$(dirname "${BASH_SOURCE:-$0}")" && pwd)"
 BUILD_DIR="${CURRENT_DIR}/build"
 OUT_DIR="${CURRENT_DIR}/out"
-CONFIG_FILE="${CURRENT_DIR}/config.txt"
 PROFILE_DIR="${CURRENT_DIR}/profile"
 FLAMEGRAPH_DIR="${FLAMEGRAPH_DIR:-${CURRENT_DIR}/FlameGraph}"
 
 echo "========================================"
-echo "Target: ${SOC_VERSION}"
-echo "Mode:   ${RUN_MODE}"
-echo "Build:  ${BUILD_TYPE}"
-echo "FlameGraph mode: ${PROFILE_MODE}"
-echo "Compile mode: ${COMPILE_MODE}"
-echo "Executable: ${EXECUTABLE_NAME}"
-echo "NPU IDs: ${NPU_IDS[*]}"
+echo "Target:     ${SOC_VERSION}"
+echo "Mode:       ${RUN_MODE}"
+echo "Build:      ${BUILD_TYPE}"
+echo "Variant:    ${EXECUTABLE_NAME} ($(case "${VARIANT}" in s|a1|a2|a3|a8) echo 'serial';; p) echo 'parallel';; esac))"
+echo "Compile:    ${COMPILE_MODE}"
+echo "Profile:    ${PROFILE_MODE}"
+echo "NPU IDs:    ${NPU_IDS[*]}"
 echo "========================================"
 
 export ASCEND_HOME_PATH="${ASCEND_INSTALL_PATH}"

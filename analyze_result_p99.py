@@ -23,12 +23,41 @@ LATENCY_METRICS = [
     ("bucket_level_ivf_ms", "IVF桶选择"),
     ("candidate_bucket_merge_ms", "候选桶合并"),
     ("npu_async_launch_ms", "NPU异步下发"),
+    ("npu_submit_ms", "NPU提交(H2D+launch)"),
+    ("npu_kernel_exec_ms", "NPU kernel执行"),
+    ("npu_d2d_gather_ms", "D2D gather"),
+    ("npu_d2h_transfer_ms", "D2H传输"),
+    ("npu_sync_overhead_ms", "同步等待开销"),
     ("inbucket_attr_filter_overlapped_ms", "属性过滤(与NPU并行)"),
     ("wait_npu_flag_ms", "等待NPU完成"),
     ("result_collection_ms", "结果收集"),
     ("final_merge_ms", "最终合并"),
     ("total_end_to_end_ms", "总耗时"),
 ]
+
+
+# ── CJK-aware formatting helpers ─────────────────────────
+def _dw(s: str) -> int:
+    """Display width: CJK ideographs and fullwidth chars count as 2."""
+    w = 0
+    for ch in s:
+        cp = ord(ch)
+        if (0x4E00 <= cp <= 0x9FFF or 0x3000 <= cp <= 0x303F or
+                0xFF00 <= cp <= 0xFFEF or 0xF900 <= cp <= 0xFAFF):
+            w += 2
+        else:
+            w += 1
+    return w
+
+
+def _rpad(s: str, width: int) -> str:
+    """Right-pad string to *display* width."""
+    return s + ' ' * max(0, width - _dw(s))
+
+
+def _lpad(s: str, width: int) -> str:
+    """Left-pad string to *display* width."""
+    return ' ' * max(0, width - _dw(s)) + s
 
 
 def read_float_column(path: Path) -> list[float]:
@@ -137,9 +166,15 @@ def main():
     stage_keys = [k for k, _ in LATENCY_METRICS if k != "total_end_to_end_ms" and k in data]
     stage_names = {k: name for k, name in LATENCY_METRICS}
 
+    NUM_W = 12
+    RATIO_W = 8
+    LABEL_W = max(_dw(name) for name in stage_names.values()) + 2
+    LABEL_W = max(LABEL_W, _dw("总耗时") + 2, _dw("阶段") + 2)
+    SEP1_W = LABEL_W + 2 + NUM_W + 2 + NUM_W + 2 + NUM_W + 2 + RATIO_W
+
     print()
-    print(f"  {'阶段':<30s}  {'平均(ms)':>12s}  {'中位数(ms)':>12s}  {'最大(ms)':>12s}  {'占比':>8s}")
-    print("  " + "-" * 78)
+    print(f"  {_rpad('阶段', LABEL_W)}  {_lpad('平均(ms)', NUM_W)}  {_lpad('中位数(ms)', NUM_W)}  {_lpad('最大(ms)', NUM_W)}  {_lpad('占比', RATIO_W)}")
+    print("  " + "-" * SEP1_W)
 
     tail_total = [total[i] for i in tail_indices]
     tail_total_mean = statistics.mean(tail_total)
@@ -151,15 +186,15 @@ def main():
         max_v = max(vals)
         ratio = (mean_v / tail_total_mean * 100) if tail_total_mean > 0 else 0
         label = stage_names.get(key, key)
-        print(f"  {label:<30s}  {fmt_ms(mean_v):>12s}  {fmt_ms(median_v):>12s}  {fmt_ms(max_v):>12s}  {ratio:>7.2f}%")
+        print(f"  {_rpad(label, LABEL_W)}  {_lpad(fmt_ms(mean_v), NUM_W)}  {_lpad(fmt_ms(median_v), NUM_W)}  {_lpad(fmt_ms(max_v), NUM_W)}  {_lpad(f'{ratio:.2f}%', RATIO_W)}")
 
     # 总耗时行
     tail_mean = statistics.mean(tail_total)
     tail_median = statistics.median(tail_total)
     tail_max = max(tail_total)
     tail_min = min(tail_total)
-    print("  " + "-" * 78)
-    print(f"  {'总耗时':<30s}  {fmt_ms(tail_mean):>12s}  {fmt_ms(tail_median):>12s}  {fmt_ms(tail_max):>12s}  {'100.00%':>8s}")
+    print("  " + "-" * SEP1_W)
+    print(f"  {_rpad('总耗时', LABEL_W)}  {_lpad(fmt_ms(tail_mean), NUM_W)}  {_lpad(fmt_ms(tail_median), NUM_W)}  {_lpad(fmt_ms(tail_max), NUM_W)}  {_lpad('100.00%', RATIO_W)}")
 
     # ── 5. P99+ vs 全体对比 ─────────────────────────────
     print()
@@ -170,12 +205,15 @@ def main():
     all_total_mean = statistics.mean(total)
     all_total_median = statistics.median(total)
 
-    header = f"  {'指标':<24s}  {'全体':>12s}  {'P99+':>12s}  {'倍率':>8s}"
-    print(header)
-    print("  " + "-" * 60)
-    print(f"  {'总耗时-平均(ms)':<24s}  {fmt_ms(all_total_mean):>12s}  {fmt_ms(tail_mean):>12s}  {tail_mean/all_total_mean:>8.2f}x")
-    print(f"  {'总耗时-中位数(ms)':<24s}  {fmt_ms(all_total_median):>12s}  {fmt_ms(tail_median):>12s}  {tail_median/all_total_median:>8.2f}x")
-    print(f"  {'总耗时-最大(ms)':<24s}  {fmt_ms(max(total)):>12s}  {fmt_ms(tail_max):>12s}")
+    T2_LABELS = ["总耗时-平均(ms)", "总耗时-中位数(ms)", "总耗时-最大(ms)"] + list(stage_names.values())
+    T2_LABEL_W = max(_dw(s) for s in T2_LABELS) + 2
+    T2_SEP_W = T2_LABEL_W + 2 + NUM_W + 2 + NUM_W + 2 + RATIO_W
+
+    print(f"  {_rpad('指标', T2_LABEL_W)}  {_lpad('全体', NUM_W)}  {_lpad('P99+', NUM_W)}  {_lpad('倍率', RATIO_W)}")
+    print("  " + "-" * T2_SEP_W)
+    print(f"  {_rpad('总耗时-平均(ms)', T2_LABEL_W)}  {_lpad(fmt_ms(all_total_mean), NUM_W)}  {_lpad(fmt_ms(tail_mean), NUM_W)}  {_lpad(f'{tail_mean/all_total_mean:.2f}x', RATIO_W)}")
+    print(f"  {_rpad('总耗时-中位数(ms)', T2_LABEL_W)}  {_lpad(fmt_ms(all_total_median), NUM_W)}  {_lpad(fmt_ms(tail_median), NUM_W)}  {_lpad(f'{tail_median/all_total_median:.2f}x', RATIO_W)}")
+    print(f"  {_rpad('总耗时-最大(ms)', T2_LABEL_W)}  {_lpad(fmt_ms(max(total)), NUM_W)}  {_lpad(fmt_ms(tail_max), NUM_W)}  {_lpad('—', RATIO_W)}")
 
     for key in stage_keys:
         all_vals = data[key]
@@ -184,7 +222,7 @@ def main():
         t_mean = statistics.mean(tail_vals)
         ratio = t_mean / all_mean if all_mean > 0 else 0
         label = stage_names.get(key, key)
-        print(f"  {label:<24s}  {fmt_ms(all_mean):>12s}  {fmt_ms(t_mean):>12s}  {ratio:>8.2f}x")
+        print(f"  {_rpad(label, T2_LABEL_W)}  {_lpad(fmt_ms(all_mean), NUM_W)}  {_lpad(fmt_ms(t_mean), NUM_W)}  {_lpad(f'{ratio:.2f}x', RATIO_W)}")
 
     # ── 6. 扩搜轮次分布（如有） ─────────────────────────
     if round_l1:
@@ -200,12 +238,12 @@ def main():
         l1_dist = Counter(tail_l1)
         l2_dist = Counter(tail_l2)
 
-        print(f"  L1 轮次分布: ", end="")
+        print("  L1 轮次分布: ", end="")
         for k in sorted(l1_dist.keys()):
             print(f"{k}轮={l1_dist[k]}条({l1_dist[k]/tail_count*100:.1f}%)  ", end="")
         print()
 
-        print(f"  L2 批次分布: ", end="")
+        print("  L2 批次分布: ", end="")
         for k in sorted(l2_dist.keys()):
             print(f"{k}批={l2_dist[k]}条({l2_dist[k]/tail_count*100:.1f}%)  ", end="")
         print()
@@ -223,29 +261,28 @@ def main():
     print("  P99+ 内部时延分布细分")
     print("=" * 72)
 
-    print(f"  {'百分位':<10s}  {'总耗时(ms)':>14s}", end="")
+    PCT_W = 10
+    TOT_W = 14
+    STAGE_W = 10
+    T3_SEP_W = PCT_W + 2 + TOT_W + len(stage_keys) * (2 + STAGE_W)
+
+    print(f"  {_rpad('百分位', PCT_W)}  {_lpad('总耗时(ms)', TOT_W)}", end="")
     for key in stage_keys:
         label = stage_names.get(key, key)
         short = label[:6]
-        print(f"  {short:>10s}", end="")
+        print(f"  {_lpad(short, STAGE_W)}", end="")
     print()
-    print("  " + "-" * (16 + 14 + len(stage_keys) * 12))
+    print("  " + "-" * T3_SEP_W)
 
     for p in [0, 25, 50, 75, 90, 100]:
-        tail_totals_sorted = sorted(tail_total)
-        k = int((len(tail_totals_sorted) - 1) * p / 100.0)
-        threshold = tail_totals_sorted[k]
-        # 找到 P99+ 集合中对应这个百分位的查询索引
-        idx = tail_indices[tail_totals_sorted.index(threshold)] if tail_count > 0 else 0
-        # 直接用排序后的 rank 对应
         rank_idx = min(int(len(tail_indices) * p / 100.0), tail_count - 1)
         sorted_tail = sorted(tail_indices, key=lambda i: total[i])
         qi = sorted_tail[rank_idx]
 
         label = f"P99+P{p}" if p > 0 else "MIN"
-        print(f"  {label:<10s}  {fmt_ms(total[qi]):>14s}", end="")
+        print(f"  {_rpad(label, PCT_W)}  {_lpad(fmt_ms(total[qi]), TOT_W)}", end="")
         for key in stage_keys:
-            print(f"  {fmt_ms(data[key][qi]):>10s}", end="")
+            print(f"  {_lpad(fmt_ms(data[key][qi]), STAGE_W)}", end="")
         print()
 
     print()

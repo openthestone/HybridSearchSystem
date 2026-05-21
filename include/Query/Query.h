@@ -133,6 +133,11 @@ struct QueryTimingMetrics
     double bucket_level_ivf_result_pack_ms = 0.0;
     double candidate_bucket_merge_ms = 0.0;
     double npu_async_launch_ms = 0.0;
+    double npu_submit_ms = 0.0;
+    double npu_kernel_exec_ms = 0.0;
+    double npu_d2d_gather_ms = 0.0;
+    double npu_d2h_transfer_ms = 0.0;
+    double npu_sync_overhead_ms = 0.0;
     double inbucket_attr_filter_overlapped_ms = 0.0;
     double wait_npu_flag_ms = 0.0;
     double result_collection_ms = 0.0;
@@ -161,6 +166,7 @@ public:
     int process_round_count_level_2 = 0; // 当前查询实际执行的二级桶处理子批次数
     int searched_bucket_count_level_1 = 0; // 当前查询实际处理的一级桶数量
     int searched_bucket_count_level_2 = 0; // 当前查询实际处理的二级桶数量
+    std::vector<uint32_t> searched_level_2_bucket_ids; // 当前查询实际处理过的二级桶编号（按处理顺序）
     QueryResult result;              // 查询结果
 
     // ==========================================
@@ -212,6 +218,7 @@ public:
         result.topk_results.clear();
         ground_truth_results.clear();
         merge_buffer_.clear();
+        searched_level_2_bucket_ids.clear();
 
         query_vector.clear();
         TrackVectorReserve(query_vector,
@@ -284,6 +291,13 @@ public:
     void merge_batch_results(const std::vector<QueryResult::Item> &new_items)
     {
         result.merge_batch(new_items, expanded_k, merge_buffer_);
+    }
+
+    void RecordSearchedLevel2Buckets(const std::vector<uint32_t> &bucket_ids)
+    {
+        searched_level_2_bucket_ids.insert(searched_level_2_bucket_ids.end(),
+                                           bucket_ids.begin(),
+                                           bucket_ids.end());
     }
 
     static void WarmUpThreadLocalExecutionBuffers()
@@ -397,17 +411,29 @@ public:
                     {
                         uint32_t j = 0;
 #if defined(__aarch64__) || defined(__arm__)
-                        // ---- NEON 256-bit: 4 uint64/iteration (2x uint64x2_t) ----
+                        for (; j + 7 < block_len; j += 8)
+                        {
+                            uint64x2_t v1_0 = vld1q_u64(left.ptr + j);
+                            uint64x2_t v1_1 = vld1q_u64(left.ptr + j + 2);
+                            uint64x2_t v1_2 = vld1q_u64(left.ptr + j + 4);
+                            uint64x2_t v1_3 = vld1q_u64(left.ptr + j + 6);
+                            uint64x2_t v2_0 = vld1q_u64(right.ptr + j);
+                            uint64x2_t v2_1 = vld1q_u64(right.ptr + j + 2);
+                            uint64x2_t v2_2 = vld1q_u64(right.ptr + j + 4);
+                            uint64x2_t v2_3 = vld1q_u64(right.ptr + j + 6);
+                            vst1q_u64(res_ptr + j,     vandq_u64(v1_0, v2_0));
+                            vst1q_u64(res_ptr + j + 2, vandq_u64(v1_1, v2_1));
+                            vst1q_u64(res_ptr + j + 4, vandq_u64(v1_2, v2_2));
+                            vst1q_u64(res_ptr + j + 6, vandq_u64(v1_3, v2_3));
+                        }
                         for (; j + 3 < block_len; j += 4)
                         {
                             uint64x2_t v1_0 = vld1q_u64(left.ptr + j);
                             uint64x2_t v1_1 = vld1q_u64(left.ptr + j + 2);
                             uint64x2_t v2_0 = vld1q_u64(right.ptr + j);
                             uint64x2_t v2_1 = vld1q_u64(right.ptr + j + 2);
-                            uint64x2_t vres_0 = vandq_u64(v1_0, v2_0);
-                            uint64x2_t vres_1 = vandq_u64(v1_1, v2_1);
-                            vst1q_u64(res_ptr + j, vres_0);
-                            vst1q_u64(res_ptr + j + 2, vres_1);
+                            vst1q_u64(res_ptr + j,     vandq_u64(v1_0, v2_0));
+                            vst1q_u64(res_ptr + j + 2, vandq_u64(v1_1, v2_1));
                         }
 #endif
                         for (; j < block_len; ++j)
@@ -417,17 +443,29 @@ public:
                     {
                         uint32_t j = 0;
 #if defined(__aarch64__) || defined(__arm__)
-                        // ---- NEON 256-bit: 4 uint64/iteration (2x uint64x2_t) ----
+                        for (; j + 7 < block_len; j += 8)
+                        {
+                            uint64x2_t v1_0 = vld1q_u64(left.ptr + j);
+                            uint64x2_t v1_1 = vld1q_u64(left.ptr + j + 2);
+                            uint64x2_t v1_2 = vld1q_u64(left.ptr + j + 4);
+                            uint64x2_t v1_3 = vld1q_u64(left.ptr + j + 6);
+                            uint64x2_t v2_0 = vld1q_u64(right.ptr + j);
+                            uint64x2_t v2_1 = vld1q_u64(right.ptr + j + 2);
+                            uint64x2_t v2_2 = vld1q_u64(right.ptr + j + 4);
+                            uint64x2_t v2_3 = vld1q_u64(right.ptr + j + 6);
+                            vst1q_u64(res_ptr + j,     vorrq_u64(v1_0, v2_0));
+                            vst1q_u64(res_ptr + j + 2, vorrq_u64(v1_1, v2_1));
+                            vst1q_u64(res_ptr + j + 4, vorrq_u64(v1_2, v2_2));
+                            vst1q_u64(res_ptr + j + 6, vorrq_u64(v1_3, v2_3));
+                        }
                         for (; j + 3 < block_len; j += 4)
                         {
                             uint64x2_t v1_0 = vld1q_u64(left.ptr + j);
                             uint64x2_t v1_1 = vld1q_u64(left.ptr + j + 2);
                             uint64x2_t v2_0 = vld1q_u64(right.ptr + j);
                             uint64x2_t v2_1 = vld1q_u64(right.ptr + j + 2);
-                            uint64x2_t vres_0 = vorrq_u64(v1_0, v2_0);
-                            uint64x2_t vres_1 = vorrq_u64(v1_1, v2_1);
-                            vst1q_u64(res_ptr + j, vres_0);
-                            vst1q_u64(res_ptr + j + 2, vres_1);
+                            vst1q_u64(res_ptr + j,     vorrq_u64(v1_0, v2_0));
+                            vst1q_u64(res_ptr + j + 2, vorrq_u64(v1_1, v2_1));
                         }
 #endif
                         for (; j < block_len; ++j)
@@ -564,6 +602,17 @@ public:
                             uint32_t i = 0;
 #if defined(__aarch64__) || defined(__arm__)
                             uint64x2_t all_ones = vdupq_n_u64(~0ULL);
+                            for (; i + 7 < block_len; i += 8)
+                            {
+                                uint64x2_t v_0 = vld1q_u64(tag_bits + i);
+                                uint64x2_t v_1 = vld1q_u64(tag_bits + i + 2);
+                                uint64x2_t v_2 = vld1q_u64(tag_bits + i + 4);
+                                uint64x2_t v_3 = vld1q_u64(tag_bits + i + 6);
+                                vst1q_u64(res_ptr + i,     veorq_u64(v_0, all_ones));
+                                vst1q_u64(res_ptr + i + 2, veorq_u64(v_1, all_ones));
+                                vst1q_u64(res_ptr + i + 4, veorq_u64(v_2, all_ones));
+                                vst1q_u64(res_ptr + i + 6, veorq_u64(v_3, all_ones));
+                            }
                             for (; i + 3 < block_len; i += 4)
                             {
                                 uint64x2_t v_0 = vld1q_u64(tag_bits + i);
@@ -621,6 +670,21 @@ public:
                             uint64_t *dst = const_cast<uint64_t*>(left.ptr);
                             uint32_t i = 0;
 #if defined(__aarch64__) || defined(__arm__)
+                            for (; i + 7 < block_len; i += 8)
+                            {
+                                uint64x2_t vl_0 = vld1q_u64(dst + i);
+                                uint64x2_t vl_1 = vld1q_u64(dst + i + 2);
+                                uint64x2_t vl_2 = vld1q_u64(dst + i + 4);
+                                uint64x2_t vl_3 = vld1q_u64(dst + i + 6);
+                                uint64x2_t vr_0 = vld1q_u64(right.ptr + i);
+                                uint64x2_t vr_1 = vld1q_u64(right.ptr + i + 2);
+                                uint64x2_t vr_2 = vld1q_u64(right.ptr + i + 4);
+                                uint64x2_t vr_3 = vld1q_u64(right.ptr + i + 6);
+                                vst1q_u64(dst + i,     vandq_u64(vl_0, vr_0));
+                                vst1q_u64(dst + i + 2, vandq_u64(vl_1, vr_1));
+                                vst1q_u64(dst + i + 4, vandq_u64(vl_2, vr_2));
+                                vst1q_u64(dst + i + 6, vandq_u64(vl_3, vr_3));
+                            }
                             for (; i + 3 < block_len; i += 4)
                             {
                                 uint64x2_t vl_0 = vld1q_u64(dst + i);
@@ -641,6 +705,21 @@ public:
                             uint64_t *dst = const_cast<uint64_t*>(right.ptr);
                             uint32_t i = 0;
 #if defined(__aarch64__) || defined(__arm__)
+                            for (; i + 7 < block_len; i += 8)
+                            {
+                                uint64x2_t vl_0 = vld1q_u64(left.ptr + i);
+                                uint64x2_t vl_1 = vld1q_u64(left.ptr + i + 2);
+                                uint64x2_t vl_2 = vld1q_u64(left.ptr + i + 4);
+                                uint64x2_t vl_3 = vld1q_u64(left.ptr + i + 6);
+                                uint64x2_t vr_0 = vld1q_u64(dst + i);
+                                uint64x2_t vr_1 = vld1q_u64(dst + i + 2);
+                                uint64x2_t vr_2 = vld1q_u64(dst + i + 4);
+                                uint64x2_t vr_3 = vld1q_u64(dst + i + 6);
+                                vst1q_u64(dst + i,     vandq_u64(vl_0, vr_0));
+                                vst1q_u64(dst + i + 2, vandq_u64(vl_1, vr_1));
+                                vst1q_u64(dst + i + 4, vandq_u64(vl_2, vr_2));
+                                vst1q_u64(dst + i + 6, vandq_u64(vl_3, vr_3));
+                            }
                             for (; i + 3 < block_len; i += 4)
                             {
                                 uint64x2_t vl_0 = vld1q_u64(left.ptr + i);
@@ -661,6 +740,21 @@ public:
                             uint64_t *res_ptr = alloc_scratch(block_len);
                             uint32_t i = 0;
 #if defined(__aarch64__) || defined(__arm__)
+                            for (; i + 7 < block_len; i += 8)
+                            {
+                                uint64x2_t vl_0 = vld1q_u64(left.ptr + i);
+                                uint64x2_t vl_1 = vld1q_u64(left.ptr + i + 2);
+                                uint64x2_t vl_2 = vld1q_u64(left.ptr + i + 4);
+                                uint64x2_t vl_3 = vld1q_u64(left.ptr + i + 6);
+                                uint64x2_t vr_0 = vld1q_u64(right.ptr + i);
+                                uint64x2_t vr_1 = vld1q_u64(right.ptr + i + 2);
+                                uint64x2_t vr_2 = vld1q_u64(right.ptr + i + 4);
+                                uint64x2_t vr_3 = vld1q_u64(right.ptr + i + 6);
+                                vst1q_u64(res_ptr + i,     vandq_u64(vl_0, vr_0));
+                                vst1q_u64(res_ptr + i + 2, vandq_u64(vl_1, vr_1));
+                                vst1q_u64(res_ptr + i + 4, vandq_u64(vl_2, vr_2));
+                                vst1q_u64(res_ptr + i + 6, vandq_u64(vl_3, vr_3));
+                            }
                             for (; i + 3 < block_len; i += 4)
                             {
                                 uint64x2_t vl_0 = vld1q_u64(left.ptr + i);
@@ -700,6 +794,21 @@ public:
                             uint64_t *dst = const_cast<uint64_t*>(left.ptr);
                             uint32_t i = 0;
 #if defined(__aarch64__) || defined(__arm__)
+                            for (; i + 7 < block_len; i += 8)
+                            {
+                                uint64x2_t vl_0 = vld1q_u64(dst + i);
+                                uint64x2_t vl_1 = vld1q_u64(dst + i + 2);
+                                uint64x2_t vl_2 = vld1q_u64(dst + i + 4);
+                                uint64x2_t vl_3 = vld1q_u64(dst + i + 6);
+                                uint64x2_t vr_0 = vld1q_u64(right.ptr + i);
+                                uint64x2_t vr_1 = vld1q_u64(right.ptr + i + 2);
+                                uint64x2_t vr_2 = vld1q_u64(right.ptr + i + 4);
+                                uint64x2_t vr_3 = vld1q_u64(right.ptr + i + 6);
+                                vst1q_u64(dst + i,     vorrq_u64(vl_0, vr_0));
+                                vst1q_u64(dst + i + 2, vorrq_u64(vl_1, vr_1));
+                                vst1q_u64(dst + i + 4, vorrq_u64(vl_2, vr_2));
+                                vst1q_u64(dst + i + 6, vorrq_u64(vl_3, vr_3));
+                            }
                             for (; i + 3 < block_len; i += 4)
                             {
                                 uint64x2_t vl_0 = vld1q_u64(dst + i);
@@ -720,6 +829,21 @@ public:
                             uint64_t *dst = const_cast<uint64_t*>(right.ptr);
                             uint32_t i = 0;
 #if defined(__aarch64__) || defined(__arm__)
+                            for (; i + 7 < block_len; i += 8)
+                            {
+                                uint64x2_t vl_0 = vld1q_u64(left.ptr + i);
+                                uint64x2_t vl_1 = vld1q_u64(left.ptr + i + 2);
+                                uint64x2_t vl_2 = vld1q_u64(left.ptr + i + 4);
+                                uint64x2_t vl_3 = vld1q_u64(left.ptr + i + 6);
+                                uint64x2_t vr_0 = vld1q_u64(dst + i);
+                                uint64x2_t vr_1 = vld1q_u64(dst + i + 2);
+                                uint64x2_t vr_2 = vld1q_u64(dst + i + 4);
+                                uint64x2_t vr_3 = vld1q_u64(dst + i + 6);
+                                vst1q_u64(dst + i,     vorrq_u64(vl_0, vr_0));
+                                vst1q_u64(dst + i + 2, vorrq_u64(vl_1, vr_1));
+                                vst1q_u64(dst + i + 4, vorrq_u64(vl_2, vr_2));
+                                vst1q_u64(dst + i + 6, vorrq_u64(vl_3, vr_3));
+                            }
                             for (; i + 3 < block_len; i += 4)
                             {
                                 uint64x2_t vl_0 = vld1q_u64(left.ptr + i);
@@ -740,6 +864,21 @@ public:
                             uint64_t *res_ptr = alloc_scratch(block_len);
                             uint32_t i = 0;
 #if defined(__aarch64__) || defined(__arm__)
+                            for (; i + 7 < block_len; i += 8)
+                            {
+                                uint64x2_t vl_0 = vld1q_u64(left.ptr + i);
+                                uint64x2_t vl_1 = vld1q_u64(left.ptr + i + 2);
+                                uint64x2_t vl_2 = vld1q_u64(left.ptr + i + 4);
+                                uint64x2_t vl_3 = vld1q_u64(left.ptr + i + 6);
+                                uint64x2_t vr_0 = vld1q_u64(right.ptr + i);
+                                uint64x2_t vr_1 = vld1q_u64(right.ptr + i + 2);
+                                uint64x2_t vr_2 = vld1q_u64(right.ptr + i + 4);
+                                uint64x2_t vr_3 = vld1q_u64(right.ptr + i + 6);
+                                vst1q_u64(res_ptr + i,     vorrq_u64(vl_0, vr_0));
+                                vst1q_u64(res_ptr + i + 2, vorrq_u64(vl_1, vr_1));
+                                vst1q_u64(res_ptr + i + 4, vorrq_u64(vl_2, vr_2));
+                                vst1q_u64(res_ptr + i + 6, vorrq_u64(vl_3, vr_3));
+                            }
                             for (; i + 3 < block_len; i += 4)
                             {
                                 uint64x2_t vl_0 = vld1q_u64(left.ptr + i);
