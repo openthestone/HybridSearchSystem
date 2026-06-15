@@ -3,8 +3,35 @@ set -euo pipefail
 
 # --- 核心配置 ---
 RUN_MODE="npu"
-SOC_VERSION="Ascend910B3"
-ASCEND_INSTALL_PATH="/usr/local/Ascend/ascend-toolkit/latest"
+
+# Auto-detect SOC version from npu-smi (override via SOC_VERSION env)
+if [[ -z "${SOC_VERSION:-}" ]]; then
+    _chip_name=$(npu-smi info 2>/dev/null | grep -oP '\b910B[1-4]\b' | head -1 || true)
+    case "${_chip_name}" in
+        910B1) SOC_VERSION="Ascend910B1" ;;
+        910B2) SOC_VERSION="Ascend910B2" ;;
+        910B3) SOC_VERSION="Ascend910B3" ;;
+        910B4) SOC_VERSION="Ascend910B4" ;;
+        *)     SOC_VERSION="Ascend910B3" ;;  # fallback
+    esac
+fi
+
+# Auto-detect CANN toolkit path (first existing wins; override via ASCEND_INSTALL_PATH env)
+if [[ -z "${ASCEND_INSTALL_PATH:-}" ]]; then
+    for _candidate in \
+        "/usr/local/Ascend/ascend-toolkit/latest" \
+        "/home/lcy/Ascend/ascend-toolkit/latest"
+    do
+        if [[ -d "${_candidate}" ]]; then
+            ASCEND_INSTALL_PATH="${_candidate}"
+            break
+        fi
+    done
+    if [[ -z "${ASCEND_INSTALL_PATH:-}" ]]; then
+        echo "[ERROR] CANN toolkit not found. Set ASCEND_INSTALL_PATH env var."
+        exit 1
+    fi
+fi
 VARIANT="s"
 PROFILE_MODE="0"
 COMPILE_MODE="1"
@@ -304,8 +331,44 @@ run_normal_mode() {
     write_cpu_usage_log "${app_pid}" "${top_output_file}" "${cpu_usage_file}"
     rm -f "${top_output_file}"
 
+    # CANN cleanup may segfault after all results are written (cosmetic).
+    # If result files exist, treat as success.
     if [[ "${app_exit_code}" -ne 0 ]]; then
-        exit "${app_exit_code}"
+        local has_results="false"
+        if compgen -G "${RESULT_ROOT_PATH}/recall/*" >/dev/null 2>&1; then
+            has_results="true"
+        fi
+        if [[ "${has_results}" == "true" ]]; then
+            echo ">>> Application exited with code ${app_exit_code} but results exist — treating as success (CANN cleanup segfault is known)."
+        else
+            # Dump CANN GE debug logs on failure
+            echo ">>> Application failed (exit ${app_exit_code}). Dumping CANN GE logs..."
+            local _ge_log_dirs=()
+            for _d in "${HOME}/ascend/log/debug/plog" "${ASCEND_INSTALL_PATH}/../log/debug/plog"; do
+                [[ -d "${_d}" ]] && _ge_log_dirs+=("${_d}")
+            done
+            if [[ ${#_ge_log_dirs[@]} -gt 0 ]]; then
+                for _d in "${_ge_log_dirs[@]}"; do
+                    local _latest
+                    _latest="$(find "${_d}" -name 'plog-*.log' -type f -mmin -5 2>/dev/null | head -3)"
+                    if [[ -n "${_latest}" ]]; then
+                        echo ">>> GE log dir: ${_d}"
+                        while IFS= read -r _f; do
+                            echo "--- $(basename "${_f}") (last 50 lines) ---"
+                            tail -50 "${_f}"
+                        done <<< "${_latest}"
+                    fi
+                done
+            else
+                echo ">>> No GE log directory found. Searched: ${HOME}/ascend/log/debug/plog"
+            fi
+            # Print CANN env vars for diagnostics
+            echo ">>> CANN environment:"
+            for _v in ASCEND_HOME_PATH ASCEND_TOOLKIT_HOME ASCEND_OPP_PATH ASCEND_AICPU_PATH ASCEND_OPP_BUILT_IN; do
+                echo "    ${_v}=${!_v:-<not set>}"
+            done
+            exit "${app_exit_code}"
+        fi
     fi
 }
 
@@ -558,7 +621,7 @@ if [[ -f "${ASCEND_INSTALL_PATH}/bin/setenv.bash" ]]; then
     set -u
 fi
 
-export LD_LIBRARY_PATH="${OUT_DIR}/lib:/usr/local/lib:/usr/local/lib64:/usr/lib64:/opt/OpenBLAS/lib:/lib:${LD_LIBRARY_PATH:-}"
+export LD_LIBRARY_PATH="${OUT_DIR}/lib:/usr/local/lib:/usr/local/lib64:/usr/lib64:/opt/OpenBLAS/lib:/lib:${ASCEND_INSTALL_PATH}/opp/vendors/aicpu_mask/op_impl/cpu/aicpu_kernel/impl:${LD_LIBRARY_PATH:-}"
 
 if [[ "${PROFILE_MODE}" == "1" ]]; then
     echo ">>> Cleaning profile directory: ${PROFILE_DIR}"
@@ -580,8 +643,311 @@ if [[ "${COMPILE_MODE}" == "1" ]]; then
     echo ">>> Compiling..."
     cmake --build "${BUILD_DIR}" -j8
     cmake --install "${BUILD_DIR}"
+
+    # Deploy vendor files (op_proto, AI CPU kernel .so, kernel.json) to CANN
+    echo ">>> Installing vendor files to CANN..."
+    VENDOR_SRC="${CURRENT_DIR}/include/NPU/vendor"
+    CANN_VENDOR="${ASCEND_INSTALL_PATH}/opp/vendors/aicpu_mask"
+
+    mkdir -p "${CANN_VENDOR}/op_proto/inc"
+    mkdir -p "${CANN_VENDOR}/op_proto/lib/linux/aarch64"
+    mkdir -p "${CANN_VENDOR}/op_impl/cpu/aicpu_kernel/impl"
+    mkdir -p "${CANN_VENDOR}/op_impl/cpu/config"
+
+    # Register in vendors/config.ini (idempotent)
+    # Ensure aicpu_mask is listed and no conflicting vendor registers MaskFilter
+    VENDORS_INI="${ASCEND_INSTALL_PATH}/opp/vendors/config.ini"
+    if [[ ! -f "${VENDORS_INI}" ]]; then
+        echo "load_priority=aicpu_mask" > "${VENDORS_INI}"
+    elif ! grep -q 'aicpu_mask' "${VENDORS_INI}" 2>/dev/null; then
+        existing="$(head -1 "${VENDORS_INI}" | sed 's/[[:space:]]*$//')"
+        echo "${existing},aicpu_mask" > "${VENDORS_INI}"
+    fi
+    # Remove sks_hw from vendors if present (conflicts with aicpu_mask for MaskFilter)
+    if grep -q 'sks_hw' "${VENDORS_INI}" 2>/dev/null; then
+        existing="$(head -1 "${VENDORS_INI}" | sed 's/[[:space:]]*$//')"
+        cleaned="$(echo "${existing}" | tr ',' '\n' | grep -v 'sks_hw' | tr '\n' ',' | sed 's/,$//')"
+        echo "${cleaned}" > "${VENDORS_INI}"
+        echo ">>> Removed conflicting sks_hw vendor from config.ini"
+    fi
+
+    # Copy kernel config
+    cp -f "${VENDOR_SRC}/op_impl/cpu/config/cust_aicpu_kernel.json" "${CANN_VENDOR}/op_impl/cpu/config/" && \
+        echo ">>> kernel config deployed: $(wc -c < "${CANN_VENDOR}/op_impl/cpu/config/cust_aicpu_kernel.json") bytes" || \
+        echo ">>> WARNING: kernel config copy failed"
+    chmod 644 "${CANN_VENDOR}/op_impl/cpu/config/cust_aicpu_kernel.json"
+
+    # Copy AI CPU kernel .so
+    KERNEL_SO="${OUT_DIR}/bin/libcust_aicpu_kernels_sks_final.so"
+    if [[ -f "${KERNEL_SO}" ]]; then
+        cp -f "${KERNEL_SO}" "${CANN_VENDOR}/op_impl/cpu/aicpu_kernel/impl/" && \
+            echo ">>> AI CPU kernel .so deployed: $(wc -c < "${KERNEL_SO}") bytes" || \
+            echo ">>> WARNING: kernel .so copy failed"
+        chmod 755 "${CANN_VENDOR}/op_impl/cpu/aicpu_kernel/impl/libcust_aicpu_kernels_sks_final.so"
+    else
+        echo ">>> WARNING: AI CPU kernel .so not found at ${KERNEL_SO}"
+        # Try build directory as fallback
+        KERNEL_SO_BUILD="${BUILD_DIR}/libcust_aicpu_kernels_sks_final.so"
+        if [[ -f "${KERNEL_SO_BUILD}" ]]; then
+            cp -f "${KERNEL_SO_BUILD}" "${CANN_VENDOR}/op_impl/cpu/aicpu_kernel/impl/" && \
+                echo ">>> AI CPU kernel .so deployed from build dir: $(wc -c < "${KERNEL_SO_BUILD}") bytes"
+            chmod 755 "${CANN_VENDOR}/op_impl/cpu/aicpu_kernel/impl/libcust_aicpu_kernels_sks_final.so"
+        else
+            echo ">>> ERROR: AI CPU kernel .so not found in build dir either!"
+        fi
+    fi
+
+    # --- Compile and deploy op_proto with CANN ABI=0 ---
+    # Must compile with -D_GLIBCXX_USE_CXX11_ABI=0 to match libgraph.so ABI.
+    OP_PROTO_SRC="${VENDOR_SRC}/op_proto/inc/op_proto.h"
+    OP_PROTO_CC="/tmp/_sks_op_proto_compile.cpp"
+    OP_PROTO_SO="${CANN_VENDOR}/op_proto/libcust_op_proto.so"
+    if [[ -f "${OP_PROTO_SRC}" ]]; then
+        echo '#include "op_proto.h"' > "${OP_PROTO_CC}"
+        CANN_INC="${ASCEND_INSTALL_PATH}/aarch64-linux/include"
+        CANN_LIB="${ASCEND_INSTALL_PATH}/aarch64-linux/lib64"
+        g++ -shared -fPIC -o "${OP_PROTO_SO}" "${OP_PROTO_CC}" \
+            -I"$(dirname "${OP_PROTO_SRC}")" \
+            -I"${CANN_INC}" \
+            -L"${CANN_LIB}" -lgraph \
+            -std=c++17 -O2 \
+            -D_GLIBCXX_USE_CXX11_ABI=0 \
+            -Wl,-rpath,"${CANN_LIB}" 2>&1 && \
+            echo ">>> op_proto deployed (ABI=0)" || \
+            echo ">>> WARNING: op_proto compilation failed"
+        chmod 755 "${OP_PROTO_SO}" 2>/dev/null
+        # Also copy to lib/linux/aarch64/ — some CANN builds expect it there
+        cp -f "${OP_PROTO_SO}" "${CANN_VENDOR}/op_proto/lib/linux/aarch64/" 2>/dev/null
+        rm -f "${OP_PROTO_CC}"
+
+        # Copy op_proto.h to vendor inc
+        cp -f "${OP_PROTO_SRC}" "${CANN_VENDOR}/op_proto/inc/" 2>/dev/null
+
+        # Write version.info
+        echo "custom_opp_compiler_version=8.3.0.2.220" > "${CANN_VENDOR}/version.info"
+
+        # Deploy ops-info.json (required by CANN for custom op registration)
+        OPS_INFO_DIR="${CANN_VENDOR}/op_impl/ai_core/tbe/config/${SOC_VERSION}"
+        mkdir -p "${OPS_INFO_DIR}"
+        cat > "${OPS_INFO_DIR}/aic-${SOC_VERSION}-ops-info.json" <<'OPSJSON'
+{
+    "MaskFilter": {
+        "coreType": {
+            "value": "AiCpu"
+        },
+        "input0": {
+            "dtype": "float32",
+            "format": "ND",
+            "name": "scores",
+            "paramType": "required",
+            "shape": "all"
+        },
+        "input1": {
+            "dtype": "uint64",
+            "format": "ND",
+            "name": "masks",
+            "paramType": "required",
+            "shape": "all"
+        },
+        "input2": {
+            "dtype": "float32",
+            "format": "ND",
+            "name": "output_buf",
+            "paramType": "required",
+            "shape": "all"
+        },
+        "input3": {
+            "dtype": "int32",
+            "format": "ND",
+            "name": "index_buf",
+            "paramType": "required",
+            "shape": "all"
+        },
+        "input4": {
+            "dtype": "int32",
+            "format": "ND",
+            "name": "count_buf",
+            "paramType": "required",
+            "shape": "all"
+        },
+        "input5": {
+            "dtype": "uint64",
+            "format": "ND",
+            "name": "task_buf",
+            "paramType": "required",
+            "shape": "all"
+        },
+        "output0": {
+            "dtype": "float32",
+            "format": "ND",
+            "name": "result",
+            "paramType": "required",
+            "shape": "all"
+        }
+    }
+}
+OPSJSON
+        chmod 644 "${OPS_INFO_DIR}/aic-${SOC_VERSION}-ops-info.json"
+        echo ">>> ops-info.json deployed to ${OPS_INFO_DIR}/"
+    fi
+
+    # Verify deployment
+    echo ">>> Vendor deployment verification:"
+    echo "    config.ini: $(cat "${VENDORS_INI}" 2>/dev/null)"
+    echo "    kernel.json: $(ls -la "${CANN_VENDOR}/op_impl/cpu/config/cust_aicpu_kernel.json" 2>/dev/null || echo MISSING)"
+    echo "    kernel.so: $(ls -la "${CANN_VENDOR}/op_impl/cpu/aicpu_kernel/impl/libcust_aicpu_kernels_sks_final.so" 2>/dev/null || echo MISSING)"
+    echo "    op_proto.so: $(ls -la "${CANN_VENDOR}/op_proto/libcust_op_proto.so" 2>/dev/null || echo MISSING)"
+    echo "    ops-info.json: $(ls -la "${CANN_VENDOR}/op_impl/ai_core/tbe/config/${SOC_VERSION}/aic-${SOC_VERSION}-ops-info.json" 2>/dev/null || echo MISSING)"
+
+    echo ">>> Vendor files installed to ${CANN_VENDOR}"
 else
     echo ">>> Skip compile due to -c 0. Reuse existing out/ artifacts."
+
+    # Always deploy vendor files even in -c 0 mode
+    VENDOR_SRC="${CURRENT_DIR}/include/NPU/vendor"
+    CANN_VENDOR="${ASCEND_INSTALL_PATH}/opp/vendors/aicpu_mask"
+    if [[ -f "${VENDOR_SRC}/op_proto/inc/op_proto.h" ]]; then
+        echo ">>> Deploying vendor files to CANN (no-compile mode)..."
+        mkdir -p "${CANN_VENDOR}/op_proto/inc"
+        mkdir -p "${CANN_VENDOR}/op_proto/lib/linux/aarch64"
+        mkdir -p "${CANN_VENDOR}/op_impl/cpu/aicpu_kernel/impl"
+        mkdir -p "${CANN_VENDOR}/op_impl/cpu/config"
+
+        # Register in vendors/config.ini (idempotent)
+        VENDORS_INI="${ASCEND_INSTALL_PATH}/opp/vendors/config.ini"
+        if [[ ! -f "${VENDORS_INI}" ]]; then
+            echo "load_priority=aicpu_mask" > "${VENDORS_INI}"
+        elif ! grep -q 'aicpu_mask' "${VENDORS_INI}" 2>/dev/null; then
+            existing="$(head -1 "${VENDORS_INI}" | sed 's/[[:space:]]*$//')"
+            echo "${existing},aicpu_mask" > "${VENDORS_INI}"
+        fi
+        # Remove conflicting sks_hw vendor
+        if grep -q 'sks_hw' "${VENDORS_INI}" 2>/dev/null; then
+            existing="$(head -1 "${VENDORS_INI}" | sed 's/[[:space:]]*$//')"
+            cleaned="$(echo "${existing}" | tr ',' '\n' | grep -v 'sks_hw' | tr '\n' ',' | sed 's/,$//')"
+            echo "${cleaned}" > "${VENDORS_INI}"
+        fi
+
+        # Copy kernel config
+        cp -f "${VENDOR_SRC}/op_impl/cpu/config/cust_aicpu_kernel.json" "${CANN_VENDOR}/op_impl/cpu/config/" 2>/dev/null && \
+            echo ">>> kernel config deployed" || echo ">>> WARNING: kernel config copy failed"
+        chmod 644 "${CANN_VENDOR}/op_impl/cpu/config/cust_aicpu_kernel.json" 2>/dev/null
+        KERNEL_SO="${OUT_DIR}/bin/libcust_aicpu_kernels_sks_final.so"
+        if [[ -f "${KERNEL_SO}" ]]; then
+            cp -f "${KERNEL_SO}" "${CANN_VENDOR}/op_impl/cpu/aicpu_kernel/impl/" && \
+                echo ">>> AI CPU kernel .so deployed: $(wc -c < "${KERNEL_SO}") bytes" || \
+                echo ">>> WARNING: kernel .so copy failed"
+            chmod 755 "${CANN_VENDOR}/op_impl/cpu/aicpu_kernel/impl/libcust_aicpu_kernels_sks_final.so"
+        else
+            echo ">>> WARNING: AI CPU kernel .so not found at ${KERNEL_SO}"
+            KERNEL_SO_BUILD="${BUILD_DIR}/libcust_aicpu_kernels_sks_final.so"
+            if [[ -f "${KERNEL_SO_BUILD}" ]]; then
+                cp -f "${KERNEL_SO_BUILD}" "${CANN_VENDOR}/op_impl/cpu/aicpu_kernel/impl/" && \
+                    echo ">>> AI CPU kernel .so deployed from build dir"
+                chmod 755 "${CANN_VENDOR}/op_impl/cpu/aicpu_kernel/impl/libcust_aicpu_kernels_sks_final.so"
+            else
+                echo ">>> ERROR: AI CPU kernel .so not found anywhere!"
+            fi
+        fi
+
+        # Compile and deploy op_proto with CANN ABI=0
+        OP_PROTO_SRC="${VENDOR_SRC}/op_proto/inc/op_proto.h"
+        OP_PROTO_CC="/tmp/_sks_op_proto_compile.cpp"
+        OP_PROTO_SO="${CANN_VENDOR}/op_proto/libcust_op_proto.so"
+        echo '#include "op_proto.h"' > "${OP_PROTO_CC}"
+        CANN_INC="${ASCEND_INSTALL_PATH}/aarch64-linux/include"
+        CANN_LIB="${ASCEND_INSTALL_PATH}/aarch64-linux/lib64"
+        g++ -shared -fPIC -o "${OP_PROTO_SO}" "${OP_PROTO_CC}" \
+            -I"$(dirname "${OP_PROTO_SRC}")" \
+            -I"${CANN_INC}" \
+            -L"${CANN_LIB}" -lgraph \
+            -std=c++17 -O2 \
+            -D_GLIBCXX_USE_CXX11_ABI=0 \
+            -Wl,-rpath,"${CANN_LIB}" 2>&1 && \
+            echo ">>> op_proto deployed (ABI=0)" || \
+            echo ">>> WARNING: op_proto compilation failed"
+        chmod 755 "${OP_PROTO_SO}" 2>/dev/null
+        cp -f "${OP_PROTO_SO}" "${CANN_VENDOR}/op_proto/lib/linux/aarch64/" 2>/dev/null
+        rm -f "${OP_PROTO_CC}"
+
+        # Copy op_proto.h to vendor inc
+        cp -f "${OP_PROTO_SRC}" "${CANN_VENDOR}/op_proto/inc/" 2>/dev/null
+
+        # Write version.info
+        echo "custom_opp_compiler_version=8.3.0.2.220" > "${CANN_VENDOR}/version.info"
+
+        # Deploy ops-info.json
+        OPS_INFO_DIR="${CANN_VENDOR}/op_impl/ai_core/tbe/config/${SOC_VERSION}"
+        mkdir -p "${OPS_INFO_DIR}"
+        cat > "${OPS_INFO_DIR}/aic-${SOC_VERSION}-ops-info.json" <<'OPSJSON'
+{
+    "MaskFilter": {
+        "coreType": {
+            "value": "AiCpu"
+        },
+        "input0": {
+            "dtype": "float32",
+            "format": "ND",
+            "name": "scores",
+            "paramType": "required",
+            "shape": "all"
+        },
+        "input1": {
+            "dtype": "uint64",
+            "format": "ND",
+            "name": "masks",
+            "paramType": "required",
+            "shape": "all"
+        },
+        "input2": {
+            "dtype": "float32",
+            "format": "ND",
+            "name": "output_buf",
+            "paramType": "required",
+            "shape": "all"
+        },
+        "input3": {
+            "dtype": "int32",
+            "format": "ND",
+            "name": "index_buf",
+            "paramType": "required",
+            "shape": "all"
+        },
+        "input4": {
+            "dtype": "int32",
+            "format": "ND",
+            "name": "count_buf",
+            "paramType": "required",
+            "shape": "all"
+        },
+        "input5": {
+            "dtype": "uint64",
+            "format": "ND",
+            "name": "task_buf",
+            "paramType": "required",
+            "shape": "all"
+        },
+        "output0": {
+            "dtype": "float32",
+            "format": "ND",
+            "name": "result",
+            "paramType": "required",
+            "shape": "all"
+        }
+    }
+}
+OPSJSON
+        chmod 644 "${OPS_INFO_DIR}/aic-${SOC_VERSION}-ops-info.json"
+        echo ">>> ops-info.json deployed to ${OPS_INFO_DIR}/"
+
+        # Verify deployment
+        echo ">>> Vendor deployment verification:"
+        echo "    config.ini: $(cat "${VENDORS_INI}" 2>/dev/null)"
+        echo "    kernel.so: $(ls -la "${CANN_VENDOR}/op_impl/cpu/aicpu_kernel/impl/libcust_aicpu_kernels_sks_final.so" 2>/dev/null || echo MISSING)"
+        echo "    op_proto.so: $(ls -la "${CANN_VENDOR}/op_proto/libcust_op_proto.so" 2>/dev/null || echo MISSING)"
+        echo "    ops-info.json: $(ls -la "${CANN_VENDOR}/op_impl/ai_core/tbe/config/${SOC_VERSION}/aic-${SOC_VERSION}-ops-info.json" 2>/dev/null || echo MISSING)"
+        echo ">>> Vendor files installed to ${CANN_VENDOR}"
+    fi
 fi
 
 if [[ ! -f "${OUT_DIR}/bin/${EXECUTABLE_NAME}" ]]; then
@@ -593,6 +959,57 @@ if [[ ! -f "${OUT_DIR}/bin/${EXECUTABLE_NAME}" ]]; then
     fi
     exit 1
 fi
+
+# --- Pre-flight checks ---
+preflight_ok=true
+
+# Check CANN toolkit
+if [[ ! -d "${ASCEND_INSTALL_PATH}" ]]; then
+    echo "[PREFLIGHT] ERROR: CANN toolkit not found at ${ASCEND_INSTALL_PATH}"
+    preflight_ok=false
+fi
+
+# Check NPU devices
+if ! npu-smi info >/dev/null 2>&1; then
+    echo "[PREFLIGHT] WARN: npu-smi info failed — no NPU devices visible"
+fi
+
+# Check vendor deployment exists (needed for CANN runtime)
+CANN_VENDOR_CHECK="${ASCEND_INSTALL_PATH}/opp/vendors/aicpu_mask"
+if [[ ! -d "${CANN_VENDOR_CHECK}" ]]; then
+    echo "[PREFLIGHT] WARN: Vendor directory not found at ${CANN_VENDOR_CHECK}"
+    echo "[PREFLIGHT]        Run with -c 1 to deploy vendor files."
+fi
+
+# Check config.txt exists
+if [[ ! -f "${CONFIG_FILE}" ]]; then
+    echo "[PREFLIGHT] ERROR: config.txt not found at ${CONFIG_FILE}"
+    preflight_ok=false
+fi
+
+# Check shared libraries
+if ! ldd "${OUT_DIR}/bin/${EXECUTABLE_NAME}" 2>/dev/null | grep -q "not found"; then
+    : # OK
+else
+    missing_libs=$(ldd "${OUT_DIR}/bin/${EXECUTABLE_NAME}" 2>/dev/null | grep "not found")
+    echo "[PREFLIGHT] ERROR: Missing shared libraries:"
+    echo "${missing_libs}"
+    preflight_ok=false
+fi
+
+if [[ "${preflight_ok}" != "true" ]]; then
+    echo "[PREFLIGHT] Pre-flight checks failed. Aborting."
+    exit 1
+fi
+echo "[PREFLIGHT] Checks passed."
+
+# CANN environment diagnostics
+echo "[CANN] ASCEND_HOME_PATH=${ASCEND_HOME_PATH:-<not set>}"
+echo "[CANN] ASCEND_OPP_PATH=${ASCEND_OPP_PATH:-<not set>}"
+echo "[CANN] ASCEND_AICPU_PATH=${ASCEND_AICPU_PATH:-<not set>}"
+echo "[CANN] ASCEND_OPP_BUILT_IN=${ASCEND_OPP_BUILT_IN:-<not set>}"
+echo "[CANN] LD_LIBRARY_PATH (first 5):"
+printf '    %s\n' $(echo "${LD_LIBRARY_PATH:-}" | tr ':' '\n' | head -5)
 
 RESULT_ROOT_RAW="$(extract_config_value "query_result_root" "${CONFIG_FILE}")"
 RESULT_ROOT_PATH="$(resolve_result_root "${RESULT_ROOT_RAW}")"

@@ -1,4 +1,5 @@
 #include "SPANN.h"
+#include "utils/RunSupport.h"
 #include <atomic>
 
 static void AddClusteringCacheDiagnostic(std::vector<std::string>* diagnostics,
@@ -39,6 +40,9 @@ static int g_loaded_vector_dim = 0;
 static int g_loaded_total_tag_num = 0;
 static int g_loaded_total_bucket_num_level_1 = 0;
 static int g_loaded_max_doc_per_bucket = 0;
+
+// L2→L0 mapping for L0 NPU score caching
+static std::vector<uint32_t> g_l2_to_l0_map;
 
 
 static fs::path ResolveProjectRoot() {
@@ -282,6 +286,40 @@ static bool SaveCentroidsDefaultBin(const fs::path& path,
     return true;
 }
 
+static bool LoadL2ToL0Map(const fs::path& project_root, int expected_l2_count) {
+    const fs::path map_file = project_root / "l2_to_l0_map.bin";
+    std::error_code ec;
+    if (!fs::exists(map_file, ec) || ec) {
+        std::cerr << "[Clustering] l2_to_l0_map.bin not found, skipping L0 mapping.\n";
+        return false;
+    }
+    std::ifstream ifs(map_file, std::ios::binary | std::ios::ate);
+    if (!ifs) return false;
+    auto size = ifs.tellg();
+    ifs.seekg(0);
+    const size_t expected_bytes = static_cast<size_t>(expected_l2_count) * sizeof(uint32_t);
+    if (static_cast<size_t>(size) != expected_bytes) {
+        std::cerr << "[Clustering] l2_to_l0_map.bin size mismatch: expected "
+                  << expected_bytes << " bytes, got " << size << " bytes.\n";
+        return false;
+    }
+    g_l2_to_l0_map.resize(static_cast<size_t>(expected_l2_count));
+    ifs.read(reinterpret_cast<char*>(g_l2_to_l0_map.data()),
+             static_cast<std::streamsize>(g_l2_to_l0_map.size() * sizeof(uint32_t)));
+    if (!ifs) {
+        g_l2_to_l0_map.clear();
+        return false;
+    }
+    // Validate L0 count
+    uint32_t max_l0 = 0;
+    for (uint32_t v : g_l2_to_l0_map) {
+        if (v > max_l0) max_l0 = v;
+    }
+    std::cout << "[Clustering] Loaded l2_to_l0_map.bin: " << g_l2_to_l0_map.size()
+              << " entries, " << (max_l0 + 1) << " L0 clusters.\n";
+    return true;
+}
+
 static bool SaveBucketsDocIdsBins(const fs::path& buckets_dir,
                                   const std::vector<uint32_t>& assignments,
                                   const std::vector<float>& centroids,
@@ -479,18 +517,67 @@ static bool RunBalancedSuperKMeansInMain(const fs::path& project_root,
         const fs::path centroids_file = project_root / "centroids.bin";
         const fs::path buckets_dir = project_root / "buckets";
 
-        if (!SaveCentroidsDefaultBin(centroids_file, centroids, total_bucket_num_level_1, vector_dim)) {
-            std::cerr << "[Clustering] 写入 centroids.bin 失败: " << centroids_file << "\n";
-            return false;
-        }
-        if (!SaveBucketsDocIdsBins(buckets_dir,
-                                 assignments,
-                                 centroids,
-                                 total_bucket_num_level_1,
-                                 total_doc_num,
-                                 vector_dim)) {
-            std::cerr << "[Clustering] 写入 buckets 失败: " << buckets_dir << "\n";
-            return false;
+        // Build L2 layout + per-L2 centroids from L1 assignments
+        {
+            std::vector<uint64_t> counts(static_cast<size_t>(total_bucket_num_level_1), 0);
+            for (uint32_t a : assignments) {
+                if (a < static_cast<uint32_t>(total_bucket_num_level_1))
+                    counts[a]++;
+            }
+            std::vector<uint64_t> offsets(static_cast<size_t>(total_bucket_num_level_1) + 1);
+            offsets[0] = 0;
+            for (int b = 0; b < total_bucket_num_level_1; ++b)
+                offsets[static_cast<size_t>(b) + 1] = offsets[static_cast<size_t>(b)] + counts[static_cast<size_t>(b)];
+
+            std::vector<uint32_t> l1_doc_ids(assignments.size());
+            std::vector<uint64_t> write_pos = offsets;
+            for (uint32_t doc_id = 0; doc_id < assignments.size(); ++doc_id) {
+                uint32_t bucket = assignments[doc_id];
+                l1_doc_ids[write_pos[bucket]++] = doc_id;
+            }
+
+            BucketDocTable l1_bdt = RunSupport::BuildBucketDocTableFromOffsets(offsets, l1_doc_ids);
+            std::vector<float> l2_centroids;
+            TwoLevelBucketLayout l2_layout = RunSupport::BuildTwoLevelBucketLayout(
+                std::move(l1_bdt), max_doc_per_bucket,
+                vectors.data(), vector_dim, &l2_centroids);
+
+            const int l2_count = static_cast<int>(l2_layout.Level2BucketCount());
+
+            // Save L2 centroids
+            if (!SaveCentroidsDefaultBin(centroids_file, l2_centroids, l2_count, vector_dim)) {
+                std::cerr << "[Clustering] 写入 centroids.bin 失败: " << centroids_file << "\n";
+                return false;
+            }
+            std::cout << "[Clustering] Saved per-L2 centroids: " << l2_count << " centroids\n";
+
+            // Build L2-level doc assignments for SaveBucketsDocIdsBins
+            std::vector<uint32_t> l2_assignments(assignments.size());
+            for (size_t l1 = 0; l1 < l2_layout.level_1_bucket_doc_table.size(); ++l1) {
+                uint32_t l2_begin = l2_layout.level_1_to_level_2_offsets[l1];
+                const auto &l1_docs = l2_layout.level_1_bucket_doc_table[l1];
+                size_t cursor = 0;
+                while (cursor < l1_docs.size()) {
+                    size_t chunk_end = std::min(cursor + static_cast<size_t>(max_doc_per_bucket),
+                                                l1_docs.size());
+                    for (size_t i = cursor; i < chunk_end; ++i) {
+                        l2_assignments[l1_docs[i]] = static_cast<uint32_t>(l2_begin);
+                    }
+                    ++l2_begin;
+                    cursor = chunk_end;
+                }
+            }
+
+            if (!SaveBucketsDocIdsBins(buckets_dir,
+                                      l2_assignments,
+                                      l2_centroids,
+                                      l2_count,
+                                      total_doc_num,
+                                      vector_dim)) {
+                std::cerr << "[Clustering] 写入 buckets 失败: " << buckets_dir << "\n";
+                return false;
+            }
+            std::cout << "[Clustering] Saved L2 buckets: " << l2_count << " buckets\n";
         }
 
         const auto t1 = std::chrono::steady_clock::now();
@@ -586,18 +673,34 @@ static bool UpdateBucketsAndCentroidsFromClusterResult(const fs::path& project_r
     std::vector<uint64_t> bucket_doc_offsets_loaded;
     std::vector<uint32_t> bucket_doc_ids_loaded;
     std::vector<float> centroids_loaded;
+
+    // Read centroids.bin header to determine bucket_count (L2 format)
+    int32_t file_bucket_count = 0;
+    int32_t file_dim = 0;
+    {
+        std::ifstream header_in(centroids_file, std::ios::binary);
+        if (!header_in ||
+            !header_in.read(reinterpret_cast<char*>(&file_bucket_count), sizeof(file_bucket_count)) ||
+            !header_in.read(reinterpret_cast<char*>(&file_dim), sizeof(file_dim)) ||
+            file_bucket_count <= 0 || file_dim != g_loaded_vector_dim) {
+            std::ostringstream oss;
+            oss << "centroids.bin 头部读取失败或维度不匹配: " << centroids_file;
+            AddClusteringCacheDiagnostic(diagnostics, "centroids 头部无效", oss.str());
+            return false;
+        }
+    }
+
     const bool centroids_ok = LoadCentroidsDefaultBin(centroids_file,
                                                       centroids_loaded,
                                                       g_loaded_vector_dim,
-                                                      g_loaded_total_bucket_num_level_1,
+                                                      file_bucket_count,
                                                       diagnostics);
     if (!centroids_ok) {
-        std::cout << "[Clustering] Cached centroids.bin is missing or does not match config: "
-                  << centroids_file << "\n";
+        std::cout << "[Clustering] Cached centroids.bin load failed: " << centroids_file << "\n";
     }
 
     const bool buckets_ok = LoadBucketDocIdsBins(buckets_dir,
-                                                 g_loaded_total_bucket_num_level_1,
+                                                 file_bucket_count,
                                                  g_loaded_total_doc_num,
                                                  bucket_doc_offsets_loaded,
                                                  bucket_doc_ids_loaded,
@@ -617,6 +720,21 @@ static bool UpdateBucketsAndCentroidsFromClusterResult(const fs::path& project_r
     std::cout << "[Clustering] 已加载并应用聚类结果: bucket_doc_offsets=" << g_bucket_doc_offsets.size()
               << ", bucket_doc_ids=" << g_bucket_doc_ids.size()
               << ", centroids=" << g_centroids.size() << "\n";
+
+    // Load L2→L0 mapping (optional — L0 cache is disabled if not found)
+    // Derive L2 count from file size instead of using L1 count
+    {
+        const fs::path map_file = project_root / "l2_to_l0_map.bin";
+        std::error_code ec;
+        if (fs::exists(map_file, ec) && !ec) {
+            auto fsize = fs::file_size(map_file, ec);
+            if (!ec && fsize > 0) {
+                int l2_count = static_cast<int>(fsize / sizeof(uint32_t));
+                LoadL2ToL0Map(project_root, l2_count);
+            }
+        }
+    }
+
     return true;
 }
 

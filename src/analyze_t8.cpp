@@ -129,7 +129,7 @@ struct TimingRow
     size_t query_id = 0;
     double total_end_to_end_ms = 0.0;
     double construct_ms = 0.0;
-    int searched_bucket_count_level_1 = 0;
+    int searched_bucket_count_l2 = 0;
     double bucket_level_ivf_ms = 0.0;
     double candidate_bucket_merge_ms = 0.0;
     double npu_async_launch_ms = 0.0;
@@ -221,80 +221,61 @@ private:
 // =========================================================
 // Expression analysis
 // =========================================================
-ExprStats AnalyzeExpression(const std::vector<RPNItem> &rpn)
+ExprStats AnalyzeExpression(const BucketPlan &plan)
 {
     ExprStats stats;
-    if (rpn.empty())
+    if (!plan.valid)
     {
         return stats;
     }
 
-    struct StackEntry
+    struct Result
     {
         int depth;
-        int or_terms; // number of leaf predicates under OR chain
+        int or_terms;
     };
-    std::vector<StackEntry> stack;
-    stack.reserve(rpn.size());
 
-    for (const auto &item : rpn)
-    {
-        if (!item.is_op)
+    std::function<Result(uint32_t)> visit = [&](uint32_t node_id) -> Result {
+        const PlanNode &n = plan.nodes[node_id];
+        if (n.op == PlanOp::TAG || n.op == PlanOp::NOT_TAG)
         {
             ++stats.num_predicates;
-            if (item.flags & 1)
-            {
+            if (n.op == PlanOp::NOT_TAG)
                 ++stats.num_not;
-            }
-            stack.push_back({1, 0});
+            return {1, 0};
         }
+        // GROUP
+        bool is_and = (n.op == PlanOp::AND_GROUP);
+        if (is_and)
+            ++stats.num_and;
         else
+            ++stats.num_or;
+
+        int max_depth = 0;
+        int total_or_terms = 0;
+        for (uint16_t i = 0; i < n.child_count; ++i)
         {
-            if (item.value == FilterOp8::OP_AND)
+            uint32_t child_id = plan.children[n.first_child + i];
+            Result cr = visit(child_id);
+            max_depth = std::max(max_depth, cr.depth);
+            if (!is_and)
             {
-                ++stats.num_and;
+                if (cr.or_terms == 0)
+                    ++total_or_terms;
+                else
+                    total_or_terms += cr.or_terms;
             }
-            else if (item.value == FilterOp8::OP_OR)
-            {
-                ++stats.num_or;
-            }
-
-            if (stack.size() < 2)
-            {
-                continue;
-            }
-            StackEntry right = stack.back();
-            stack.pop_back();
-            StackEntry left = stack.back();
-            stack.pop_back();
-
-            int merged_or_terms = left.or_terms + right.or_terms;
-            if (item.value == FilterOp8::OP_OR)
-            {
-                if (left.or_terms == 0)
-                {
-                    ++merged_or_terms;
-                }
-                if (right.or_terms == 0)
-                {
-                    ++merged_or_terms;
-                }
-                if (merged_or_terms > stats.max_or_width)
-                {
-                    stats.max_or_width = merged_or_terms;
-                }
-            }
-
-            stack.push_back({std::max(left.depth, right.depth) + 1, merged_or_terms});
         }
-    }
 
-    stats.total_or_terms = (!stack.empty()) ? stack[0].or_terms : 0;
+        if (!is_and && total_or_terms > stats.max_or_width)
+            stats.max_or_width = total_or_terms;
 
-    if (!stack.empty())
-    {
-        stats.expr_depth = stack[0].depth;
-    }
+        return {max_depth + 1, is_and ? 0 : total_or_terms};
+    };
+
+    Result root_r = visit(plan.root);
+    stats.expr_depth = root_r.depth;
+    stats.total_or_terms = root_r.or_terms;
 
     return stats;
 }
@@ -302,79 +283,65 @@ ExprStats AnalyzeExpression(const std::vector<RPNItem> &rpn)
 // =========================================================
 // Normalized expression string from RPN
 // =========================================================
-std::string GenerateNormalizedExpr(const std::vector<RPNItem> &rpn)
+std::string GenerateNormalizedExpr(const BucketPlan &plan)
 {
-    if (rpn.empty())
+    if (!plan.valid)
     {
         return "PASS_ALL";
     }
 
-    struct StackStr
+    struct Result
     {
         std::string str;
         int precedence; // 0=operand, 1=OR, 2=AND
     };
 
-    std::vector<StackStr> stack;
-    stack.reserve(rpn.size());
-
-    for (const auto &item : rpn)
-    {
-        if (!item.is_op)
+    std::function<Result(uint32_t)> visit = [&](uint32_t node_id) -> Result {
+        const PlanNode &n = plan.nodes[node_id];
+        if (n.op == PlanOp::TAG)
         {
-            std::string s;
-            if (item.flags & 1)
-            {
-                s = "!T" + std::to_string(item.value);
-            }
-            else
-            {
-                s = "T" + std::to_string(item.value);
-            }
-            stack.push_back({std::move(s), 0});
+            return {"T" + std::to_string(n.value), 0};
         }
-        else
+        if (n.op == PlanOp::NOT_TAG)
         {
-            if (stack.size() < 2)
-            {
-                continue;
-            }
-            StackStr right = std::move(stack.back());
-            stack.pop_back();
-            StackStr left = std::move(stack.back());
-            stack.pop_back();
-
-            const char *op_str = (item.value == FilterOp8::OP_AND) ? "&" : "|";
-            int new_prec = (item.value == FilterOp8::OP_AND) ? 2 : 1;
-
-            std::string combined;
-            auto wrap = [&](const StackStr &child) -> std::string
-            {
-                if (child.precedence > 0 && child.precedence < new_prec)
-                {
-                    return "(" + child.str + ")";
-                }
-                return child.str;
-            };
-
-            combined += wrap(left);
-            combined += op_str;
-            combined += wrap(right);
-
-            stack.push_back({std::move(combined), new_prec});
+            return {"!T" + std::to_string(n.value), 0};
         }
-    }
 
-    return stack.empty() ? "EMPTY" : stack[0].str;
+        bool is_and = (n.op == PlanOp::AND_GROUP);
+        const char *op_str = is_and ? "&" : "|";
+        int prec = is_and ? 2 : 1;
+
+        std::string combined;
+        auto wrap = [&](const Result &child) -> std::string
+        {
+            if (child.precedence > 0 && child.precedence < prec)
+                return "(" + child.str + ")";
+            return child.str;
+        };
+
+        for (uint16_t i = 0; i < n.child_count; ++i)
+        {
+            uint32_t child_id = plan.children[n.first_child + i];
+            Result cr = visit(child_id);
+            if (i > 0)
+                combined += op_str;
+            combined += wrap(cr);
+        }
+
+        return {combined, prec};
+    };
+
+    Result r = visit(plan.root);
+    return r.str;
 }
 
 // =========================================================
 // Bitmap volume (pure counting, same block decomposition as search_bucket)
 // =========================================================
-BitmapVolumeStats ComputeBitmapVolume(const std::vector<RPNItem> &rpn, const Bucket &bucket)
+BitmapVolumeStats ComputeBitmapVolume(const BucketPlan &plan, const Bucket &bucket)
 {
     BitmapVolumeStats stats;
-    if (rpn.empty())
+    if (!plan.valid)
     {
         return stats;
     }
@@ -387,39 +354,32 @@ BitmapVolumeStats ComputeBitmapVolume(const std::vector<RPNItem> &rpn, const Buc
 
     uint32_t cache_line_bytes = cpu_cache_line_size > 0 ? static_cast<uint32_t>(cpu_cache_line_size) : 64;
     uint32_t block_u64 = std::max<uint32_t>(1, (cache_line_bytes / sizeof(uint64_t)) * 4);
+    uint32_t num_blocks = (stride + block_u64 - 1) / block_u64;
 
-    for (uint32_t block_start = 0; block_start < stride; block_start += block_u64)
+    // Count ops per node (tree traversal)
+    uint64_t not_ops = 0, and_ops = 0, or_ops = 0;
+    for (uint32_t i = 0; i < plan.nodes.size(); ++i)
     {
-        uint32_t block_len = std::min(block_u64, stride - block_start);
-        for (const auto &item : rpn)
-        {
-            if (!item.is_op)
-            {
-                if (item.flags & 1)
-                {
-                    // Inverted operand (NOT): read + write for inversion.
-                    stats.words_read += block_len;
-                    stats.words_written += block_len;
-                    stats.not_ops++;
-                }
-                // Non-inverted operand: no read at this point —
-                // the consuming operator accounts for reading it.
-            }
-            else
-            {
-                stats.words_read += 2 * block_len;
-                stats.words_written += block_len;
-                if (item.value == FilterOp8::OP_AND)
-                {
-                    stats.and_ops++;
-                }
-                else
-                {
-                    stats.or_ops++;
-                }
-            }
-        }
+        const PlanNode &n = plan.nodes[i];
+        if (n.op == PlanOp::NOT_TAG)
+            not_ops++;
+        else if (n.op == PlanOp::AND_GROUP)
+            and_ops++;
+        else if (n.op == PlanOp::OR_GROUP)
+            or_ops++;
     }
+
+    stats.not_ops = not_ops * num_blocks;
+    stats.and_ops = and_ops * num_blocks;
+    stats.or_ops = or_ops * num_blocks;
+
+    // Per NOT_TAG: read + write per block; per AND/OR: read 2 + write 1 per block
+    // Each leaf (TAG/NOT_TAG) contributes 1 read when consumed by operator
+    // NOT_TAG adds 1 read (source) + 1 write (inverted result)
+    // AND/OR each reads 2 sources, writes 1 result
+    uint32_t block_len = std::min(block_u64, stride);
+    stats.words_read = (not_ops + 2 * (and_ops + or_ops)) * block_len * num_blocks;
+    stats.words_written = (not_ops + and_ops + or_ops) * block_len * num_blocks;
 
     return stats;
 }
@@ -469,7 +429,7 @@ std::vector<uint32_t> SelectCandidateBuckets(DataBaseCPU &db,
     // Step 1: Determine valid L1 buckets via IVF filtering.
     std::vector<BucketScore> scores;
 
-    if (query.filter_exp.BucketLevelIVF_RPN.empty())
+    if (!query.filter_exp.bucket_plan.valid)
     {
         // No IVF filter: all L1 buckets are valid candidates.
         scores.reserve(static_cast<size_t>(total_bucket_num_level_1));
@@ -550,7 +510,7 @@ std::vector<uint32_t> SelectCandidateBuckets(DataBaseCPU &db,
     else
     {
         l1_count = std::min(static_cast<int>(scores.size()),
-                            valid_bucket_num_base_level_1);
+                            valid_bucket_num_base_level_2);
     }
 
     // Step 4: Expand to L2 buckets.
@@ -1277,7 +1237,7 @@ int main()
         tr.query_id = prepared.line_no;
         tr.total_end_to_end_ms = construct_ms.count() + loop_ms.count();
         tr.construct_ms = construct_ms.count();
-        tr.searched_bucket_count_level_1 = completed_q->searched_bucket_count_level_1;
+        tr.searched_bucket_count_l2 = completed_q->searched_bucket_count_l2;
         tr.bucket_level_ivf_ms = completed_q->timing_metrics.bucket_level_ivf_ms;
         tr.candidate_bucket_merge_ms = completed_q->timing_metrics.candidate_bucket_merge_ms;
         tr.npu_async_launch_ms = completed_q->timing_metrics.npu_async_launch_ms;
@@ -1387,17 +1347,17 @@ int main()
             row.unaccounted_wait_ms = pipeline_ms - accounted;
         }
 
-        // Build analysis query to get the compiled RPN.
+        // Build analysis query to get the compiled plan.
         analysis_query.Reset(prepared.query_vec, prepared.filter_expr, prepared.top_k, prepared.line_no);
-        const auto &rpn = analysis_query.filter_exp.Bucket_RPN;
+        const auto &plan = analysis_query.filter_exp.bucket_plan;
 
         // Expression analysis.
-        row.expr = AnalyzeExpression(rpn);
-        row.attr_expr_normalized = GenerateNormalizedExpr(rpn);
+        row.expr = AnalyzeExpression(plan);
+        row.attr_expr_normalized = GenerateNormalizedExpr(plan);
 
-        // Bucket selection (uses real pipeline's searched_bucket_count_level_1).
+        // Bucket selection (uses real pipeline's searched_bucket_count_l2).
         std::vector<uint32_t> l2_ids = SelectCandidateBuckets(db, analysis_query,
-                                                               tr.searched_bucket_count_level_1);
+                                                               tr.searched_bucket_count_l2);
 
         // Collect tag operand IDs for per-predicate selectivity.
         struct TagOperand
@@ -1406,16 +1366,17 @@ int main()
             bool is_inverted;
         };
         std::vector<TagOperand> tag_operands;
-        for (const auto &item : rpn)
+        for (uint32_t i = 0; i < plan.nodes.size(); ++i)
         {
-            if (!item.is_op)
+            const PlanNode &n = plan.nodes[i];
+            if (n.op == PlanOp::TAG || n.op == PlanOp::NOT_TAG)
             {
-                tag_operands.push_back({static_cast<uint32_t>(item.value),
-                                        (item.flags & 1) != 0});
+                tag_operands.push_back({n.value, n.op == PlanOp::NOT_TAG});
             }
         }
 
         // Per-bucket analysis: bitmap volume + survivors + per-tag cardinality.
+        const BucketLevelIVF &ivf = db.get_bucket_level_ivf();
         BitmapVolumeStats total_bitmap;
         BucketDistStats bds;
         bds.num_buckets = static_cast<uint32_t>(l2_ids.size());
@@ -1449,7 +1410,7 @@ int main()
             }
 
             // Bitmap volume.
-            BitmapVolumeStats bvs = ComputeBitmapVolume(rpn, bucket);
+            BitmapVolumeStats bvs = ComputeBitmapVolume(plan, bucket);
             total_bitmap.words_read += bvs.words_read;
             total_bitmap.words_written += bvs.words_written;
             total_bitmap.and_ops += bvs.and_ops;
@@ -1468,8 +1429,8 @@ int main()
                 per_tag_matched[t] += matched;
             }
 
-            // Survivors via actual search_bucket.
-            analysis_query.search_bucket(bucket, temp_mask, scratch);
+            // Survivors via actual search_bucket_plan.
+            analysis_query.search_bucket_plan(bucket, bid, &ivf, temp_mask, scratch);
             uint64_t survivors = PopcountMask(temp_mask, doc_num);
             bds.total_survivors += survivors;
             total_bitmap.num_popcount_ops++;

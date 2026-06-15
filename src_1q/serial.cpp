@@ -462,50 +462,37 @@ int main() {
         std::cout << "[Info] No valid query found in " << loaded_query_path << ".\n";
         return 0;
     }
-    std::cout << "[Loader] Prepared query count from file: " << queries.size() << "\n";
 
-    // Truncate or expand to QueryNum using round-robin from loaded queries
-    if (static_cast<int>(queries.size()) > QueryNum) {
-        queries.resize(static_cast<size_t>(QueryNum));
-    } else {
-        const size_t base = queries.size();
-        queries.reserve(static_cast<size_t>(QueryNum));
-        for (size_t i = base; i < static_cast<size_t>(QueryNum); ++i) {
-            queries.push_back(queries[i % base]);
-        }
-    }
-    std::cout << "[Loader] Final query count: " << queries.size() << " (QueryNum=" << QueryNum << ")\n";
-
-    // Load filter expressions: read all from file, random assign to queries
+    // Load filter expressions, pick one for the single query
     {
         std::vector<std::string> filter_exprs;
         const fs::path filter_expr_path = config_path.has_parent_path()
                                               ? (config_path.parent_path() / "filter_expr_600.txt")
                                               : fs::path("filter_expr_600.txt");
-        {
-            std::ifstream fexpr_file(filter_expr_path);
-            std::string line;
-            while (std::getline(fexpr_file, line)) {
-                if (!line.empty()) {
-                    filter_exprs.push_back(line);
-                }
+        std::ifstream fexpr_file(filter_expr_path);
+        std::string line;
+        while (std::getline(fexpr_file, line)) {
+            if (!line.empty()) {
+                filter_exprs.push_back(line);
             }
         }
-        if (filter_exprs.empty()) {
-            std::cerr << "[Warn] filter_expr.txt not found or empty at " << filter_expr_path
-                      << ". Using empty filters for all queries.\n";
-        }
-
         if (!filter_exprs.empty()) {
-            std::mt19937 rng(42);
-            std::uniform_int_distribution<size_t> dist(0, filter_exprs.size() - 1);
-            for (size_t i = 0; i < queries.size(); ++i) {
-                queries[i].filter_expr = filter_exprs[dist(rng)];
-            }
+            queries[0].filter_expr = filter_exprs[0];
+        } else {
+            std::cerr << "[Warn] filter_expr_600.txt not found or empty. Using empty filter.\n";
         }
-        std::cout << "[Loader] Assigned " << filter_exprs.size()
-                  << " filter expressions to " << queries.size() << " queries (random, seed=42)\n";
     }
+
+    // 1-query mode: duplicate first query 10000 times
+    {
+        DataReader::PreparedQuery first_q = std::move(queries[0]);
+        queries.clear();
+        queries.resize(10000, first_q);
+        for (size_t i = 0; i < queries.size(); ++i) {
+            queries[i].line_no = i + 1;
+        }
+    }
+    std::cout << "[Loader] 1-query mode: first query duplicated to " << queries.size() << "\n";
 
     if (!RunSupport::ValidatePreparedQueriesAgainstPrealloc(queries)) {
         return -1;
@@ -564,7 +551,6 @@ int main() {
     const size_t loaded_l2_count = bucket_doc_offsets.size() - 1;
     total_bucket_num_level_2 = static_cast<int>(loaded_l2_count);
 
-    // centroids.bin now contains per-L2 centroids
     if (dataset_buffers.centroids.size() != loaded_l2_count * static_cast<size_t>(vector_dim))
     {
         std::cerr << "[Fatal] Invalid clustering output: centroids size mismatch. Expected "
@@ -573,7 +559,6 @@ int main() {
         return -1;
     }
 
-    // Build L2 bucket doc table directly from loaded data
     BucketDocTable l2_bucket_doc_table;
     try
     {
@@ -586,7 +571,6 @@ int main() {
         return -1;
     }
 
-    // Construct TwoLevelBucketLayout with L2 data directly (L1 is degenerate: 1 group)
     TwoLevelBucketLayout bucket_layout;
     bucket_layout.level_1_bucket_doc_table.resize(1);
     bucket_layout.level_1_bucket_doc_table[0].reserve(loaded_l2_count);

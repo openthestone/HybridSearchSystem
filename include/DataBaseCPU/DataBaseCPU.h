@@ -29,38 +29,25 @@ public:
     {
         std::cout << "[DB] Starting Index Construction..." << std::endl;
 
-        if (bucket_layout.Level1BucketCount() != static_cast<size_t>(total_bucket_num_level_1))
-        {
-            throw std::invalid_argument("[DB] level-1 bucket count does not match total_bucket_num_level_1.");
-        }
         if (bucket_layout.Level2BucketCount() != static_cast<size_t>(total_bucket_num_level_2))
         {
             throw std::invalid_argument("[DB] level-2 bucket count does not match total_bucket_num_level_2.");
         }
-        if (bucket_layout.level_1_to_level_2_offsets.size() != bucket_layout.Level1BucketCount() + 1)
-        {
-            throw std::invalid_argument("[DB] invalid level_1_to_level_2_offsets size.");
-        }
-        if (bucket_layout.level_1_to_level_2_offsets.back() != bucket_layout.Level2BucketCount())
-        {
-            throw std::invalid_argument("[DB] invalid level_1_to_level_2_offsets tail.");
-        }
 
-        ValidateQueryScoreSlotCapacities(bucket_layout.level_1_bucket_doc_table);
+        ValidateQueryScoreSlotCapacities(bucket_layout.level_2_bucket_doc_table);
 
         BucketDocTable normalized_level_2_bucket_doc_table =
             NormalizeLevel2BucketDocTable(std::move(bucket_layout.level_2_bucket_doc_table));
         level_1_to_level_2_offsets_ = std::move(bucket_layout.level_1_to_level_2_offsets);
-        level_1_bucket_layout_hash_ = ComputeBucketDocTableHash(bucket_layout.level_1_bucket_doc_table);
         level_2_bucket_layout_hash_ = ComputeBucketDocTableHash(normalized_level_2_bucket_doc_table);
 
         // ==========================================
-        // 1. 存储一级桶中心向量
+        // 1. 存储 L2 桶中心向量（per-L2 centroids）
         // ==========================================
-        bucket_centroids_.resize(static_cast<size_t>(total_bucket_num_level_1) * static_cast<size_t>(vector_dim));
+        bucket_centroids_.resize(static_cast<size_t>(total_bucket_num_level_2) * static_cast<size_t>(vector_dim));
         std::memcpy(bucket_centroids_.data(),
                     dataset.bucket_centroids,
-                    static_cast<size_t>(total_bucket_num_level_1) * static_cast<size_t>(vector_dim) * sizeof(float));
+                    static_cast<size_t>(total_bucket_num_level_2) * static_cast<size_t>(vector_dim) * sizeof(float));
 
         // ==========================================
         // 2. CPU 侧索引：优先从文件加载，否则从 dataset 重建
@@ -69,7 +56,6 @@ public:
         {
             std::cout << "[DB] CPU index cache unavailable. Rebuilding from dataset..." << std::endl;
             BuildCpuIndexesFromDataset(dataset,
-                                       bucket_layout.level_1_bucket_doc_table,
                                        normalized_level_2_bucket_doc_table);
             if (!SaveCpuIndexes())
             {
@@ -77,22 +63,63 @@ public:
                           << "Next run will rebuild them again." << std::endl;
             }
         }
+        else
+        {
+            // CPU indexes loaded from cache — still need tag freq cache
+            if (g_global_tag_freq.empty() && total_doc_num > 0)
+            {
+                TryLoadTagFreqCache(static_cast<uint64_t>(total_doc_num),
+                                    static_cast<uint32_t>(total_tag_num));
+            }
+        }
 
         if (use_npu_vector_compute_)
         {
             npuAPI::Init(dataset, normalized_level_2_bucket_doc_table);
         }
+
+        // Build L2→L0 mapping for L0 NPU score caching
+        if (dataset.l1_to_l0_map != nullptr) {
+            InitL0Mapping(dataset.l1_to_l0_map, static_cast<uint32_t>(normalized_level_2_bucket_doc_table.size()));
+        }
+
+        // Build global_tag_freq for BucketPlan selectivity estimation
+        if (g_global_tag_freq.empty() && total_doc_num > 0)
+        {
+            if (!TryLoadTagFreqCache(static_cast<uint64_t>(total_doc_num),
+                                     static_cast<uint32_t>(total_tag_num)))
+            {
+                const uint32_t bitmap_stride = (total_tag_num + 63) / 64;
+                std::vector<uint32_t> tag_counts(total_tag_num, 0);
+                for (int doc = 0; doc < total_doc_num; ++doc)
+                {
+                    const uint64_t *doc_bitmap = dataset.tag_bitmaps + static_cast<size_t>(doc) * bitmap_stride;
+                    for (uint32_t word = 0; word < bitmap_stride; ++word)
+                    {
+                        uint64_t w = doc_bitmap[word];
+                        while (w)
+                        {
+                            int bit = __builtin_ctzll(w);
+                            uint32_t tag_id = word * 64 + static_cast<uint32_t>(bit);
+                            if (tag_id < static_cast<uint32_t>(total_tag_num))
+                                tag_counts[tag_id]++;
+                            w &= (w - 1);
+                        }
+                    }
+                }
+                g_global_tag_freq.resize(total_tag_num);
+                float inv_total = 1.0f / static_cast<float>(total_doc_num);
+                for (int t = 0; t < total_tag_num; ++t)
+                    g_global_tag_freq[t] = static_cast<float>(tag_counts[t]) * inv_total;
+                std::cout << "[DB] global_tag_freq computed (" << total_tag_num << " tags)." << std::endl;
+                SaveTagFreqCache();
+            }
+        }
+
         std::cout << "[DB] Index Construction Complete." << std::endl;
     }
 
-    // 析构时清理 NPU 资源
-    ~DataBaseCPU()
-    {
-        if (use_npu_vector_compute_)
-        {
-            npuAPI::Finalize();
-        }
-    }
+    ~DataBaseCPU() = default;
 
     /**
      * @brief 获取指定二级桶的引用
@@ -123,6 +150,35 @@ public:
         return doc_vectors_;
     }
 
+    // L0 (mesocluster) mapping accessors
+    uint32_t GetL0ForL2(uint32_t l2_bucket_id) const
+    {
+        if (l2_bucket_id < l2_to_l0_map_.size())
+            return l2_to_l0_map_[l2_bucket_id];
+        return 0;
+    }
+
+    bool HasL0Mapping() const { return !l2_to_l0_map_.empty(); }
+
+    uint32_t get_l0_count() const
+    {
+        return static_cast<uint32_t>(l0_to_l2_ranges_.size());
+    }
+
+    uint32_t get_l2_begin_for_l0(uint32_t l0_id) const
+    {
+        if (l0_id < l0_to_l2_ranges_.size())
+            return l0_to_l2_ranges_[l0_id].first;
+        return 0;
+    }
+
+    uint32_t get_l2_end_for_l0(uint32_t l0_id) const
+    {
+        if (l0_id < l0_to_l2_ranges_.size())
+            return l0_to_l2_ranges_[l0_id].second;
+        return 0;
+    }
+
     bool UsesNpuVectorCompute() const
     {
         return use_npu_vector_compute_;
@@ -147,44 +203,66 @@ public:
         return end_offset - begin_offset;
     }
 
+    void InitL0Mapping(const uint32_t *l2_to_l0_map_ptr, uint32_t l2_count)
+    {
+        l2_to_l0_map_.assign(l2_to_l0_map_ptr, l2_to_l0_map_ptr + l2_count);
+
+        uint32_t max_l0 = 0;
+        for (uint32_t i = 0; i < l2_count; ++i)
+            max_l0 = std::max(max_l0, l2_to_l0_map_[i]);
+
+        const uint32_t l0_count = max_l0 + 1;
+        l0_to_l2_ranges_.assign(l0_count, {UINT32_MAX, 0});
+
+        for (uint32_t l2 = 0; l2 < l2_count; ++l2)
+        {
+            uint32_t l0 = l2_to_l0_map_[l2];
+            l0_to_l2_ranges_[l0].first = std::min(l0_to_l2_ranges_[l0].first, l2);
+            l0_to_l2_ranges_[l0].second = std::max(l0_to_l2_ranges_[l0].second, l2 + 1);
+        }
+
+        std::cout << "[DB] L0 mapping initialized: " << l0_count << " L0 mesoclusters, "
+                  << l2_count << " L2 buckets mapped." << std::endl;
+    }
+
 private:
     static constexpr uint32_t kBucketIvfIndexFileVersion = 2;
     static constexpr uint32_t kBucketIndexFileVersion = 2;
     static constexpr size_t kQueryScoreCols = 16;
 
-    static void ValidateQueryScoreSlotCapacities(const BucketDocTable &level_1_bucket_doc_table)
+    static void ValidateQueryScoreSlotCapacities(const BucketDocTable &l2_bucket_doc_table)
     {
-        std::vector<size_t> level_1_doc_counts;
-        level_1_doc_counts.reserve(level_1_bucket_doc_table.size());
-        for (const auto &bucket_docs : level_1_bucket_doc_table)
+        std::vector<size_t> l2_doc_counts;
+        l2_doc_counts.reserve(l2_bucket_doc_table.size());
+        for (const auto &bucket_docs : l2_bucket_doc_table)
         {
-            level_1_doc_counts.push_back(bucket_docs.size());
+            l2_doc_counts.push_back(bucket_docs.size());
         }
-        std::sort(level_1_doc_counts.begin(), level_1_doc_counts.end(), std::greater<size_t>());
+        std::sort(l2_doc_counts.begin(), l2_doc_counts.end(), std::greater<size_t>());
 
         auto sum_top_doc_counts = [&](size_t top_n) -> size_t
         {
-            const size_t limit = std::min(top_n, level_1_doc_counts.size());
+            const size_t limit = std::min(top_n, l2_doc_counts.size());
             size_t total_docs = 0;
             for (size_t i = 0; i < limit; ++i)
             {
-                total_docs += level_1_doc_counts[i];
+                total_docs += l2_doc_counts[i];
             }
             return total_docs;
         };
 
         const size_t first_round_required_floats =
-            sum_top_doc_counts(static_cast<size_t>(std::max(valid_bucket_num_base_level_1, 0))) * kQueryScoreCols;
+            sum_top_doc_counts(static_cast<size_t>(std::max(valid_bucket_num_base_level_2, 0))) * kQueryScoreCols;
         const size_t incremental_required_floats =
-            sum_top_doc_counts(static_cast<size_t>(std::max(valid_bucket_num_incremental_level_1, 0))) * kQueryScoreCols;
+            sum_top_doc_counts(static_cast<size_t>(std::max(valid_bucket_num_incremental_level_2, 0))) * kQueryScoreCols;
 
         const size_t first_round_slot_capacity_floats =
-            static_cast<size_t>(valid_bucket_num_base_level_1) *
+            static_cast<size_t>(valid_bucket_num_base_level_2) *
             static_cast<size_t>(max_process_bucket_num_level_2) *
             static_cast<size_t>(max_doc_per_bucket_level_2) *
             kQueryScoreCols;
         const size_t incremental_slot_capacity_floats =
-            static_cast<size_t>(valid_bucket_num_incremental_level_1) *
+            static_cast<size_t>(valid_bucket_num_incremental_level_2) *
             static_cast<size_t>(max_process_bucket_num_level_2) *
             static_cast<size_t>(max_doc_per_bucket_level_2) *
             kQueryScoreCols;
@@ -213,7 +291,7 @@ private:
         std::memcpy(header.magic, magic, sizeof(header.magic));
         header.version = kBucketIvfIndexFileVersion;
         header.total_tag_num = static_cast<uint32_t>(total_tag_num);
-        header.total_bucket_num = static_cast<uint32_t>(total_bucket_num_level_1);
+        header.total_bucket_num = static_cast<uint32_t>(total_bucket_num_level_2);
         header.cores_per_group = static_cast<uint32_t>(cores_per_group);
         header.cpu_cache_line_size = static_cast<uint32_t>(cpu_cache_line_size);
         header.buckets_per_core = ivf.get_buckets_per_core();
@@ -245,7 +323,7 @@ private:
         return std::memcmp(header.magic, expected_magic, sizeof(header.magic)) == 0 &&
                header.version == kBucketIvfIndexFileVersion &&
                header.total_tag_num == static_cast<uint32_t>(total_tag_num) &&
-               header.total_bucket_num == static_cast<uint32_t>(total_bucket_num_level_1) &&
+               header.total_bucket_num == static_cast<uint32_t>(total_bucket_num_level_2) &&
                header.cores_per_group == static_cast<uint32_t>(cores_per_group) &&
                header.cpu_cache_line_size == static_cast<uint32_t>(cpu_cache_line_size) &&
                header.buckets_per_core == ivf.get_buckets_per_core() &&
@@ -305,7 +383,6 @@ private:
     }
 
     void BuildCpuIndexesFromDataset(const InputDataset &dataset,
-                                    const BucketDocTable &level_1_bucket_doc_table,
                                     const BucketDocTable &normalized_level_2_bucket_doc_table)
     {
         buckets_.clear();
@@ -341,9 +418,9 @@ private:
         std::vector<uint64_t> agg_or_mask(input_bitmap_stride);
         std::vector<uint64_t> agg_and_mask(input_bitmap_stride);
 
-        for (uint32_t bid = 0; bid < total_bucket_num_level_1; ++bid)
+        for (uint32_t bid = 0; bid < static_cast<uint32_t>(total_bucket_num_level_2); ++bid)
         {
-            const std::vector<uint32_t> &doc_ids = level_1_bucket_doc_table[bid];
+            const std::vector<uint32_t> &doc_ids = normalized_level_2_bucket_doc_table[bid];
             if (doc_ids.empty())
             {
                 continue;
@@ -397,7 +474,7 @@ private:
 
         BucketLevelIVF loaded_bucket_level_ivf;
         if (!LoadBucketIvfIndexFile(bucket_ivf_path,
-                                    level_1_bucket_layout_hash_,
+                                    level_2_bucket_layout_hash_,
                                     loaded_bucket_level_ivf))
         {
             std::cout << "[DB] Warning: bucket IVF index file parameter mismatch: "
@@ -419,6 +496,86 @@ private:
 
         return SaveBucketIvfIndexFile(std::filesystem::path(bucket_ivf_index_file)) &&
                SaveBucketIndexFile(std::filesystem::path(bucket_index_file));
+    }
+
+    // ---- Tag Frequency Cache ----
+    static bool TryLoadTagFreqCache(uint64_t expected_doc_num, uint32_t expected_tag_num)
+    {
+        if (tag_freq_cache_file.empty())
+            return false;
+
+        std::filesystem::path path(tag_freq_cache_file);
+        std::error_code ec;
+        if (!std::filesystem::exists(path, ec) || ec)
+            return false;
+
+        std::ifstream in(path, std::ios::binary);
+        if (!in.is_open())
+            return false;
+
+        DataReader::TagFreqCacheHeaderDisk header{};
+        if (!DataReader::ReadBinaryExact(in, &header, sizeof(header)))
+            return false;
+
+        if (std::memcmp(header.magic, "TAGFREQ\0", 8) != 0 ||
+            header.version != 1 ||
+            header.doc_num != expected_doc_num ||
+            header.tag_num != expected_tag_num)
+        {
+            std::cout << "[DB] Tag freq cache header mismatch. Rebuilding..." << std::endl;
+            return false;
+        }
+
+        g_global_tag_freq.resize(header.tag_num);
+        if (!DataReader::ReadBinaryExact(in, g_global_tag_freq.data(),
+                                          static_cast<size_t>(header.tag_num) * sizeof(float)))
+        {
+            g_global_tag_freq.clear();
+            return false;
+        }
+
+        std::cout << "[DB] global_tag_freq loaded from cache (" << header.tag_num << " tags)." << std::endl;
+        return true;
+    }
+
+    static bool SaveTagFreqCache()
+    {
+        if (tag_freq_cache_file.empty() || g_global_tag_freq.empty())
+            return true;
+
+        std::filesystem::path path(tag_freq_cache_file);
+        {
+            std::error_code ec;
+            auto parent = path.parent_path();
+            if (!parent.empty() && !std::filesystem::exists(parent, ec))
+                std::filesystem::create_directories(parent, ec);
+        }
+
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        if (!out.is_open())
+        {
+            std::cerr << "[DB] Warning: Failed to create tag freq cache: " << path << std::endl;
+            return false;
+        }
+
+        DataReader::TagFreqCacheHeaderDisk header{};
+        std::memcpy(header.magic, "TAGFREQ\0", 8);
+        header.version = 1;
+        header.doc_num = static_cast<uint64_t>(total_doc_num);
+        header.tag_num = static_cast<uint32_t>(g_global_tag_freq.size());
+
+        out.write(reinterpret_cast<const char *>(&header), sizeof(header));
+        out.write(reinterpret_cast<const char *>(g_global_tag_freq.data()),
+                  static_cast<std::streamsize>(g_global_tag_freq.size()) * sizeof(float));
+
+        if (!out.good())
+        {
+            std::cerr << "[DB] Warning: Failed to write tag freq cache." << std::endl;
+            return false;
+        }
+
+        std::cout << "[DB] global_tag_freq saved to cache (" << g_global_tag_freq.size() << " tags)." << std::endl;
+        return true;
     }
 
     static bool LoadBucketIvfIndexFile(const std::filesystem::path &path,
@@ -532,7 +689,7 @@ private:
         }
 
         const DataReader::BucketIvfIndexFileHeaderDisk header =
-            MakeBucketIvfIndexFileHeader(bucket_level_ivf_, level_1_bucket_layout_hash_);
+            MakeBucketIvfIndexFileHeader(bucket_level_ivf_, level_2_bucket_layout_hash_);
         const bool ok = DataReader::WriteBinaryExact(out, &header, sizeof(header)) &&
                         bucket_level_ivf_.Serialize(out);
         out.flush();
@@ -649,9 +806,9 @@ private:
     BucketLevelIVF bucket_level_ivf_;
     std::vector<uint32_t> level_1_to_level_2_offsets_;
 
-    // 扁平化存储的桶中心向量
+    std::vector<uint32_t> l2_to_l0_map_; // L2 → L0 mapping for L0 NPU score caching
+    std::vector<std::pair<uint32_t, uint32_t>> l0_to_l2_ranges_; // L0 → [begin_l2, end_l2) ranges
     std::vector<float, AlignedAllocator<float>> bucket_centroids_;
-    uint64_t level_1_bucket_layout_hash_ = 0;
     uint64_t level_2_bucket_layout_hash_ = 0;
 
     const float *doc_vectors_ = nullptr;

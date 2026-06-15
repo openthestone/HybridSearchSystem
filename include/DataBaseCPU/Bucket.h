@@ -237,6 +237,28 @@ public:
         return &bitmap_data_[static_cast<size_t>(slot - 1) * stride_];
     }
 
+    void batch_get_tag_bits_sorted(const uint32_t *query_tags, size_t query_count,
+                                   const uint64_t **out_ptrs) const
+    {
+        size_t qi = 0, bi = 0;
+        while (qi < query_count)
+        {
+            if (bi >= valid_tag_count_ || query_tags[qi] < sorted_tag_ids_[bi])
+            {
+                out_ptrs[qi++] = BucketInternal::g_global_zero_bitmap;
+            }
+            else if (query_tags[qi] > sorted_tag_ids_[bi])
+            {
+                ++bi;
+            }
+            else
+            {
+                out_ptrs[qi++] = &bitmap_data_[bi * stride_];
+                ++bi;
+            }
+        }
+    }
+
     // 获取预计算的 Norm 数组
     const float *get_norms() const { return precomputed_norms_.data(); }
 

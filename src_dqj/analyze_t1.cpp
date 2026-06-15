@@ -13,6 +13,7 @@
 #include <string>
 #include <system_error>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -34,130 +35,72 @@ namespace fs = RunSupport::fs;
 namespace
 {
 // ---------------------------------------------------------------------------
-//  Query loading (sks_new style: fvecs format, no tag-map)
+//  Config path helpers (dqj: config-driven data loading)
 // ---------------------------------------------------------------------------
-bool LoadPreparedQueriesFromFvec(const std::vector<std::string> &query_paths,
-                                 int expected_dim,
-                                 int default_top_k,
-                                 std::vector<DataReader::PreparedQuery> &queries,
-                                 std::string &loaded_path)
+bool ParseConfigStringValue(const std::string &config_file,
+                            const std::string &target_key,
+                            std::string &value_out)
 {
-    queries.clear();
-    loaded_path.clear();
-
-    if (expected_dim < 64 || default_top_k <= 0)
+    std::ifstream file(config_file);
+    if (!file.is_open())
     {
         return false;
     }
 
-    auto append_query = [&](const float *raw, int source_dim, size_t line_no) {
-        DataReader::PreparedQuery q;
-        q.query_vec.assign(static_cast<size_t>(expected_dim), 0.0f);
-        const int copy_dim = std::min<int>(64, std::min<int>(expected_dim, source_dim));
-        for (int d = 0; d < copy_dim; ++d)
-        {
-            q.query_vec[static_cast<size_t>(d)] = raw[static_cast<size_t>(d)];
-        }
-        q.filter_expr = "";
-        q.top_k = default_top_k;
-        q.line_no = line_no;
-        queries.push_back(std::move(q));
-    };
-
-    for (const auto &path : query_paths)
+    std::string line;
+    while (std::getline(file, line))
     {
-        std::ifstream in(path, std::ios::binary);
-        if (!in)
+        StripConfigComment(line);
+        line = ParamTrim(line);
+        if (line.empty())
         {
             continue;
         }
 
-        in.seekg(0, std::ios::end);
-        const std::streamoff file_size = in.tellg();
-        in.seekg(0, std::ios::beg);
-        if (file_size < static_cast<std::streamoff>(sizeof(int32_t) * 2))
+        const size_t equal_pos = line.find('=');
+        if (equal_pos == std::string::npos)
         {
             continue;
         }
 
-        int32_t first = 0;
-        int32_t second = 0;
-        in.read(reinterpret_cast<char *>(&first), sizeof(int32_t));
-        in.read(reinterpret_cast<char *>(&second), sizeof(int32_t));
-        if (!in)
+        const std::string key = ParamTrim(line.substr(0, equal_pos));
+        if (key != target_key)
         {
             continue;
         }
 
-        const std::streamoff headered_bytes = static_cast<std::streamoff>(sizeof(int32_t) * 2) +
-                                              static_cast<std::streamoff>(first) * static_cast<std::streamoff>(second) *
-                                                  static_cast<std::streamoff>(sizeof(float));
-
-        if (first > 0 && second >= 64 && file_size == headered_bytes)
+        std::string parsed_value;
+        if (!ParseConfigString(line.substr(equal_pos + 1), parsed_value))
         {
-            const int32_t rows = first;
-            const int32_t source_dim = second;
-            std::vector<float> raw(static_cast<size_t>(source_dim));
-            queries.clear();
-            queries.reserve(static_cast<size_t>(rows));
-            for (int32_t i = 0; i < rows; ++i)
-            {
-                in.read(reinterpret_cast<char *>(raw.data()),
-                        static_cast<std::streamsize>(raw.size() * sizeof(float)));
-                if (!in)
-                {
-                    queries.clear();
-                    break;
-                }
-                append_query(raw.data(), source_dim, static_cast<size_t>(i + 1));
-            }
-            if (!queries.empty())
-            {
-                loaded_path = path;
-                return true;
-            }
-            continue;
+            return false;
         }
-
-        in.clear();
-        in.seekg(0, std::ios::beg);
-        queries.clear();
-        size_t line_no = 0;
-        while (true)
-        {
-            int32_t dim = 0;
-            in.read(reinterpret_cast<char *>(&dim), sizeof(int32_t));
-            if (!in)
-            {
-                break;
-            }
-            if (dim < 64)
-            {
-                queries.clear();
-                break;
-            }
-
-            std::vector<float> raw(static_cast<size_t>(dim));
-            in.read(reinterpret_cast<char *>(raw.data()),
-                    static_cast<std::streamsize>(raw.size() * sizeof(float)));
-            if (!in)
-            {
-                queries.clear();
-                break;
-            }
-
-            ++line_no;
-            append_query(raw.data(), dim, line_no);
-        }
-
-        if (!queries.empty())
-        {
-            loaded_path = path;
-            return true;
-        }
+        value_out = parsed_value;
+        return true;
     }
 
     return false;
+}
+
+void RestoreSrcStyleRelativePathsFromConfig(const std::string &config_file)
+{
+    auto restore_path = [&](const std::string &key, std::string &target) {
+        std::string raw_value;
+        if (ParseConfigStringValue(config_file, key, raw_value))
+        {
+            target = raw_value;
+        }
+    };
+
+    restore_path("dataset_cache_file", dataset_cache_file);
+    restore_path("tag_map_cache_file", tag_map_cache_file);
+    restore_path("query_file", query_file);
+    restore_path("query_result_root", query_result_root);
+    restore_path("ground_truth_cache_file", ground_truth_cache_file);
+    restore_path("bucket_ivf_index_file", bucket_ivf_index_file);
+    restore_path("bucket_index_file", bucket_index_file);
+    restore_path("raw_vector_file", raw_vector_file);
+    restore_path("raw_attr_dir", raw_attr_dir);
+    restore_path("raw_query_file", raw_query_file);
 }
 
 // ---------------------------------------------------------------------------
@@ -808,22 +751,6 @@ bool RemoveObsoleteAnalyzeFiles(const fs::path &analyze_output_dir)
 // ---------------------------------------------------------------------------
 int main()
 {
-    constexpr int kDefaultTopK = 100;
-    constexpr const char *kDatasetFile = "../../dataset_HW.bin";
-    const std::vector<std::string> kQueryPaths = {
-        "datasets/hw_queries.fvecs",
-        "../datasets/hw_queries.fvecs",
-        "../../datasets/hw_queries.fvecs",
-        "../../../datasets/hw_queries.fvecs"
-    };
-    // constexpr const char *kDatasetFile = "../../dataset_DEEP.bin";
-    // const std::vector<std::string> kQueryPaths = {
-    //     "queries/deep1B_queries.fvecs",
-    //     "../queries/deep1B_queries.fvecs",
-    //     "../../queries/deep1B_queries.fvecs",
-    //     "../../../queries/deep1B_queries.fvecs"
-    // };
-
     // --- Config ---
     const fs::path config_path = RunSupport::ResolveConfigPath();
     std::cout << "[AnalyzeT1] Loading config from " << config_path << "...\n";
@@ -832,6 +759,7 @@ int main()
         std::cerr << "[Error] Failed to load config: " << config_path << "\n";
         return -1;
     }
+    RestoreSrcStyleRelativePathsFromConfig(config_path.string());
 
 #ifdef _OPENMP
     if (cpu_core_count > 0)
@@ -848,45 +776,73 @@ int main()
     // --- Dataset ---
     std::cout << "[Loader] Loading dataset cache...\n";
     DataReader::DatasetBuffers dataset_buffers;
+    std::unordered_map<std::string, int> tag_map;
     DataReader::LoadFailureReason dataset_failure = DataReader::LoadFailureReason::None;
-    if (!DataReader::LoadDatasetCache(kDatasetFile, dataset_buffers, &dataset_failure))
+    if (!DataReader::EnsureDatasetAndTagMapCaches(dataset_buffers, tag_map))
     {
-        if (dataset_failure != DataReader::LoadFailureReason::VectorDimMismatch)
-        {
-            std::cerr << "[Fatal] Failed to load dataset cache: " << kDatasetFile << "\n";
-        }
+        std::cerr << "[Fatal] Failed to prepare dataset/tag-map caches.\n";
         return -1;
     }
     std::cout << "[Loader] Dataset loaded. Docs=" << total_doc_num
               << ", Dim=" << vector_dim
               << ", Tags=" << total_tag_num
               << ", Buckets(Level1)=" << total_bucket_num_level_1 << "\n";
+    std::cout << "[Loader] tag_map loaded. size=" << tag_map.size() << "\n";
 
-    // --- Queries (sks_new fvec style) ---
+    // --- Queries (dqj: config-driven with tag_map) ---
     std::cout << "[Loader] Loading queries...\n";
-    std::vector<DataReader::PreparedQuery> prepared_queries;
-    std::string loaded_query_path;
-    if (!LoadPreparedQueriesFromFvec(kQueryPaths,
-                                     vector_dim,
-                                     kDefaultTopK,
-                                     prepared_queries,
-                                     loaded_query_path))
+    if (!DataReader::EnsurePreparedQueryFile())
     {
-        std::cerr << "[Fatal] Failed to read queries from hw_queries.fvecs\n";
+        std::cerr << "[Fatal] Failed to prepare query file: " << query_file << "\n";
         return -1;
     }
-    std::cout << "[Loader] Queries loaded from " << loaded_query_path << "\n";
+
+    std::vector<DataReader::PreparedQuery> prepared_queries;
+    std::vector<std::string> query_warnings;
+    DataReader::QueryLoadDiagnostics query_load_diagnostics;
+    DataReader::LoadFailureReason query_failure = DataReader::LoadFailureReason::None;
+    if (!DataReader::LoadPreparedQueries(query_file,
+                                         tag_map,
+                                         vector_dim,
+                                         prepared_queries,
+                                         query_warnings,
+                                         &query_load_diagnostics,
+                                         &query_failure))
+    {
+        if (query_failure != DataReader::LoadFailureReason::VectorDimMismatch)
+        {
+            std::cerr << "[Fatal] Failed to read query file: " << query_file << "\n";
+        }
+        return -1;
+    }
+    if (!RunSupport::WriteQueryLoadDiagnosticsFiles(query_result_root_dir, query_load_diagnostics))
+    {
+        std::cerr << "[Fatal] Failed to write query load diagnostics under "
+                  << (query_result_root_dir / "log") << "\n";
+        return -1;
+    }
+    if (!RunSupport::WritePreparedQueryFilterFile(query_result_root_dir, prepared_queries))
+    {
+        std::cerr << "[Fatal] Failed to write query boolean filters under "
+                  << (query_result_root_dir / "log") << "\n";
+        return -1;
+    }
+
+    for (const auto &warning : query_warnings)
+    {
+        std::cout << "[Warn] " << warning << "\n";
+    }
 
     if (prepared_queries.empty())
     {
-        std::cout << "[Info] No valid query found in " << loaded_query_path << ". Exit with code 0.\n";
+        std::cout << "[Info] No valid query found in " << query_file << ". Exit with code 0.\n";
         return 0;
     }
 
     std::cout << "[Loader] Prepared query count: " << prepared_queries.size() << "\n";
     std::cout << "[Analyze] analyze_t1=" << ::analyze_t1
-              << ", batch0=" << ::valid_bucket_num_base_level_2
-              << ", incremental=" << ::valid_bucket_num_incremental_level_2 << "\n";
+              << ", batch0=" << ::valid_bucket_num_base_level_1
+              << ", incremental=" << ::valid_bucket_num_incremental_level_1 << "\n";
     FilterExpCompiler::WarmUpThreadLocalBuffers();
 
     // --- Clustering ---

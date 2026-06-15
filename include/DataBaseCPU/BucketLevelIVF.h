@@ -20,7 +20,7 @@ public:
     BucketLevelIVF()
     {
         // 1. 计算每个 Core 负责的桶数量 (向上取整)
-        buckets_per_core_ = (total_bucket_num_level_1 + cores_per_group - 1) / cores_per_group;
+        buckets_per_core_ = (total_bucket_num_level_2 + cores_per_group - 1) / cores_per_group;
 
         // 2. 计算每个 Core 需要的 bits 和 uint64 数量
         uint32_t bits_per_core = buckets_per_core_;
@@ -130,6 +130,38 @@ public:
     uint32_t get_buckets_per_core() const
     {
         return buckets_per_core_;
+    }
+
+    // ==========================================
+    // Tag Agg State query for constant folding
+    // ==========================================
+    struct TagAggState {
+        bool has_tag;       // at least one doc in this bucket has this tag
+        bool all_have_tag;  // all docs in this bucket have this tag
+    };
+
+    TagAggState GetTagAggState(uint32_t tag_id, uint32_t bucket_id) const
+    {
+        if (tag_id >= static_cast<uint32_t>(total_tag_num))
+            return {false, true}; // absent tag: has=false, all_have vacuously true
+
+        int core_idx = static_cast<int>(bucket_id / buckets_per_core_);
+        uint32_t local_bucket_idx = bucket_id % buckets_per_core_;
+
+        if (core_idx >= cores_per_group)
+            return {false, true};
+
+        size_t row_start = static_cast<size_t>(tag_id) * aligned_stride_;
+        size_t word_offset = local_bucket_idx / 64;
+        size_t bit_offset = local_bucket_idx % 64;
+
+        uint64_t and_or_bit = (shards_and_or_[core_idx][row_start + word_offset] >> bit_offset) & 1ULL;
+        uint64_t not_bit = (shards_not_[core_idx][row_start + word_offset] >> bit_offset) & 1ULL;
+
+        return {
+            .has_tag = (and_or_bit != 0),
+            .all_have_tag = (not_bit == 0)  // not_bit=0 means no doc lacks this tag
+        };
     }
 
     bool Serialize(std::ofstream &out) const

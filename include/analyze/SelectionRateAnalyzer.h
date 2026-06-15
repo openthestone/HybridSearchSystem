@@ -384,8 +384,8 @@ private:
         {
             // 先做桶级过滤，再对过滤后的桶按顺序分批。
             const size_t batch_size = static_cast<size_t>((batch_idx == 0)
-                                                              ? ::valid_bucket_num_base_level_1
-                                                              : ::valid_bucket_num_incremental_level_1);
+                                                              ? ::valid_bucket_num_base_level_2
+                                                              : ::valid_bucket_num_incremental_level_2);
             const size_t batch_end = std::min(cursor + batch_size, sorted_bucket_ids.size());
             assignment.bucket_count_per_batch[static_cast<size_t>(batch_idx)] = batch_end - cursor;
             for (; cursor < batch_end; ++cursor)

@@ -5,112 +5,67 @@
 #include <string_view>
 #include <cstdint>
 #include <iostream>
+#include <limits>
 
-struct RPNItem
-{
-    bool is_op;     // true if Operator, false if Operand (Tag)
-    uint32_t value; // TagID or OpCode
-    uint8_t flags;  // Flags (e.g., bit 0 = Inverted/NOT for Tag)
+// ---- BucketPlan: Linear Execution Plan with AND/OR Group Short-Circuit ----
 
-    // Helper for debugging
-    bool is_inverted() const { return flags & 1; }
+enum class PlanOp : uint8_t {
+    TAG,
+    NOT_TAG,
+    AND_GROUP,
+    OR_GROUP,
 };
 
-namespace FilterOp8
+struct PlanNode {
+    PlanOp op;
+    uint32_t value;       // TAG/NOT_TAG: tag_id
+    uint32_t first_child; // GROUP: children 起始下标（在 children 数组中）
+    uint16_t child_count; // GROUP: children 数量
+    uint16_t leaf_index;  // TAG/NOT_TAG: leaf_base_ptrs 下标；GROUP 置 UINT16_MAX
+    float selectivity;    // 编译期估计选择率
+};
+
+struct BucketPlan {
+    std::vector<PlanNode> nodes;    // 所有节点（叶子 + group）连续存储
+    std::vector<uint32_t> children; // group 节点的 child 下标
+    std::vector<uint32_t> leaf_to_sorted_idx; // leaf_index -> index in sorted_unique_tag_ids
+    std::vector<uint32_t> eval_order; // 后序遍历求值顺序（叶子在前，group 在子节点之后）
+    uint32_t root = UINT32_MAX;
+    uint16_t leaf_count = 0;
+    bool valid = false;
+    bool validated = false;
+    bool always_false = false;
+};
+
+// ---- Compilation tree node (intermediate, used by FilterExpCompiler) ----
+
+struct FilterTmpNode
 {
-    // §2.2B: OP_AND=0, OP_OR=1 enables branchless XOR flip: op ^ inverted
-    // 0 is used for OP_AND, 1 for OP_OR (XOR semantics)
-    const uint8_t OP_AND = 0;
-    const uint8_t OP_OR = 1;
-
-    // IVF Specific Ops
-    const uint8_t OP_IVF_LOAD_EXIST = 3;   // Load Tag
-    const uint8_t OP_IVF_LOAD_MISSING = 4; // Load Not Tag
-
-    // Note: OP_NOT is removed from execution stream, handled via RPNItem.flags
-}
+    enum Type { LEAF, GROUP, CONSTANT } type;
+    // LEAF
+    uint32_t tag_id = 0;
+    bool inverted = false;
+    // GROUP
+    PlanOp op = PlanOp::AND_GROUP;
+    std::vector<uint32_t> children; // indices into tmp vector
+    // CONSTANT
+    bool const_value = false;
+    float selectivity = 0.5f;
+};
 
 class FilterExp
 {
 public:
-    // Bucket_RPN: 用于桶内属性过滤
-    std::vector<RPNItem> Bucket_RPN;
-
-    // BucketLevelIVF_RPN: 用于桶级属性过滤
-    std::vector<RPNItem> BucketLevelIVF_RPN;
-
     // ---- Sorted unique tag IDs for merge-based batch lookup ----
-    // 在 CompileFrom 中一次性计算，查询时复用
-    std::vector<uint32_t> sorted_unique_tag_ids;   // 升序去重的 tag ID 列表
-    std::vector<uint32_t> rpn_tag_to_sorted_idx;   // RPN 中每个 tag 在 sorted_unique_tag_ids 中的索引
+    std::vector<uint32_t> sorted_unique_tag_ids;
+
+    // ---- BucketPlan: group short-circuit execution plan ----
+    BucketPlan bucket_plan;
 
     FilterExp() = default;
 
-    // 构造函数
     explicit FilterExp(const std::string &query_filter);
     explicit FilterExp(std::string_view query_filter);
 
-    void Reserve(size_t bucket_rpn_capacity, size_t bucket_level_ivf_rpn_capacity)
-    {
-        if (Bucket_RPN.capacity() < bucket_rpn_capacity)
-        {
-            Bucket_RPN.reserve(bucket_rpn_capacity);
-            Bucket_RPN.resize(bucket_rpn_capacity);
-            Bucket_RPN.clear();
-        }
-        if (BucketLevelIVF_RPN.capacity() < bucket_level_ivf_rpn_capacity)
-        {
-            BucketLevelIVF_RPN.reserve(bucket_level_ivf_rpn_capacity);
-            BucketLevelIVF_RPN.resize(bucket_level_ivf_rpn_capacity);
-            BucketLevelIVF_RPN.clear();
-        }
-    }
-
     void CompileFrom(std::string_view query_filter);
-
-    void dump() const
-    {
-        std::cout << ">>> Bucket_RPN (No-AST): ";
-        for (const auto &item : Bucket_RPN)
-        {
-            if (item.is_op)
-            {
-                if (item.value == FilterOp8::OP_AND)
-                    std::cout << "AND ";
-                else if (item.value == FilterOp8::OP_OR)
-                    std::cout << "OR ";
-                else
-                    std::cout << "OP(" << item.value << ") ";
-            }
-            else
-            {
-                std::cout << "Tag" << item.value;
-                if (item.flags & 1)
-                    std::cout << "(NOT)";
-                std::cout << " ";
-            }
-        }
-        std::cout << "\n>>> BucketLevelIVF_RPN (No-AST): ";
-        for (const auto &item : BucketLevelIVF_RPN)
-        {
-            if (item.is_op)
-            {
-                if (item.value == FilterOp8::OP_AND)
-                    std::cout << "AND ";
-                else if (item.value == FilterOp8::OP_OR)
-                    std::cout << "OR ";
-                else if (item.value == FilterOp8::OP_IVF_LOAD_EXIST)
-                    std::cout << "LD_EXIST ";
-                else if (item.value == FilterOp8::OP_IVF_LOAD_MISSING)
-                    std::cout << "LD_MISSING ";
-                else
-                    std::cout << "OP(" << item.value << ") ";
-            }
-            else
-            {
-                std::cout << "Tag" << item.value << " ";
-            }
-        }
-        std::cout << std::endl;
-    }
 };

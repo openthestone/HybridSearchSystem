@@ -15,7 +15,7 @@
 #include <iomanip>
 #include <cstring> 
 
-// 负责将查询中原始的属性过滤表达式字符串优化并转化为 RPN序列
+// 负责将查询中原始的属性过滤表达式字符串直接编译为 TmpNode 树
 /*
     表达式字符串需要满足以下要求：
     允许有多余空格
@@ -99,36 +99,13 @@ private:
         return static_cast<uint32_t>(val);
     }
 
-    void emitTag(uint32_t tag_id, bool inverted, FilterExp &output)
+    static std::vector<uint32_t> &ThreadLocalValueStack()
     {
-        if (inverted)
-        {
-            // Bucket_RPN: Tag(NEG)
-            output.Bucket_RPN.push_back({false, tag_id, 1}); // flag=1 for NEG
-
-            // BucketLevelIVF_RPN: Tag + LOAD_MISSING
-            output.BucketLevelIVF_RPN.push_back({false, tag_id, 0});
-            output.BucketLevelIVF_RPN.push_back({true, FilterOp8::OP_IVF_LOAD_MISSING, 0});
-        }
-        else
-        {
-            output.Bucket_RPN.push_back({false, tag_id, 0}); // flag=0 for POS
-
-            output.BucketLevelIVF_RPN.push_back({false, tag_id, 0});
-            output.BucketLevelIVF_RPN.push_back({true, FilterOp8::OP_IVF_LOAD_EXIST, 0});
-        }
+        static thread_local std::vector<uint32_t> vs;
+        return vs;
     }
 
-    void emitBinary(uint8_t op, bool inverted, FilterExp &output)
-    {
-        // §2.2B: XOR-based branchless flip: inverted flips AND↔OR
-        // Requires OP_AND=0, OP_OR=1. Then op^1 = NOT op.
-        uint8_t final_op = inverted ? (op ^ 1) : op;
-        output.Bucket_RPN.push_back({true, final_op, 0});
-        output.BucketLevelIVF_RPN.push_back({true, final_op, 0});
-    }
-
-    void compileNoAST(FilterExp &output)
+    void compileNoAST(std::vector<FilterTmpNode> &tmp, std::vector<uint32_t> &val_stack)
     {
         std::vector<Frame> &stack = ThreadLocalCompileStack();
         MemoryEventSession *session = GetActiveMemoryEventSession();
@@ -156,7 +133,7 @@ private:
                 {
                     if (matchKeyword("OR"))
                     {
-                        f.pending_op = FilterOp8::OP_OR;
+                        f.pending_op = 1; // OR marker
                         f.stage = 2;
                         stack.push_back({FrameType::Term, 0, f.inverted, 0});
                         continue;
@@ -166,7 +143,19 @@ private:
                 }
                 if (f.stage == 2)
                 {
-                    emitBinary(f.pending_op, f.inverted, output);
+                    // Binary OR: pop right and left from val_stack, create GROUP
+                    if (val_stack.size() < 2)
+                        throw std::runtime_error("Compile Error: Value stack underflow");
+                    uint32_t right_idx = val_stack.back(); val_stack.pop_back();
+                    uint32_t left_idx = val_stack.back(); val_stack.pop_back();
+                    PlanOp group_op = f.inverted ? PlanOp::AND_GROUP : PlanOp::OR_GROUP;
+                    FilterTmpNode group;
+                    group.type = FilterTmpNode::GROUP;
+                    group.op = group_op;
+                    group.children.push_back(left_idx);
+                    group.children.push_back(right_idx);
+                    tmp.push_back(std::move(group));
+                    val_stack.push_back(static_cast<uint32_t>(tmp.size() - 1));
                     f.stage = 1;
                     continue;
                 }
@@ -183,7 +172,7 @@ private:
                 {
                     if (matchKeyword("AND"))
                     {
-                        f.pending_op = FilterOp8::OP_AND;
+                        f.pending_op = 0; // AND marker
                         f.stage = 2;
                         stack.push_back({FrameType::Factor, 0, f.inverted, 0});
                         continue;
@@ -193,7 +182,19 @@ private:
                 }
                 if (f.stage == 2)
                 {
-                    emitBinary(f.pending_op, f.inverted, output);
+                    // Binary AND: pop right and left from val_stack, create GROUP
+                    if (val_stack.size() < 2)
+                        throw std::runtime_error("Compile Error: Value stack underflow");
+                    uint32_t right_idx = val_stack.back(); val_stack.pop_back();
+                    uint32_t left_idx = val_stack.back(); val_stack.pop_back();
+                    PlanOp group_op = f.inverted ? PlanOp::OR_GROUP : PlanOp::AND_GROUP;
+                    FilterTmpNode group;
+                    group.type = FilterTmpNode::GROUP;
+                    group.op = group_op;
+                    group.children.push_back(left_idx);
+                    group.children.push_back(right_idx);
+                    tmp.push_back(std::move(group));
+                    val_stack.push_back(static_cast<uint32_t>(tmp.size() - 1));
                     f.stage = 1;
                     continue;
                 }
@@ -219,7 +220,12 @@ private:
                     if (std::isdigit(static_cast<unsigned char>(c)))
                     {
                         uint32_t tag_id = parseTagId();
-                        emitTag(tag_id, f.inverted, output);
+                        FilterTmpNode leaf;
+                        leaf.type = FilterTmpNode::LEAF;
+                        leaf.tag_id = tag_id;
+                        leaf.inverted = f.inverted;
+                        tmp.push_back(std::move(leaf));
+                        val_stack.push_back(static_cast<uint32_t>(tmp.size() - 1));
                         stack.pop_back();
                         continue;
                     }
@@ -264,48 +270,46 @@ public:
             stack.resize(target);
         }
         stack.clear();
+
+        std::vector<uint32_t> &vs = ThreadLocalValueStack();
+        if (vs.capacity() < target)
+        {
+            vs.reserve(target);
+        }
+        vs.clear();
     }
 
-    void compile(FilterExp &output)
+    void compile(std::vector<FilterTmpNode> &tmp, uint32_t &root_idx)
     {
-        MemoryEventSession *session = GetActiveMemoryEventSession();
-        const size_t bucket_rpn_old_capacity = session == nullptr ? 0 : output.Bucket_RPN.capacity();
-        const size_t bucket_level_ivf_rpn_old_capacity =
-            session == nullptr ? 0 : output.BucketLevelIVF_RPN.capacity();
-
-        output.Bucket_RPN.clear();
-        output.BucketLevelIVF_RPN.clear();
-        compileNoAST(output);
-
-        RecordCapacityGrowth<RPNItem>(session,
-                                      "FilterExp.h:Bucket_RPN",
-                                      bucket_rpn_old_capacity,
-                                      output.Bucket_RPN.capacity());
-        RecordCapacityGrowth<RPNItem>(session,
-                                      "FilterExp.h:BucketLevelIVF_RPN",
-                                      bucket_level_ivf_rpn_old_capacity,
-                                      output.BucketLevelIVF_RPN.capacity());
+        tmp.clear();
+        std::vector<uint32_t> &val_stack = ThreadLocalValueStack();
+        val_stack.clear();
+        compileNoAST(tmp, val_stack);
+        if (val_stack.size() == 1)
+        {
+            root_idx = val_stack.back();
+        }
+        else
+        {
+            root_idx = UINT32_MAX;
+        }
     }
 
-    static void run(std::string_view expression, FilterExp &output)
+    static void run(std::string_view expression, std::vector<FilterTmpNode> &tmp, uint32_t &root_idx)
     {
         FilterExpCompiler compiler(expression);
-        compiler.compile(output);
+        compiler.compile(tmp, root_idx);
     }
 };
 
 // FilterExp 构造函数实现
 inline FilterExp::FilterExp(const std::string &query_filter)
 {
-    Reserve(static_cast<size_t>(query_bucket_rpn_reserve_items),
-            static_cast<size_t>(query_bucket_level_ivf_rpn_reserve_items));
     CompileFrom(query_filter);
 }
 
 inline FilterExp::FilterExp(std::string_view query_filter)
 {
-    Reserve(static_cast<size_t>(query_bucket_rpn_reserve_items),
-            static_cast<size_t>(query_bucket_level_ivf_rpn_reserve_items));
     CompileFrom(query_filter);
 }
 
@@ -366,50 +370,346 @@ inline size_t radix_sort_dedup_u32(std::vector<uint32_t> &arr)
     return out + 1;
 }
 
-inline void FilterExp::CompileFrom(std::string_view query_filter)
-{
-    Bucket_RPN.clear();
-    BucketLevelIVF_RPN.clear();
-    sorted_unique_tag_ids.clear();
-    rpn_tag_to_sorted_idx.clear();
-    if (query_filter.empty())
-        return;
-    FilterExpCompiler::run(query_filter, *this);
+// ---- BucketPlan Compilation ----
 
-    // Build sorted unique tag IDs and RPN-to-sorted index mapping
-    // Step 1: Collect all tag IDs from Bucket_RPN
-    std::vector<uint32_t> all_tags;
-    all_tags.reserve(Bucket_RPN.size());
-    for (const auto &item : Bucket_RPN)
+inline void BuildBucketPlan(FilterExp &output, std::vector<FilterTmpNode> &tmp, uint32_t root_idx)
+{
+    BucketPlan &plan = output.bucket_plan;
+    plan = BucketPlan(); // reset
+
+    if (tmp.empty() || root_idx == UINT32_MAX)
+        return;
+
+    // Helper: compute selectivity for a leaf
+    auto leaf_selectivity = [](uint32_t tag_id, bool inverted) -> float {
+        if (!g_global_tag_freq.empty() && tag_id < g_global_tag_freq.size())
+        {
+            float sel = g_global_tag_freq[tag_id];
+            return inverted ? (1.0f - sel) : sel;
+        }
+        return 0.5f;
+    };
+
+    // Assign selectivity to leaf nodes
+    for (auto &n : tmp)
     {
-        if (!item.is_op)
-            all_tags.push_back(item.value);
+        if (n.type == FilterTmpNode::LEAF)
+        {
+            n.selectivity = leaf_selectivity(n.tag_id, n.inverted);
+        }
     }
 
-    // Step 2: Sort and dedup via radix sort (O(n), branch-free)
-    radix_sort_dedup_u32(all_tags);
-    sorted_unique_tag_ids = std::move(all_tags);
-
-    // Step 3: Build RPN-to-sorted mapping using linear scan
-    // (both arrays are sorted by tag_id, so merge-style scan is O(n))
-    rpn_tag_to_sorted_idx.reserve(Bucket_RPN.size());
-    {
-        const uint32_t *sorted = sorted_unique_tag_ids.data();
-        const size_t sorted_n = sorted_unique_tag_ids.size();
-        size_t hint = 0; // monotonic hint — tags in RPN tend to repeat, so this helps
-        for (const auto &item : Bucket_RPN)
+    // Helper: compute selectivity for a group
+    std::function<float(uint32_t)> compute_sel = [&](uint32_t idx) -> float {
+        const FilterTmpNode &n = tmp[idx];
+        if (n.type == FilterTmpNode::LEAF || n.type == FilterTmpNode::CONSTANT)
+            return n.selectivity;
+        // GROUP
+        if (n.children.empty())
+            return n.op == PlanOp::AND_GROUP ? 1.0f : 0.0f;
+        if (n.op == PlanOp::AND_GROUP)
         {
-            if (!item.is_op)
+            float prod = 1.0f;
+            for (uint32_t c : n.children)
+                prod *= compute_sel(c);
+            return prod;
+        }
+        else
+        { // OR_GROUP
+            float prod = 1.0f;
+            for (uint32_t c : n.children)
+                prod *= (1.0f - compute_sel(c));
+            return 1.0f - prod;
+        }
+    };
+
+    // Step 1: Compile-time constant folding (global_tag_freq)
+    std::function<uint32_t(uint32_t)> fold_constants = [&](uint32_t idx) -> uint32_t {
+        FilterTmpNode &n = tmp[idx];
+        if (n.type == FilterTmpNode::CONSTANT) return idx;
+
+        if (n.type == FilterTmpNode::LEAF)
+        {
+            if (!g_global_tag_freq.empty() && n.tag_id < g_global_tag_freq.size())
             {
-                // Linear scan from hint (monotonic since sorted tags are unique & ascending)
-                while (hint < sorted_n && sorted[hint] < item.value)
-                    ++hint;
-                rpn_tag_to_sorted_idx.push_back(static_cast<uint32_t>(hint));
+                float freq = g_global_tag_freq[n.tag_id];
+                if (freq == 0.0f)
+                {
+                    n.type = FilterTmpNode::CONSTANT;
+                    n.const_value = n.inverted;
+                    n.selectivity = n.const_value ? 1.0f : 0.0f;
+                }
+                else if (freq == 1.0f)
+                {
+                    n.type = FilterTmpNode::CONSTANT;
+                    n.const_value = !n.inverted;
+                    n.selectivity = n.const_value ? 1.0f : 0.0f;
+                }
+            }
+            return idx;
+        }
+
+        // GROUP: recursively fold children
+        std::vector<uint32_t> new_children;
+        for (uint32_t c : n.children)
+        {
+            uint32_t fc = fold_constants(c);
+            const FilterTmpNode &child = tmp[fc];
+            if (child.type == FilterTmpNode::CONSTANT)
+            {
+                if (n.op == PlanOp::AND_GROUP && !child.const_value)
+                {
+                    n.type = FilterTmpNode::CONSTANT;
+                    n.const_value = false;
+                    n.selectivity = 0.0f;
+                    return idx;
+                }
+                if (n.op == PlanOp::OR_GROUP && child.const_value)
+                {
+                    n.type = FilterTmpNode::CONSTANT;
+                    n.const_value = true;
+                    n.selectivity = 1.0f;
+                    return idx;
+                }
+                continue;
+            }
+            new_children.push_back(fc);
+        }
+        n.children = std::move(new_children);
+
+        if (n.children.empty())
+        {
+            n.type = FilterTmpNode::CONSTANT;
+            n.const_value = (n.op == PlanOp::AND_GROUP);
+            n.selectivity = n.const_value ? 1.0f : 0.0f;
+            return idx;
+        }
+        if (n.children.size() == 1)
+            return n.children[0];
+        return idx;
+    };
+    root_idx = fold_constants(root_idx);
+
+    if (tmp[root_idx].type == FilterTmpNode::CONSTANT)
+    {
+        if (tmp[root_idx].const_value)
+        {
+            plan.valid = false;
+        }
+        else
+        {
+            plan.always_false = true;
+            plan.valid = true;
+        }
+        return;
+    }
+
+    // Step 2: Flatten homogeneous chains
+    std::function<void(uint32_t)> flatten = [&](uint32_t idx) {
+        FilterTmpNode &n = tmp[idx];
+        if (n.type == FilterTmpNode::LEAF || n.type == FilterTmpNode::CONSTANT)
+            return;
+        // First, recursively flatten children
+        for (uint32_t c : n.children)
+            flatten(c);
+        // Now absorb homogeneous grandchildren
+        std::vector<uint32_t> flat_children;
+        for (uint32_t c : n.children)
+        {
+            if (tmp[c].type == FilterTmpNode::GROUP && tmp[c].op == n.op)
+            {
+                // Same op type — absorb grandchildren
+                for (uint32_t gc : tmp[c].children)
+                    flat_children.push_back(gc);
             }
             else
             {
-                rpn_tag_to_sorted_idx.push_back(UINT32_MAX);
+                flat_children.push_back(c);
+            }
+        }
+        n.children = std::move(flat_children);
+    };
+    flatten(root_idx);
+
+    // Step 3: Sort children by selectivity
+    std::function<void(uint32_t)> sort_children = [&](uint32_t idx) {
+        FilterTmpNode &n = tmp[idx];
+        if (n.type == FilterTmpNode::LEAF || n.type == FilterTmpNode::CONSTANT)
+            return;
+        for (uint32_t c : n.children)
+            sort_children(c);
+        // Recompute selectivity after flattening
+        n.selectivity = compute_sel(idx);
+        if (n.op == PlanOp::AND_GROUP)
+        {
+            // Sort ascending — lowest selectivity first
+            std::sort(n.children.begin(), n.children.end(),
+                      [&](uint32_t a, uint32_t b) { return compute_sel(a) < compute_sel(b); });
+        }
+        else
+        {
+            // Sort descending — highest selectivity first
+            std::sort(n.children.begin(), n.children.end(),
+                      [&](uint32_t a, uint32_t b) { return compute_sel(a) > compute_sel(b); });
+        }
+    };
+    sort_children(root_idx);
+
+    // Step 4: Assign leaf_index and serialize
+    uint16_t next_leaf_index = 0;
+    std::function<void(uint32_t)> serialize = [&](uint32_t idx) {
+        const FilterTmpNode &n = tmp[idx];
+        size_t node_pos = plan.nodes.size();
+
+        if (n.type == FilterTmpNode::LEAF)
+        {
+            PlanNode pn;
+            pn.op = n.inverted ? PlanOp::NOT_TAG : PlanOp::TAG;
+            pn.value = n.tag_id;
+            pn.first_child = 0;
+            pn.child_count = 0;
+            pn.leaf_index = next_leaf_index++;
+            pn.selectivity = n.selectivity;
+            plan.nodes.push_back(pn);
+        }
+        else
+        {
+            // Reserve slot for this group node — will fill first_child after children are serialized
+            PlanNode pn;
+            pn.op = n.op;
+            pn.value = 0;
+            pn.first_child = 0;
+            pn.child_count = static_cast<uint16_t>(n.children.size());
+            pn.leaf_index = std::numeric_limits<uint16_t>::max();
+            pn.selectivity = n.selectivity;
+            plan.nodes.push_back(pn);
+
+            // Serialize children
+            uint32_t child_start = static_cast<uint32_t>(plan.children.size());
+            for (size_t ci = 0; ci < n.children.size(); ++ci)
+            {
+                plan.children.push_back(0); // placeholder
+            }
+
+            // Recursively serialize each child, record its node position
+            for (size_t i = 0; i < n.children.size(); ++i)
+            {
+                uint32_t child_node_pos = static_cast<uint32_t>(plan.nodes.size());
+                plan.children[child_start + i] = child_node_pos;
+                serialize(n.children[i]);
+            }
+
+            // Fix up group node's first_child
+            plan.nodes[node_pos].first_child = child_start;
+        }
+    };
+    serialize(root_idx);
+
+    plan.root = 0; // root is always the first serialized node
+    plan.leaf_count = next_leaf_index;
+    plan.valid = (next_leaf_index >= 1);
+
+    // Validate plan integrity once at compile time
+    if (plan.valid)
+    {
+        plan.validated = true;
+        if (plan.root >= plan.nodes.size()) { plan.validated = false; }
+        else
+        {
+            const PlanNode &root = plan.nodes[plan.root];
+            if (root.first_child + root.child_count > plan.children.size())
+                plan.validated = false;
+        }
+        for (uint32_t ci = 0; ci < plan.children.size() && plan.validated; ++ci)
+        {
+            if (plan.children[ci] >= plan.nodes.size())
+                plan.validated = false;
+        }
+        if (!plan.validated)
+        {
+            std::cerr << "[BUG] Plan validation failed: root=" << plan.root
+                      << " nodes=" << plan.nodes.size()
+                      << " children=" << plan.children.size() << std::endl;
+            std::abort();
+        }
+    }
+
+    // Build leaf_to_sorted_idx: map each leaf_index to position in sorted_unique_tag_ids
+    plan.leaf_to_sorted_idx.resize(plan.leaf_count);
+    for (uint32_t i = 0; i < plan.nodes.size(); ++i)
+    {
+        const PlanNode &node = plan.nodes[i];
+        if (node.op != PlanOp::TAG && node.op != PlanOp::NOT_TAG) continue;
+        if (node.leaf_index >= plan.leaf_count) continue;
+        auto it = std::lower_bound(output.sorted_unique_tag_ids.begin(),
+                                   output.sorted_unique_tag_ids.end(),
+                                   node.value);
+        if (it != output.sorted_unique_tag_ids.end() && *it == node.value)
+            plan.leaf_to_sorted_idx[node.leaf_index] =
+                static_cast<uint32_t>(it - output.sorted_unique_tag_ids.begin());
+        else
+            plan.leaf_to_sorted_idx[node.leaf_index] = UINT32_MAX;
+    }
+
+    // Build eval_order: post-order traversal so every group node comes after its children
+    if (plan.valid && plan.root < plan.nodes.size())
+    {
+        plan.eval_order.clear();
+        plan.eval_order.reserve(plan.nodes.size());
+        // Iterative post-order using a small stack
+        struct StackEntry { uint32_t node_idx; uint32_t child_pos; bool visited; };
+        std::vector<StackEntry> stack;
+        stack.push_back({plan.root, 0, false});
+        while (!stack.empty())
+        {
+            StackEntry &top = stack.back();
+            const PlanNode &node = plan.nodes[top.node_idx];
+            if (node.op == PlanOp::TAG || node.op == PlanOp::NOT_TAG || top.visited)
+            {
+                plan.eval_order.push_back(top.node_idx);
+                stack.pop_back();
+                continue;
+            }
+            top.visited = true;
+            const uint32_t child_begin = node.first_child;
+            const uint32_t child_end = child_begin + static_cast<uint32_t>(node.child_count);
+            // Push children in reverse so leftmost child is on top
+            for (uint32_t c = child_end; c > child_begin; --c)
+            {
+                stack.push_back({plan.children[c - 1], 0, false});
             }
         }
     }
+}
+
+
+inline void FilterExp::CompileFrom(std::string_view query_filter)
+{
+    bucket_plan = BucketPlan();
+    sorted_unique_tag_ids.clear();
+    if (query_filter.empty())
+        return;
+
+    // Compile directly to TmpNode tree (no RPN intermediate)
+    std::vector<FilterTmpNode> tmp;
+    uint32_t root_idx = UINT32_MAX;
+    FilterExpCompiler::run(query_filter, tmp, root_idx);
+
+    if (root_idx == UINT32_MAX)
+        return;
+
+    // Build sorted unique tag IDs from TmpNode tree
+    std::vector<uint32_t> all_tags;
+    all_tags.reserve(tmp.size());
+    for (const auto &node : tmp)
+    {
+        if (node.type == FilterTmpNode::LEAF)
+            all_tags.push_back(node.tag_id);
+    }
+
+    radix_sort_dedup_u32(all_tags);
+    sorted_unique_tag_ids = std::move(all_tags);
+
+    // Build BucketPlan from TmpNode tree
+    BuildBucketPlan(*this, tmp, root_idx);
 }

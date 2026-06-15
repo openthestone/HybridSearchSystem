@@ -1,10 +1,28 @@
 cmake_minimum_required(VERSION 3.16)
 project(HybridRetrievalSystem)
 
+# Suppress CMake unused-variable warnings from CANN's internal subprojects
+set(CMAKE_SUPPRESS_DEVELOPER_WARNINGS ON CACHE BOOL "" FORCE)
+
 # --- 1. 核心参数 ---
 set(RUN_MODE "npu" CACHE STRING "run mode" FORCE)
-set(SOC_VERSION "Ascend910B3" CACHE STRING "system on chip type" FORCE)
-set(ASCEND_CANN_PACKAGE_PATH "/usr/local/Ascend/ascend-toolkit/latest" CACHE PATH "ASCEND CANN package path")
+set(SOC_VERSION "Ascend910B3" CACHE STRING "system on chip type")
+# Auto-detect CANN toolkit path if not specified
+if(NOT DEFINED ASCEND_CANN_PACKAGE_PATH)
+    set(_CANN_CANDIDATES
+        "/usr/local/Ascend/ascend-toolkit/latest"
+        "/home/lcy/Ascend/ascend-toolkit/latest"
+    )
+    foreach(_dir ${_CANN_CANDIDATES})
+        if(IS_DIRECTORY "${_dir}")
+            set(ASCEND_CANN_PACKAGE_PATH "${_dir}" CACHE PATH "ASCEND CANN package path")
+            break()
+        endif()
+    endforeach()
+    if(NOT DEFINED ASCEND_CANN_PACKAGE_PATH)
+        message(FATAL_ERROR "CANN toolkit not found. Pass -DASCEND_CANN_PACKAGE_PATH=...")
+    endif()
+endif()
 
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE "Release" CACHE STRING "Build type Release/Debug" FORCE)
@@ -12,31 +30,25 @@ endif()
 
 # 分析专用构建：保留符号、保留帧指针、关闭LTO，便于 FlameGraph 展开函数栈。
 option(ENABLE_PROFILING_BUILD "Use profiling-friendly flags for better stack visibility" OFF)
+option(ENABLE_ASAN "Enable AddressSanitizer" OFF)
 
 if(CMAKE_INSTALL_PREFIX STREQUAL /usr/local)
     set(CMAKE_INSTALL_PREFIX "${CMAKE_CURRENT_LIST_DIR}/out" CACHE STRING "path for install()" FORCE)
 endif()
-# 设置 C++ 标准 
+# 设置 C++ 标准
 set(CMAKE_CXX_STANDARD 17)
 find_package(Threads REQUIRED)
 find_package(OpenMP REQUIRED)
 
-# ================= 新增部分 =================
-# 1. 显式添加 /usr/local 到查找路径（防止系统默认未包含）
+# --- 1b. 查找依赖包 ---
 list(APPEND CMAKE_PREFIX_PATH "/usr/local")
 
 find_package(gflags REQUIRED)
 find_package(glog REQUIRED)
-
-# 强制将 /usr/local 的库目录加入链接阶段的搜索路径
-link_directories(/usr/local/lib /usr/local/lib64)
-
-# 2. 查找 Folly 及其依赖包
 find_package(folly CONFIG REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(BLAS REQUIRED)
 find_package(fmt REQUIRED)
-# ================= END =================
 
 if(ENABLE_PROFILING_BUILD)
     message(STATUS "ENABLE_PROFILING_BUILD=ON: using flamegraph-friendly compile/link flags")
@@ -45,9 +57,21 @@ endif()
 
 # --- 2. 算子文件路径 ---
 set(DEVICE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/include/NPU/device")
-file(GLOB KERNEL_FILES 
-    "${DEVICE_DIR}/kernel_vector_mmad_op.cpp"
+set(KERNEL_FILES "${DEVICE_DIR}/kernel_vector_mmad_op.cpp")
+
+# --- 2b. AI CPU mask filter kernel (pure C++ .so) ---
+set(AICPU_KERNEL_SRC "${CMAKE_CURRENT_SOURCE_DIR}/include/NPU/aicpu_mask_filter_kernel.cpp")
+set(AICPU_KERNEL_SO "${CMAKE_CURRENT_BINARY_DIR}/libcust_aicpu_kernels_sks_final.so")
+
+add_custom_command(
+    OUTPUT ${AICPU_KERNEL_SO}
+    COMMAND ${CMAKE_CXX_COMPILER} -shared -fPIC -o ${AICPU_KERNEL_SO}
+            ${AICPU_KERNEL_SRC}
+            -D_GLIBCXX_USE_CXX11_ABI=0 -std=c++17 -O2
+    DEPENDS ${AICPU_KERNEL_SRC}
+    COMMENT "Building AI CPU mask filter kernel .so"
 )
+add_custom_target(aicpu_mask_filter_kernel ALL DEPENDS ${AICPU_KERNEL_SO})
 
 # --- 3. NPU 构建逻辑 ---
 if(NOT EXISTS ${ASCEND_CANN_PACKAGE_PATH}/tools/tikcpp/ascendc_kernel_cmake)
@@ -76,18 +100,26 @@ function(configure_host_target target_name source_file)
         ${ASCEND_CANN_PACKAGE_PATH}/include
     )
 
-    if(ENABLE_PROFILING_BUILD)
+    add_dependencies(${target_name} aicpu_mask_filter_kernel)
+
+    if(ENABLE_ASAN)
+        target_compile_options(${target_name} PRIVATE
+            -O1 -g -fno-omit-frame-pointer -fsanitize=address -fno-lto
+            -std=c++17 -D_GLIBCXX_USE_CXX11_ABI=0
+            -Wall -Wno-unknown-pragmas -Wno-sign-compare -Wno-alloc-size-larger-than -march=armv8-a
+        )
+        target_link_options(${target_name} PRIVATE -fsanitize=address -fno-lto)
+    elseif(ENABLE_PROFILING_BUILD)
         target_compile_options(${target_name} PRIVATE
             -O2 -g -fno-omit-frame-pointer -fno-optimize-sibling-calls
             -fno-lto -std=c++17 -D_GLIBCXX_USE_CXX11_ABI=0
-            -Wall -Wno-unknown-pragmas -Wno-sign-compare -march=armv8-a
+            -Wall -Wno-unknown-pragmas -Wno-sign-compare -Wno-alloc-size-larger-than -march=armv8-a
         )
         target_link_options(${target_name} PRIVATE -fno-lto)
     else()
-        # 注意：保留了 -D_GLIBCXX_USE_CXX11_ABI=0 以兼容 CANN
         target_compile_options(${target_name} PRIVATE
             -Ofast -flto -std=c++17 -D_GLIBCXX_USE_CXX11_ABI=0
-            -Wall -Wno-unknown-pragmas -march=armv8-a -Wno-sign-compare
+            -Wall -Wno-unknown-pragmas -Wno-alloc-size-larger-than -march=armv8-a -Wno-sign-compare
         )
         target_link_options(${target_name} PRIVATE -flto -Ofast)
     endif()
@@ -96,6 +128,7 @@ function(configure_host_target target_name source_file)
     target_link_libraries(${target_name} PRIVATE
         ascendc_kernels_${RUN_MODE}
         ascendcl
+        acl_op_compiler
         dl
         pthread
         OpenMP::OpenMP_CXX
@@ -118,6 +151,9 @@ configure_host_target(analyze_t8 src/analyze_t8.cpp)
 # --- 7. 安装 ---
 install(TARGETS serial parallel analyze_t1 analyze_t2 analyze_t3 analyze_t8 DESTINATION bin)
 install(TARGETS ascendc_kernels_${RUN_MODE} DESTINATION lib)
+
+# Install AI CPU kernel .so to build output (run.sh deploys to CANN vendor)
+install(FILES ${AICPU_KERNEL_SO} DESTINATION bin)
 
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/config.txt")
     install(FILES config.txt DESTINATION bin)

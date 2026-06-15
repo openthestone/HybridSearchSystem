@@ -10,6 +10,7 @@
 #include <random>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -25,128 +26,70 @@ namespace fs = RunSupport::fs;
 
 namespace
 {
-bool LoadPreparedQueriesFromFvec(const std::vector<std::string> &query_paths,
-                                 int expected_dim,
-                                 int default_top_k,
-                                 std::vector<DataReader::PreparedQuery> &queries,
-                                 std::string &loaded_path)
+bool ParseConfigStringValue(const std::string &config_file,
+                            const std::string &target_key,
+                            std::string &value_out)
 {
-    queries.clear();
-    loaded_path.clear();
-
-    if (expected_dim < 64 || default_top_k <= 0)
+    std::ifstream file(config_file);
+    if (!file.is_open())
     {
         return false;
     }
 
-    auto append_query = [&](const float *raw, int source_dim, size_t line_no) {
-        DataReader::PreparedQuery q;
-        q.query_vec.assign(static_cast<size_t>(expected_dim), 0.0f);
-        const int copy_dim = std::min<int>(64, std::min<int>(expected_dim, source_dim));
-        for (int d = 0; d < copy_dim; ++d)
-        {
-            q.query_vec[static_cast<size_t>(d)] = raw[static_cast<size_t>(d)];
-        }
-        q.filter_expr = "";
-        q.top_k = default_top_k;
-        q.line_no = line_no;
-        queries.push_back(std::move(q));
-    };
-
-    for (const auto &path : query_paths)
+    std::string line;
+    while (std::getline(file, line))
     {
-        std::ifstream in(path, std::ios::binary);
-        if (!in)
+        StripConfigComment(line);
+        line = ParamTrim(line);
+        if (line.empty())
         {
             continue;
         }
 
-        in.seekg(0, std::ios::end);
-        const std::streamoff file_size = in.tellg();
-        in.seekg(0, std::ios::beg);
-        if (file_size < static_cast<std::streamoff>(sizeof(int32_t) * 2))
+        const size_t equal_pos = line.find('=');
+        if (equal_pos == std::string::npos)
         {
             continue;
         }
 
-        int32_t first = 0;
-        int32_t second = 0;
-        in.read(reinterpret_cast<char *>(&first), sizeof(int32_t));
-        in.read(reinterpret_cast<char *>(&second), sizeof(int32_t));
-        if (!in)
+        const std::string key = ParamTrim(line.substr(0, equal_pos));
+        if (key != target_key)
         {
             continue;
         }
 
-        const std::streamoff headered_bytes = static_cast<std::streamoff>(sizeof(int32_t) * 2) +
-                                              static_cast<std::streamoff>(first) * static_cast<std::streamoff>(second) *
-                                                  static_cast<std::streamoff>(sizeof(float));
-
-        if (first > 0 && second >= 64 && file_size == headered_bytes)
+        std::string parsed_value;
+        if (!ParseConfigString(line.substr(equal_pos + 1), parsed_value))
         {
-            const int32_t rows = first;
-            const int32_t source_dim = second;
-            std::vector<float> raw(static_cast<size_t>(source_dim));
-            queries.clear();
-            queries.reserve(static_cast<size_t>(rows));
-            for (int32_t i = 0; i < rows; ++i)
-            {
-                in.read(reinterpret_cast<char *>(raw.data()),
-                        static_cast<std::streamsize>(raw.size() * sizeof(float)));
-                if (!in)
-                {
-                    queries.clear();
-                    break;
-                }
-                append_query(raw.data(), source_dim, static_cast<size_t>(i + 1));
-            }
-            if (!queries.empty())
-            {
-                loaded_path = path;
-                return true;
-            }
-            continue;
+            return false;
         }
-
-        in.clear();
-        in.seekg(0, std::ios::beg);
-        queries.clear();
-        size_t line_no = 0;
-        while (true)
-        {
-            int32_t dim = 0;
-            in.read(reinterpret_cast<char *>(&dim), sizeof(int32_t));
-            if (!in)
-            {
-                break;
-            }
-            if (dim < 64)
-            {
-                queries.clear();
-                break;
-            }
-
-            std::vector<float> raw(static_cast<size_t>(dim));
-            in.read(reinterpret_cast<char *>(raw.data()),
-                    static_cast<std::streamsize>(raw.size() * sizeof(float)));
-            if (!in)
-            {
-                queries.clear();
-                break;
-            }
-
-            ++line_no;
-            append_query(raw.data(), dim, line_no);
-        }
-
-        if (!queries.empty())
-        {
-            loaded_path = path;
-            return true;
-        }
+        value_out = parsed_value;
+        return true;
     }
 
     return false;
+}
+
+void RestoreSrcStyleRelativePathsFromConfig(const std::string &config_file)
+{
+    auto restore_path = [&](const std::string &key, std::string &target) {
+        std::string raw_value;
+        if (ParseConfigStringValue(config_file, key, raw_value))
+        {
+            target = raw_value;
+        }
+    };
+
+    restore_path("dataset_cache_file", dataset_cache_file);
+    restore_path("tag_map_cache_file", tag_map_cache_file);
+    restore_path("query_file", query_file);
+    restore_path("query_result_root", query_result_root);
+    restore_path("ground_truth_cache_file", ground_truth_cache_file);
+    restore_path("bucket_ivf_index_file", bucket_ivf_index_file);
+    restore_path("bucket_index_file", bucket_index_file);
+    restore_path("raw_vector_file", raw_vector_file);
+    restore_path("raw_attr_dir", raw_attr_dir);
+    restore_path("raw_query_file", raw_query_file);
 }
 
 bool WriteProcessRoundCountFile(const fs::path &output_file,
@@ -407,111 +350,88 @@ struct DeferredMetricFiles
 } // namespace
 
 int main() {
-    constexpr int kDefaultTopK = 100;
-    constexpr int QueryNum = 10000;
-    constexpr const char *kDatasetFile = "../../dataset_HW.bin";
-    const std::vector<std::string> kQueryPaths = {
-        "datasets/hw_queries.fvecs",
-        "../datasets/hw_queries.fvecs",
-        "../../datasets/hw_queries.fvecs",
-        "../../../datasets/hw_queries.fvecs"
-    };
-    // constexpr const char *kDatasetFile = "../../dataset_DEEP.bin";
-    // const std::vector<std::string> kQueryPaths = {
-    //     "queries/deep1B_queries.fvecs",
-    //     "../queries/deep1B_queries.fvecs",
-    //     "../../queries/deep1B_queries.fvecs",
-    //     "../../../queries/deep1B_queries.fvecs"
-    // };
-
     const fs::path config_path = RunSupport::ResolveConfigPath();
     std::cout << "[System] Loading config from " << config_path << "...\n";
     if (!LoadParams(config_path.string(), ResourceConfigProfile::Serial)) {
         std::cerr << "[Error] Failed to load config: " << config_path << "\n";
         return -1;
     }
+    RestoreSrcStyleRelativePathsFromConfig(config_path.string());
+
     const fs::path query_result_root_dir =
         query_result_root.empty() ? fs::path(".") : fs::path(query_result_root);
     const fs::path memory_log_file = query_result_root_dir / "log" / "memory_logs.txt";
 
     std::cout << "[Loader] Loading dataset cache...\n";
     DataReader::DatasetBuffers dataset_buffers;
-    if (!DataReader::LoadDatasetCache(kDatasetFile, dataset_buffers)) {
-        std::cerr << "[Fatal] Failed to load dataset cache: " << kDatasetFile << "\n";
+    std::unordered_map<std::string, int> tag_map;
+    if (!DataReader::EnsureDatasetAndTagMapCaches(dataset_buffers, tag_map)) {
+        std::cerr << "[Fatal] Failed to prepare dataset/tag-map caches.\n";
         return -1;
     }
     std::cout << "[Loader] Dataset loaded. Docs=" << total_doc_num
               << ", Dim=" << vector_dim
               << ", Tags=" << total_tag_num
               << ", Buckets(Level1)=" << total_bucket_num_level_1 << "\n";
+    std::cout << "[Loader] tag_map loaded. size=" << tag_map.size() << "\n";
 
     std::cout << "[Loader] Loading queries...\n";
-    std::vector<DataReader::PreparedQuery> queries;
-    std::string loaded_query_path;
-    if (!LoadPreparedQueriesFromFvec(kQueryPaths,
-                                     vector_dim,
-                                     kDefaultTopK,
-                                     queries,
-                                     loaded_query_path)) {
-        std::cerr << "[Fatal] Failed to read queries from deep1B_queries.fvecs\n";
+    if (!DataReader::EnsurePreparedQueryFile()) {
+        std::cerr << "[Fatal] Failed to prepare query file: " << query_file << "\n";
         return -1;
     }
-    std::cout << "[Loader] Queries loaded from " << loaded_query_path << "\n";
+
+    std::vector<DataReader::PreparedQuery> queries;
+    std::vector<std::string> query_warnings;
+    DataReader::QueryLoadDiagnostics query_load_diagnostics;
+    DataReader::LoadFailureReason query_failure = DataReader::LoadFailureReason::None;
+    if (!DataReader::LoadPreparedQueries(query_file,
+                                         tag_map,
+                                         vector_dim,
+                                         queries,
+                                         query_warnings,
+                                         &query_load_diagnostics,
+                                         &query_failure)) {
+        if (query_failure != DataReader::LoadFailureReason::VectorDimMismatch) {
+            std::cerr << "[Fatal] Failed to read query file: " << query_file << "\n";
+        }
+        return -1;
+    }
+    if (!RunSupport::WriteQueryLoadDiagnosticsFiles(query_result_root_dir, query_load_diagnostics)) {
+        std::cerr << "[Fatal] Failed to write query load diagnostics under "
+                  << (query_result_root_dir / "log") << "\n";
+        return -1;
+    }
+    if (!RunSupport::WritePreparedQueryFilterFile(query_result_root_dir, queries)) {
+        std::cerr << "[Fatal] Failed to write query boolean filters under "
+                  << (query_result_root_dir / "log") << "\n";
+        return -1;
+    }
+
+    for (const auto &w : query_warnings) {
+        std::cout << "[Warn] " << w << "\n";
+    }
 
     if (queries.empty()) {
-        std::cout << "[Info] No valid query found in " << loaded_query_path << ".\n";
+        std::cout << "[Info] No valid query found in " << query_file << ".\n";
         return 0;
     }
-    std::cout << "[Loader] Prepared query count from file: " << queries.size() << "\n";
 
-    // Truncate or expand to QueryNum using round-robin from loaded queries
-    if (static_cast<int>(queries.size()) > QueryNum) {
-        queries.resize(static_cast<size_t>(QueryNum));
-    } else {
-        const size_t base = queries.size();
-        queries.reserve(static_cast<size_t>(QueryNum));
-        for (size_t i = base; i < static_cast<size_t>(QueryNum); ++i) {
-            queries.push_back(queries[i % base]);
-        }
-    }
-    std::cout << "[Loader] Final query count: " << queries.size() << " (QueryNum=" << QueryNum << ")\n";
-
-    // Load filter expressions: read all from file, random assign to queries
+    // 1-query mode: duplicate first query 10000 times
     {
-        std::vector<std::string> filter_exprs;
-        const fs::path filter_expr_path = config_path.has_parent_path()
-                                              ? (config_path.parent_path() / "filter_expr_600.txt")
-                                              : fs::path("filter_expr_600.txt");
-        {
-            std::ifstream fexpr_file(filter_expr_path);
-            std::string line;
-            while (std::getline(fexpr_file, line)) {
-                if (!line.empty()) {
-                    filter_exprs.push_back(line);
-                }
-            }
+        DataReader::PreparedQuery first_q = std::move(queries[0]);
+        queries.clear();
+        queries.resize(10000, first_q);
+        for (size_t i = 0; i < queries.size(); ++i) {
+            queries[i].line_no = i + 1;
         }
-        if (filter_exprs.empty()) {
-            std::cerr << "[Warn] filter_expr.txt not found or empty at " << filter_expr_path
-                      << ". Using empty filters for all queries.\n";
-        }
-
-        if (!filter_exprs.empty()) {
-            std::mt19937 rng(42);
-            std::uniform_int_distribution<size_t> dist(0, filter_exprs.size() - 1);
-            for (size_t i = 0; i < queries.size(); ++i) {
-                queries[i].filter_expr = filter_exprs[dist(rng)];
-            }
-        }
-        std::cout << "[Loader] Assigned " << filter_exprs.size()
-                  << " filter expressions to " << queries.size() << " queries (random, seed=42)\n";
     }
+    std::cout << "[Loader] 1-query mode: first query duplicated to " << queries.size() << "\n";
 
     if (!RunSupport::ValidatePreparedQueriesAgainstPrealloc(queries)) {
         return -1;
     }
     FilterExpCompiler::WarmUpThreadLocalBuffers();
-
     auto deferred_metric_files = std::make_unique<DeferredMetricFiles>(queries.size());
     MemoryEventLogCollector memory_log_collector(memory_events_log_enable != 0);
     if (memory_events_log_enable != 0) {
@@ -564,7 +484,6 @@ int main() {
     const size_t loaded_l2_count = bucket_doc_offsets.size() - 1;
     total_bucket_num_level_2 = static_cast<int>(loaded_l2_count);
 
-    // centroids.bin now contains per-L2 centroids
     if (dataset_buffers.centroids.size() != loaded_l2_count * static_cast<size_t>(vector_dim))
     {
         std::cerr << "[Fatal] Invalid clustering output: centroids size mismatch. Expected "
@@ -573,7 +492,6 @@ int main() {
         return -1;
     }
 
-    // Build L2 bucket doc table directly from loaded data
     BucketDocTable l2_bucket_doc_table;
     try
     {
@@ -586,7 +504,6 @@ int main() {
         return -1;
     }
 
-    // Construct TwoLevelBucketLayout with L2 data directly (L1 is degenerate: 1 group)
     TwoLevelBucketLayout bucket_layout;
     bucket_layout.level_1_bucket_doc_table.resize(1);
     bucket_layout.level_1_bucket_doc_table[0].reserve(loaded_l2_count);
@@ -607,6 +524,8 @@ int main() {
               << bucket_layout.Level2BucketCount() << "\n";
 
     InputDataset dataset = DataReader::BuildInputDataset(dataset_buffers);
+    dataset.bucket_centroids = dataset_buffers.centroids.data();
+
     if (!g_l2_to_l0_map.empty() && static_cast<int>(g_l2_to_l0_map.size()) == total_bucket_num_level_2)
     {
         dataset.l1_to_l0_map = g_l2_to_l0_map.data();
@@ -619,13 +538,10 @@ int main() {
     }
 
     std::cout << "[System] Initializing DataBaseCPU...\n";
-
-    // Scope: all NPU-dependent objects must destruct before aclFinalize.
-    {
+    { // NPU scope: db, groups, scheduler must destruct before aclFinalize
     DataBaseCPU db(dataset, std::move(bucket_layout));
 
     std::cout << "[System] Launching worker threads...\n";
-
     Scheduler scheduler;
     std::vector<std::unique_ptr<WorkerGroup>> groups;
     for (int i = 0; i < group_count; ++i) {
@@ -819,7 +735,6 @@ int main() {
         std::cerr << "[Fatal] Failed to write " << memory_log_file << ".\n";
         return -1;
     }
-
     } // end NPU scope: groups, scheduler, db destruct here (releases pinned memory)
 
     std::cout << "[System] NPU scope ended. Calling aclFinalize...\n";

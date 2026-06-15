@@ -211,7 +211,7 @@ private:
     AscendC::GlobalTensor<half> aGM;
     AscendC::GlobalTensor<half> bGM;
     AscendC::GlobalTensor<float> cGM;
-    
+
     // 动态维度
     uint32_t m, k, n;
     uint32_t aSize, bSize, cSize;

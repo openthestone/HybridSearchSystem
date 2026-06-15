@@ -9,11 +9,24 @@
 #include <mutex>
 #include <vector>
 #include "acl/acl.h"
+#include "acl/acl_op.h"
+#include "acl/acl_op_compiler.h"
 #include "utils/DataReader.h"
 #include "NPU/BatchTask.h" //避免acl头文件污染
 
 // 引用内核启动头文件
 #include "aclrtlaunch_kernel_vector_mmad.h"
+
+// MaskFilterTask must match the definition in kernel_mask_filter_op.h
+// but is redeclared here to avoid including kernel_operator.h in host code.
+struct MaskFilterTask {
+    uint64_t scores_offset;
+    uint64_t mask_offset;
+    uint64_t output_offset;
+    uint64_t index_offset;
+    uint32_t doc_num;
+    uint32_t mask_words;
+};
 
 namespace npuAPI
 {
@@ -60,6 +73,15 @@ namespace npuAPI
         void *d_query_ws = nullptr;   //存放查询向量
         void *d_result_ws = nullptr;  //存放计算结果
         void *d_task_ws = nullptr;    // 存放CPU发来的BatchTaskData 数组（比如有200个element）
+        void *d_l0_cache = nullptr;   // L0 分数 HBM 缓冲区（跨轮次持久化，按需选择性 D2H）
+        size_t l0_cache_write_offset = 0; // 当前写入偏移（跨 LaunchL0BatchKernel 调用累加）
+
+        // Mask filter kernel buffers
+        void *d_mf_mask = nullptr;    // H2D mask bitmap destination
+        void *d_mf_output = nullptr;  // compact scores output (float per match)
+        void *d_mf_index = nullptr;   // compact local-doc-idx output (uint32 per match)
+        void *d_mf_count = nullptr;   // per-block match count (uint32 per block)
+        void *d_mf_task = nullptr;    // MaskFilterTask array
 
         // --- Flag 同步资源 ---
         uint32_t *h_flags[kGroupFlagSlotCount] = {}; // Host 侧 Flag 槽位 (Pinned Memory)
@@ -90,6 +112,16 @@ namespace npuAPI
     static bool g_initialized = false;
     static std::mutex g_debug_log_mutex;
     static std::atomic<uint64_t> g_debug_batch_counter{0};
+    static size_t g_total_stored_docs = 0;
+    static int g_total_bucket_num_level_2 = 0;
+
+    // Precomputed per-bucket tile data (offset_A and m fixed at Init; offset_C patched at launch)
+    struct PrecomputedBucket {
+        size_t task_offset;     // start index in g_precomputed_tasks
+        uint32_t tile_count;    // number of tiles for this bucket
+    };
+    static std::vector<BatchTaskData> g_precomputed_tasks;
+    static std::vector<PrecomputedBucket> g_precomputed_buckets;
 
     namespace
     {
@@ -146,7 +178,7 @@ namespace npuAPI
             const uint32_t row_tile = GetKernelRowTile();
             const size_t max_tiles_per_bucket =
                 (static_cast<size_t>(max_doc_per_bucket_level_2) + row_tile - 1) / row_tile;
-            return static_cast<size_t>(max_process_bucket_num_level_2) * max_tiles_per_bucket;
+            return static_cast<size_t>(g_total_bucket_num_level_2) * max_tiles_per_bucket;
         }
 
         void LogAclCleanupError(const char *op, aclError ret, int device_id, int group_id = -1)
@@ -234,6 +266,7 @@ namespace npuAPI
         g_devices.resize(npu_device_count);
         g_group_ctxs.resize(group_count);
         g_bucket_metas.resize(total_bucket_num_level_2);
+        g_total_bucket_num_level_2 = total_bucket_num_level_2;
 
         auto ret = aclInit(nullptr);
         if (ret != ACL_SUCCESS)
@@ -251,6 +284,7 @@ namespace npuAPI
         {
             total_stored_docs += bucket_docs.size();
         }
+        g_total_stored_docs = total_stored_docs;
 
         if (npu_debug_verify != 0)
         {
@@ -294,21 +328,55 @@ namespace npuAPI
         }
         //  (f32toFp16数据转换结束)
 
+        // Precompute BatchTaskData templates for all buckets (offset_A and m are fixed)
+        {
+            const uint32_t row_tile = GetKernelRowTile();
+            g_precomputed_buckets.resize(total_bucket_num_level_2);
+            size_t total_tiles = 0;
+            for (int bid = 0; bid < total_bucket_num_level_2; ++bid)
+            {
+                g_precomputed_buckets[bid].task_offset = total_tiles;
+                uint32_t doc_num = g_bucket_metas[bid].doc_num;
+                uint32_t tiles = (doc_num + row_tile - 1) / row_tile;
+                g_precomputed_buckets[bid].tile_count = tiles;
+                total_tiles += tiles;
+            }
+            g_precomputed_tasks.resize(total_tiles);
+            size_t pc = 0;
+            for (int bid = 0; bid < total_bucket_num_level_2; ++bid)
+            {
+                auto &meta = g_bucket_metas[bid];
+                for (uint32_t row_begin = 0; row_begin < meta.doc_num; row_begin += row_tile)
+                {
+                    uint32_t tile_rows = std::min(row_tile, meta.doc_num - row_begin);
+                    g_precomputed_tasks[pc].offset_A =
+                        meta.byte_offset + static_cast<size_t>(row_begin) * static_cast<size_t>(vector_dim) * sizeof(uint16_t);
+                    g_precomputed_tasks[pc].offset_C = 0;
+                    g_precomputed_tasks[pc].m = tile_rows;
+                    g_precomputed_tasks[pc].reserved = 0;
+                    ++pc;
+                }
+            }
+            std::cout << "[NPU] PrecomputedTasks=" << total_tiles << std::endl;
+        }
+
         size_t total_bytes = total_elements * sizeof(uint16_t);
         std::cout << "[NPU] StoredDocRefs=" << total_stored_docs
                   << ", HBMVectorBytesPerDevice=" << total_bytes
                   << std::endl;
-        uint32_t max_docs_in_batch =
-            static_cast<uint32_t>(max_process_bucket_num_level_2 * max_doc_per_bucket_level_2);
 
         size_t ws_query_size =
             static_cast<size_t>(vector_dim) * kKernelResultCols * sizeof(uint16_t); // 每个query向量都要padding到[k,16]
 
         // 结果按紧凑 [doc_num, 1] 布局写回（Fixpipe nSize=1 仅输出 column 0）。
-        size_t ws_result_size = max_docs_in_batch * sizeof(float);
+        // 使用 total_stored_docs 支持单次 merged launch 处理整轮所有文档
+        size_t ws_result_size = total_stored_docs * sizeof(float);
+        // L0 cache needs extra padding: each bucket's area is rounded up to 32B
+        size_t ws_l0_cache_size = ws_result_size + static_cast<size_t>(g_total_bucket_num_level_2) * 32;
 
         // Task Workspace: 一个 bucket 可能被拆成多个 row-tile task。
-        size_t ws_task_size = GetMaxKernelTasksPerBatch() * sizeof(BatchTaskData);
+        size_t max_total_tasks = (total_stored_docs + GetKernelRowTile() - 1) / GetKernelRowTile();
+        size_t ws_task_size = max_total_tasks * sizeof(BatchTaskData);
 
         for (int dev_id = npu_device_id_start; dev_id < npu_device_id_start + npu_device_count; ++dev_id)
         {
@@ -327,6 +395,22 @@ namespace npuAPI
                 aclrtMalloc(&g_group_ctxs[group_id].d_query_ws, ws_query_size, ACL_MEM_MALLOC_HUGE_FIRST);
                 aclrtMalloc(&g_group_ctxs[group_id].d_result_ws, ws_result_size, ACL_MEM_MALLOC_HUGE_FIRST);
                 aclrtMalloc(&g_group_ctxs[group_id].d_task_ws, ws_task_size, ACL_MEM_MALLOC_HUGE_FIRST);
+                aclrtMalloc(&g_group_ctxs[group_id].d_l0_cache, ws_l0_cache_size, ACL_MEM_MALLOC_HUGE_FIRST);
+
+                // Mask filter kernel buffers
+                {
+                    size_t mf_max_mask_bytes = ((total_stored_docs + 63) / 64) * sizeof(uint64_t);
+                    size_t mf_max_output_bytes = total_stored_docs * sizeof(float);
+                    size_t mf_max_index_bytes = total_stored_docs * sizeof(uint32_t);
+                    size_t mf_max_count_bytes = static_cast<size_t>(g_total_bucket_num_level_2) * sizeof(uint32_t);
+                    size_t mf_max_task_bytes = sizeof(uint64_t) + static_cast<size_t>(g_total_bucket_num_level_2) * sizeof(MaskFilterTask);
+
+                    aclrtMalloc(&g_group_ctxs[group_id].d_mf_mask, mf_max_mask_bytes, ACL_MEM_MALLOC_HUGE_FIRST);
+                    aclrtMalloc(&g_group_ctxs[group_id].d_mf_output, mf_max_output_bytes, ACL_MEM_MALLOC_HUGE_FIRST);
+                    aclrtMalloc(&g_group_ctxs[group_id].d_mf_index, mf_max_index_bytes, ACL_MEM_MALLOC_HUGE_FIRST);
+                    aclrtMalloc(&g_group_ctxs[group_id].d_mf_count, mf_max_count_bytes, ACL_MEM_MALLOC_HUGE_FIRST);
+                    aclrtMalloc(&g_group_ctxs[group_id].d_mf_task, mf_max_task_bytes, ACL_MEM_MALLOC_HUGE_FIRST);
+                }
 
                 // --- Flag 资源初始化 ---
                 for (int slot_id = 0; slot_id < kGroupFlagSlotCount; ++slot_id)
@@ -347,6 +431,8 @@ namespace npuAPI
             aclrtMalloc(&g_devices[local_idx].dev_base_addr, total_bytes, ACL_MEM_MALLOC_HUGE_FIRST);
             aclrtMemcpy(g_devices[local_idx].dev_base_addr, total_bytes, host_buffer.data(), total_bytes, ACL_MEMCPY_HOST_TO_DEVICE);
         }
+
+        InitMaskFilterOp();
         g_initialized = true;
     }
 
@@ -355,6 +441,11 @@ namespace npuAPI
         int dev_idx = g_group_to_device[group_id];
         int stream_idx = g_group_to_stream[group_id];
         return g_devices[dev_idx].streams[stream_idx];
+    }
+
+    void ResetL0CacheOffset(int group_id)
+    {
+        g_group_ctxs[group_id].l0_cache_write_offset = 0;
     }
 
     void UploadQuery(const float *query_vector,
@@ -434,7 +525,6 @@ namespace npuAPI
         return false;
     }
 
-    void SynchronizeStream(Stream s) { aclrtSynchronizeStream(s); }   //优化后这个函数不再被使用
     void Finalize()
     {
         if (!g_acl_initialized)
@@ -496,7 +586,13 @@ namespace npuAPI
                     FreeDeviceBuffer(group.d_query_ws, "aclrtFree(d_query_ws)", device_id, group_id);
                     FreeDeviceBuffer(group.d_result_ws, "aclrtFree(d_result_ws)", device_id, group_id);
                     FreeDeviceBuffer(group.d_task_ws, "aclrtFree(d_task_ws)", device_id, group_id);
+                    FreeDeviceBuffer(group.d_l0_cache, "aclrtFree(d_l0_cache)", device_id, group_id);
                     FreeDeviceBuffer(group.d_flag_zero, "aclrtFree(d_flag_zero)", device_id, group_id);
+                    FreeDeviceBuffer(group.d_mf_mask, "aclrtFree(d_mf_mask)", device_id, group_id);
+                    FreeDeviceBuffer(group.d_mf_output, "aclrtFree(d_mf_output)", device_id, group_id);
+                    FreeDeviceBuffer(group.d_mf_index, "aclrtFree(d_mf_index)", device_id, group_id);
+                    FreeDeviceBuffer(group.d_mf_count, "aclrtFree(d_mf_count)", device_id, group_id);
+                    FreeDeviceBuffer(group.d_mf_task, "aclrtFree(d_mf_task)", device_id, group_id);
                 }
                 for (int slot_id = 0; slot_id < kGroupFlagSlotCount; ++slot_id)
                 {
@@ -560,7 +656,8 @@ namespace npuAPI
     void LaunchBatchKernel(Stream stream,
                            const std::vector<uint32_t> &bucket_ids,
                            float *host_output_buffer,
-                           int group_id)
+                           int group_id,
+                           const std::vector<size_t> *bucket_result_offsets_bytes)
     {
         int local_idx = g_group_to_device[group_id];
 
@@ -569,40 +666,54 @@ namespace npuAPI
         void *dev_base_doc = g_devices[local_idx].dev_base_addr;
         void *dev_base_result = g_group_ctxs[group_id].d_result_ws;
 
-        // 1. Prepare Task Data (compact offset_C layout)
+        // 1. Prepare Task Data using precomputed templates
         static thread_local std::vector<BatchTaskData> h_tasks;
-        h_tasks.clear();
-        h_tasks.reserve(GetMaxKernelTasksPerBatch());
-        const uint32_t kernel_row_tile = GetKernelRowTile();
+        static thread_local std::vector<size_t> bucket_res_offsets;
+        bucket_res_offsets.clear();
+        bucket_res_offsets.reserve(bucket_ids.size());
 
+        const uint32_t kernel_row_tile = GetKernelRowTile();
+        size_t total_tiles = 0;
         size_t current_res_offset = 0;
 
-        for (uint32_t bid : bucket_ids)
+        // Pass 1: compute per-bucket result offsets and total tile count
+        for (size_t i = 0; i < bucket_ids.size(); ++i)
         {
-            auto &meta = g_bucket_metas[bid];
-            if (meta.doc_num == 0)
-            {
-                continue;
-            }
-
-            for (uint32_t row_begin = 0; row_begin < meta.doc_num; row_begin += kernel_row_tile)
-            {
-                const uint32_t tile_rows = std::min<uint32_t>(kernel_row_tile, meta.doc_num - row_begin);
-                BatchTaskData task;
-                task.offset_A = static_cast<uint64_t>(meta.byte_offset) +
-                                static_cast<size_t>(row_begin) * static_cast<size_t>(vector_dim) * sizeof(uint16_t);
-                // Compact offset_C: kernel outputs only column 0 (stride-1)
-                task.offset_C = static_cast<uint64_t>(current_res_offset) +
-                                static_cast<size_t>(row_begin) * sizeof(float);
-                task.m = tile_rows;
-                h_tasks.push_back(task);
-            }
-            current_res_offset +=
-                static_cast<size_t>(meta.doc_num) * sizeof(float);
+            uint32_t bid = bucket_ids[i];
+            size_t off = bucket_result_offsets_bytes
+                             ? (*bucket_result_offsets_bytes)[i]
+                             : current_res_offset;
+            bucket_res_offsets.push_back(off);
+            total_tiles += g_precomputed_buckets[bid].tile_count;
+            if (!bucket_result_offsets_bytes)
+                current_res_offset += static_cast<size_t>(g_bucket_metas[bid].doc_num) * sizeof(float);
         }
 
-        if (h_tasks.empty())
+        if (total_tiles == 0)
             return;
+
+        h_tasks.resize(total_tiles);
+
+        // Pass 2: memcpy precomputed tasks + patch offset_C
+        size_t dst_base = 0;
+        for (size_t i = 0; i < bucket_ids.size(); ++i)
+        {
+            uint32_t bid = bucket_ids[i];
+            const auto &pb = g_precomputed_buckets[bid];
+            if (pb.tile_count == 0)
+                continue;
+            size_t src_base = pb.task_offset;
+            size_t res_base = bucket_res_offsets[i];
+            memcpy(&h_tasks[dst_base], &g_precomputed_tasks[src_base],
+                   static_cast<size_t>(pb.tile_count) * sizeof(BatchTaskData));
+            for (uint32_t t = 0; t < pb.tile_count; ++t)
+            {
+                h_tasks[dst_base + t].offset_C =
+                    static_cast<uint64_t>(res_base) +
+                    static_cast<size_t>(t) * kernel_row_tile * sizeof(float);
+            }
+            dst_base += pb.tile_count;
+        }
 
         const size_t max_tasks = GetMaxKernelTasksPerBatch();
         if (h_tasks.size() > max_tasks)
@@ -626,12 +737,215 @@ namespace npuAPI
             static_cast<uint32_t>(vector_dim));
 
         // 4. Single D2H copy (compact layout: device and host use same offsets)
-        if (current_res_offset > 0)
+        if (host_output_buffer && !bucket_result_offsets_bytes && current_res_offset > 0)
         {
             aclrtMemcpyAsync(host_output_buffer, current_res_offset,
                              dev_base_result, current_res_offset,
                              ACL_MEMCPY_DEVICE_TO_HOST, stream);
         }
+        else if (host_output_buffer && bucket_result_offsets_bytes)
+        {
+            // With custom offsets, compute the total span for D2H
+            size_t total_span = 0;
+            for (size_t i = 0; i < bucket_ids.size(); ++i)
+                total_span = std::max(total_span,
+                    (*bucket_result_offsets_bytes)[i] +
+                    static_cast<size_t>(g_bucket_metas[bucket_ids[i]].doc_num) * sizeof(float));
+            if (total_span > 0)
+                aclrtMemcpyAsync(host_output_buffer, total_span,
+                                 dev_base_result, total_span,
+                                 ACL_MEMCPY_DEVICE_TO_HOST, stream);
+        }
+    }
+
+    void LaunchL0BatchKernel(Stream stream,
+                              const std::vector<uint32_t> &bucket_ids,
+                              int group_id,
+                              std::vector<L2ScoreLocation> &l2_score_map)
+    {
+        int local_idx = g_group_to_device[group_id];
+
+        void *d_query = g_group_ctxs[group_id].d_query_ws;
+        void *d_task = g_group_ctxs[group_id].d_task_ws;
+        void *dev_base_doc = g_devices[local_idx].dev_base_addr;
+        void *dev_l0_cache = g_group_ctxs[group_id].d_l0_cache;
+
+        // 1. Prepare Task Data using precomputed templates (compact offset_C into dev_l0_cache)
+        static thread_local std::vector<BatchTaskData> h_tasks;
+        static thread_local std::vector<size_t> l0_bucket_res_offsets;
+        l0_bucket_res_offsets.clear();
+        l0_bucket_res_offsets.reserve(bucket_ids.size());
+
+        const uint32_t kernel_row_tile = GetKernelRowTile();
+
+        l2_score_map.resize(g_total_bucket_num_level_2);
+        size_t total_tiles = 0;
+        size_t current_res_offset = g_group_ctxs[group_id].l0_cache_write_offset;
+
+        // Pass 1: compute per-bucket result offsets + l2_score_map + total tile count
+        for (uint32_t bid : bucket_ids)
+        {
+            l0_bucket_res_offsets.push_back(current_res_offset);
+            uint32_t doc_num = g_bucket_metas[bid].doc_num;
+            l2_score_map[bid].offset_bytes = current_res_offset;
+            l2_score_map[bid].doc_count = doc_num;
+            total_tiles += g_precomputed_buckets[bid].tile_count;
+            current_res_offset += static_cast<size_t>(doc_num) * sizeof(float);
+            // Pad to 32B boundary so next bucket's offset is aligned for gather DataCopy
+            current_res_offset = (current_res_offset + 31) & ~(size_t)31;
+        }
+
+        if (total_tiles == 0)
+            return;
+
+        h_tasks.resize(total_tiles);
+
+        // Pass 2: memcpy precomputed tasks + patch offset_C
+        size_t dst_base = 0;
+        for (size_t i = 0; i < bucket_ids.size(); ++i)
+        {
+            uint32_t bid = bucket_ids[i];
+            const auto &pb = g_precomputed_buckets[bid];
+            if (pb.tile_count == 0)
+                continue;
+            size_t res_base = l0_bucket_res_offsets[i];
+            memcpy(&h_tasks[dst_base], &g_precomputed_tasks[pb.task_offset],
+                   static_cast<size_t>(pb.tile_count) * sizeof(BatchTaskData));
+            for (uint32_t t = 0; t < pb.tile_count; ++t)
+            {
+                h_tasks[dst_base + t].offset_C =
+                    static_cast<uint64_t>(res_base) +
+                    static_cast<size_t>(t) * kernel_row_tile * sizeof(float);
+            }
+            dst_base += pb.tile_count;
+        }
+
+        const size_t max_tasks = GetMaxKernelTasksPerBatch();
+        if (h_tasks.size() > max_tasks)
+        {
+            std::cerr << "[NPU] Too many kernel tasks in L0 batch: "
+                      << h_tasks.size() << " > " << max_tasks << std::endl;
+            return;
+        }
+
+        // 2. Copy Task Data to Device
+        size_t task_data_size = h_tasks.size() * sizeof(BatchTaskData);
+        aclrtMemcpyAsync(d_task, task_data_size, h_tasks.data(), task_data_size, ACL_MEMCPY_HOST_TO_DEVICE, stream);
+
+        // 3. Launch kernel — writes to dev_l0_cache instead of d_result_ws
+        ACLRT_LAUNCH_KERNEL(kernel_vector_mmad)(
+            (uint32_t)h_tasks.size(), stream,
+            d_query,
+            d_task,
+            dev_base_doc,
+            dev_l0_cache,
+            static_cast<uint32_t>(vector_dim));
+
+        // Scores stay in dev_l0_cache for subsequent GatherL0Scores call
+        // Persist the write offset for the next LaunchL0BatchKernel call in this query
+        g_group_ctxs[group_id].l0_cache_write_offset = current_res_offset;
+    }
+
+    size_t GatherL0Scores(Stream stream,
+                           int group_id,
+                           const std::vector<uint32_t> &l2_ids,
+                           const std::vector<L2ScoreLocation> &l2_score_map,
+                           float *host_output_buffer,
+                           GatherTimingMs *timing,
+                           const std::vector<size_t> *dst_offsets_override)
+    {
+        void *dev_l0_cache = g_group_ctxs[group_id].d_l0_cache;
+        void *dev_result = g_group_ctxs[group_id].d_result_ws;
+
+        using Clock = std::chrono::high_resolution_clock;
+
+        // 1. Build compact offset map for the selected L2 buckets
+        auto t_offset_start = Clock::now();
+        static thread_local std::vector<size_t> src_offsets;
+        src_offsets.clear();
+        src_offsets.reserve(l2_ids.size());
+
+        static thread_local std::vector<size_t> dst_offsets;
+        dst_offsets.clear();
+        dst_offsets.reserve(l2_ids.size());
+
+        static thread_local std::vector<uint32_t> counts;
+        counts.clear();
+        counts.reserve(l2_ids.size());
+
+        size_t compact_dst_floats = 0;
+
+        for (size_t idx = 0; idx < l2_ids.size(); ++idx)
+        {
+            uint32_t l2_id = l2_ids[idx];
+            const auto &loc = l2_score_map[l2_id];
+            if (loc.doc_count == 0)
+                continue;
+
+            src_offsets.push_back(loc.offset_bytes);
+            if (dst_offsets_override)
+                dst_offsets.push_back((*dst_offsets_override)[idx]);
+            else
+                dst_offsets.push_back(compact_dst_floats * sizeof(float));
+            counts.push_back(loc.doc_count);
+            compact_dst_floats += loc.doc_count;
+        }
+
+        if (counts.empty())
+        {
+            if (timing) *timing = GatherTimingMs{};
+            return 0;
+        }
+
+        size_t compact_bytes = compact_dst_floats * sizeof(float);
+        auto t_offset_end = Clock::now();
+
+        // 2. D2D gather: scatter-read from dev_l0_cache into dev_result
+        auto t_d2d_start = Clock::now();
+        for (size_t i = 0; i < counts.size(); ++i)
+        {
+            size_t copy_bytes = counts[i] * sizeof(float);
+            aclrtMemcpyAsync(
+                reinterpret_cast<char *>(dev_result) + dst_offsets[i],
+                copy_bytes,
+                reinterpret_cast<char *>(dev_l0_cache) + src_offsets[i],
+                copy_bytes,
+                ACL_MEMCPY_DEVICE_TO_DEVICE, stream);
+        }
+        auto t_d2d_end = Clock::now();
+
+        // 3. D2H: skip when host_output_buffer is nullptr (mask filter reads from device)
+        auto t_d2h_start = Clock::now();
+        if (host_output_buffer)
+        {
+            size_t d2h_span = dst_offsets_override
+                ? dst_offsets.back() + counts.back() * sizeof(float)
+                : compact_bytes;
+            aclrtMemcpyAsync(host_output_buffer, d2h_span,
+                             dev_result, d2h_span,
+                             ACL_MEMCPY_DEVICE_TO_HOST, stream);
+        }
+        auto t_d2h_end = Clock::now();
+
+        // 4. Synchronize (only when D2H was done — mask filter path skips sync here)
+        auto t_sync_start = Clock::now();
+        if (host_output_buffer)
+            aclrtSynchronizeStream(stream);
+        auto t_sync_end = Clock::now();
+
+        if (timing)
+        {
+            timing->host_offset_build_ms =
+                std::chrono::duration<double, std::milli>(t_offset_end - t_offset_start).count();
+            timing->d2d_submit_ms =
+                std::chrono::duration<double, std::milli>(t_d2d_end - t_d2d_start).count();
+            timing->d2h_submit_ms =
+                std::chrono::duration<double, std::milli>(t_d2h_end - t_d2h_start).count();
+            timing->sync_wait_ms =
+                std::chrono::duration<double, std::milli>(t_sync_end - t_sync_start).count();
+        }
+
+        return compact_bytes;
     }
 
     void DebugVerifyBatchResults(const std::vector<uint32_t> &bucket_ids,
@@ -745,6 +1059,272 @@ namespace npuAPI
                       << " abs_err=" << item.abs_err
                       << " allowed=" << item.allowed_err
                       << std::endl;
+        }
+    }
+
+    void *GetL0CacheBuffer(int group_id)
+    {
+        if (group_id < 0 || group_id >= static_cast<int>(g_group_ctxs.size()))
+            return nullptr;
+        return g_group_ctxs[group_id].d_l0_cache;
+    }
+
+    // ----------------------------------------------------------------
+    // Mask Filter AI CPU Op: one-time compile.
+    // Call after aclInit + aclrtSetDevice.
+    // ----------------------------------------------------------------
+
+    static bool s_mask_filter_compiled = false;
+
+    void InitMaskFilterOp()
+    {
+        if (s_mask_filter_compiled) return;
+
+        int64_t dims1024[1] = {1024};
+        int64_t dims16[1] = {16};
+        int64_t dims1[1] = {1};
+
+        aclTensorDesc *input_desc[6];
+        input_desc[0] = aclCreateTensorDesc(ACL_FLOAT, 1, dims1024, ACL_FORMAT_ND);
+        input_desc[1] = aclCreateTensorDesc(ACL_UINT64, 1, dims16, ACL_FORMAT_ND);
+        input_desc[2] = aclCreateTensorDesc(ACL_FLOAT, 1, dims1024, ACL_FORMAT_ND);
+        input_desc[3] = aclCreateTensorDesc(ACL_INT32, 1, dims1024, ACL_FORMAT_ND);
+        input_desc[4] = aclCreateTensorDesc(ACL_INT32, 1, dims1, ACL_FORMAT_ND);
+        input_desc[5] = aclCreateTensorDesc(ACL_UINT64, 1, dims1024, ACL_FORMAT_ND);
+
+        aclTensorDesc *output_desc[1];
+        output_desc[0] = aclCreateTensorDesc(ACL_FLOAT, 1, dims1, ACL_FORMAT_ND);
+
+        aclopAttr *attr = aclopCreateAttr();
+
+        aclError ret = aclopCompile("MaskFilter", 6, input_desc, 1, output_desc,
+                                    attr, ACL_ENGINE_SYS, ACL_COMPILE_SYS, NULL);
+
+        if (ret == ACL_SUCCESS) {
+            s_mask_filter_compiled = true;
+            printf("[MaskFilter] AI CPU op compiled successfully.\n");
+        } else {
+            fprintf(stderr, "[MaskFilter] FATAL: aclopCompile failed (%d). AI CPU is required.\n", ret);
+            exit(1);
+        }
+
+        for (int i = 0; i < 6; i++) aclDestroyTensorDesc(input_desc[i]);
+        aclDestroyTensorDesc(output_desc[0]);
+        aclopDestroyAttr(attr);
+    }
+
+    // ----------------------------------------------------------------
+    // Mask Filter: AI CPU only (exit on failure).
+    // ----------------------------------------------------------------
+
+    void LaunchMaskFilter(Stream stream,
+                           int group_id,
+                           const std::vector<uint32_t> &bucket_ids,
+                           const std::vector<size_t> &score_offsets_bytes,
+                           const uint64_t *host_mask_storage,
+                           const std::vector<BucketMaskInfo> &mask_infos,
+                           size_t mask_stride_u64,
+                           float *host_score_output,
+                           uint32_t *host_index_output,
+                           uint32_t *host_count_output,
+                           MaskFilterTimingMs *timing)
+    {
+        if (bucket_ids.empty())
+            return;
+
+        auto &ctx = g_group_ctxs[group_id];
+        const uint32_t N = static_cast<uint32_t>(bucket_ids.size());
+
+        auto t0 = std::chrono::high_resolution_clock::now();
+        aclrtSynchronizeStream(stream);
+        auto t1 = std::chrono::high_resolution_clock::now();
+
+        struct MFTask {
+            uint64_t scores_offset;
+            uint64_t mask_offset;
+            uint64_t output_offset;
+            uint64_t index_offset;
+            uint32_t doc_num;
+            uint32_t mask_words;
+        };
+
+        size_t task_bytes = sizeof(uint64_t) + N * sizeof(MFTask);
+        static thread_local std::vector<uint8_t> task_buf;
+        task_buf.resize(task_bytes, 0);
+
+        uint64_t *hdr = reinterpret_cast<uint64_t *>(task_buf.data());
+        hdr[0] = N;
+        MFTask *tasks = reinterpret_cast<MFTask *>(task_buf.data() + sizeof(uint64_t));
+
+        size_t total_output_floats = 0;
+        size_t total_mask_u64 = 0;
+        for (uint32_t i = 0; i < N; ++i) {
+            int dn = g_bucket_metas[bucket_ids[i]].doc_num;
+            total_output_floats += dn;
+            total_mask_u64 += mask_infos[i].mask_words;
+        }
+
+        void *d_mf_scores = ctx.d_result_ws;
+
+        size_t mask_total_bytes = total_mask_u64 * sizeof(uint64_t);
+        size_t output_bytes = total_output_floats * sizeof(float);
+        size_t index_bytes = total_output_floats * sizeof(uint32_t);
+        size_t count_bytes = N * sizeof(uint32_t);
+
+        static thread_local void *td_mf_mask = nullptr;
+        static thread_local size_t td_mf_mask_cap = 0;
+        static thread_local void *td_mf_output = nullptr;
+        static thread_local size_t td_mf_output_cap = 0;
+        static thread_local void *td_mf_index = nullptr;
+        static thread_local size_t td_mf_index_cap = 0;
+        static thread_local void *td_mf_count = nullptr;
+        static thread_local size_t td_mf_count_cap = 0;
+        static thread_local void *td_mf_task = nullptr;
+        static thread_local size_t td_mf_task_cap = 0;
+
+        if (mask_total_bytes > td_mf_mask_cap) {
+            if (td_mf_mask) aclrtFree(td_mf_mask);
+            aclrtMalloc(&td_mf_mask, mask_total_bytes, ACL_MEM_MALLOC_HUGE_FIRST);
+            td_mf_mask_cap = mask_total_bytes;
+        }
+        if (output_bytes > td_mf_output_cap) {
+            if (td_mf_output) aclrtFree(td_mf_output);
+            aclrtMalloc(&td_mf_output, output_bytes, ACL_MEM_MALLOC_HUGE_FIRST);
+            td_mf_output_cap = output_bytes;
+        }
+        if (index_bytes > td_mf_index_cap) {
+            if (td_mf_index) aclrtFree(td_mf_index);
+            aclrtMalloc(&td_mf_index, index_bytes, ACL_MEM_MALLOC_HUGE_FIRST);
+            td_mf_index_cap = index_bytes;
+        }
+        if (count_bytes > td_mf_count_cap) {
+            if (td_mf_count) aclrtFree(td_mf_count);
+            aclrtMalloc(&td_mf_count, count_bytes, ACL_MEM_MALLOC_HUGE_FIRST);
+            td_mf_count_cap = count_bytes;
+        }
+        if (task_bytes > td_mf_task_cap) {
+            if (td_mf_task) aclrtFree(td_mf_task);
+            aclrtMalloc(&td_mf_task, task_bytes, ACL_MEM_MALLOC_HUGE_FIRST);
+            td_mf_task_cap = task_bytes;
+        }
+
+        static thread_local std::vector<uint64_t> host_mask_concat;
+        host_mask_concat.resize(total_mask_u64);
+        size_t mask_offset_acc = 0;
+        size_t output_offset_acc = 0;
+
+        for (uint32_t i = 0; i < N; ++i) {
+            int doc_num = g_bucket_metas[bucket_ids[i]].doc_num;
+            size_t mw = mask_infos[i].mask_words;
+
+            memcpy(host_mask_concat.data() + mask_offset_acc,
+                   host_mask_storage + mask_infos[i].mask_offset_u64,
+                   mw * sizeof(uint64_t));
+
+            tasks[i].scores_offset = score_offsets_bytes[i];
+            tasks[i].mask_offset = mask_offset_acc * sizeof(uint64_t);
+            tasks[i].output_offset = output_offset_acc * sizeof(float);
+            tasks[i].index_offset = output_offset_acc * sizeof(uint32_t);
+            tasks[i].doc_num = static_cast<uint32_t>(doc_num);
+            tasks[i].mask_words = static_cast<uint32_t>(mw);
+
+            mask_offset_acc += mw;
+            output_offset_acc += doc_num;
+        }
+
+        aclrtMemcpy(td_mf_mask, mask_total_bytes, host_mask_concat.data(),
+                     mask_total_bytes, ACL_MEMCPY_HOST_TO_DEVICE);
+        aclrtMemcpy(td_mf_task, task_bytes, task_buf.data(),
+                     task_bytes, ACL_MEMCPY_HOST_TO_DEVICE);
+
+        auto t2 = std::chrono::high_resolution_clock::now();
+
+        int64_t dims_scores[1] = {static_cast<int64_t>(total_output_floats)};
+        int64_t dims_mask[1] = {static_cast<int64_t>(total_mask_u64)};
+        int64_t dims_count[1] = {static_cast<int64_t>(N)};
+        int64_t dims_task[1] = {static_cast<int64_t>(task_bytes / sizeof(uint64_t))};
+        int64_t dims1[1] = {1};
+
+        aclTensorDesc *input_desc[6];
+        input_desc[0] = aclCreateTensorDesc(ACL_FLOAT, 1, dims_scores, ACL_FORMAT_ND);
+        input_desc[1] = aclCreateTensorDesc(ACL_UINT64, 1, dims_mask, ACL_FORMAT_ND);
+        input_desc[2] = aclCreateTensorDesc(ACL_FLOAT, 1, dims_scores, ACL_FORMAT_ND);
+        input_desc[3] = aclCreateTensorDesc(ACL_INT32, 1, dims_scores, ACL_FORMAT_ND);
+        input_desc[4] = aclCreateTensorDesc(ACL_INT32, 1, dims_count, ACL_FORMAT_ND);
+        input_desc[5] = aclCreateTensorDesc(ACL_UINT64, 1, dims_task, ACL_FORMAT_ND);
+
+        aclTensorDesc *output_desc[1];
+        output_desc[0] = aclCreateTensorDesc(ACL_FLOAT, 1, dims1, ACL_FORMAT_ND);
+
+        aclDataBuffer *input_buf[6];
+        input_buf[0] = aclCreateDataBuffer(d_mf_scores, dims_scores[0] * sizeof(float));
+        input_buf[1] = aclCreateDataBuffer(td_mf_mask, mask_total_bytes);
+        input_buf[2] = aclCreateDataBuffer(td_mf_output, output_bytes);
+        input_buf[3] = aclCreateDataBuffer(td_mf_index, index_bytes);
+        input_buf[4] = aclCreateDataBuffer(td_mf_count, count_bytes);
+        input_buf[5] = aclCreateDataBuffer(td_mf_task, task_bytes);
+
+        aclDataBuffer *output_buf[1];
+        output_buf[0] = aclCreateDataBuffer(td_mf_output, sizeof(float));
+
+        aclopAttr *attr = aclopCreateAttr();
+
+        aclError ret = aclopExecuteV2("MaskFilter", 6, input_desc, input_buf,
+                                      1, output_desc, output_buf, attr, stream);
+
+        if (ret != ACL_SUCCESS) {
+            for (int i = 0; i < 6; i++) { aclDestroyDataBuffer(input_buf[i]); aclDestroyTensorDesc(input_desc[i]); }
+            aclDestroyDataBuffer(output_buf[0]); aclDestroyTensorDesc(output_desc[0]);
+            aclopDestroyAttr(attr);
+            fprintf(stderr, "[MaskFilter] FATAL: aclopExecuteV2 failed (%d). AI CPU is required.\n", ret);
+            exit(1);
+        }
+
+        aclrtSynchronizeStream(stream);
+
+        auto t3 = std::chrono::high_resolution_clock::now();
+
+        static thread_local std::vector<float> h_out_scores;
+        static thread_local std::vector<uint32_t> h_out_indices;
+        static thread_local std::vector<uint32_t> h_out_counts;
+        h_out_scores.resize(total_output_floats);
+        h_out_indices.resize(total_output_floats);
+        h_out_counts.resize(N);
+
+        aclrtMemcpy(h_out_scores.data(), output_bytes, td_mf_output, output_bytes, ACL_MEMCPY_DEVICE_TO_HOST);
+        aclrtMemcpy(h_out_indices.data(), index_bytes, td_mf_index, index_bytes, ACL_MEMCPY_DEVICE_TO_HOST);
+        aclrtMemcpy(h_out_counts.data(), count_bytes, td_mf_count, count_bytes, ACL_MEMCPY_DEVICE_TO_HOST);
+
+        auto t4 = std::chrono::high_resolution_clock::now();
+
+        float *out_s = host_score_output;
+        uint32_t *out_i = host_index_output;
+        for (uint32_t i = 0; i < N; ++i) {
+            int doc_num = g_bucket_metas[bucket_ids[i]].doc_num;
+            uint32_t cnt = h_out_counts[i];
+            size_t out_offset = 0;
+            for (uint32_t j = 0; j < i; ++j)
+                out_offset += g_bucket_metas[bucket_ids[j]].doc_num;
+
+            memcpy(out_s, h_out_scores.data() + out_offset, cnt * sizeof(float));
+            memcpy(out_i, h_out_indices.data() + out_offset, cnt * sizeof(uint32_t));
+            host_count_output[i] = cnt;
+            out_s += doc_num;
+            out_i += doc_num;
+        }
+
+        for (int i = 0; i < 6; i++) { aclDestroyDataBuffer(input_buf[i]); aclDestroyTensorDesc(input_desc[i]); }
+        aclDestroyDataBuffer(output_buf[0]); aclDestroyTensorDesc(output_desc[0]);
+        aclopDestroyAttr(attr);
+
+        if (timing) {
+            // NOTE: h2d_ms measures stream sync wait (waiting for prior NPU scoring),
+            // not actual H2D copy time (which uses async copies above).
+            timing->h2d_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
+            // kernel_exec_ms covers: H2D async completion + AI CPU kernel launch + sync
+            timing->kernel_exec_ms += std::chrono::duration<double, std::milli>(t3 - t2).count();
+            // d2h_ms covers: D2H memcpy (may include residual AI CPU completion wait)
+            timing->d2h_ms += std::chrono::duration<double, std::milli>(t4 - t3).count();
         }
     }
 }

@@ -144,11 +144,20 @@ inline BucketDocTable BuildBucketDocTableFromOffsets(const std::vector<uint64_t>
 }
 
 inline TwoLevelBucketLayout BuildTwoLevelBucketLayout(BucketDocTable level_1_bucket_doc_table,
-                                                      int max_doc_per_bucket_level_2)
+                                                      int max_doc_per_bucket_level_2,
+                                                      const float *vectors = nullptr,
+                                                      int dim = 0,
+                                                      std::vector<float> *l2_centroids_out = nullptr)
 {
     if (max_doc_per_bucket_level_2 <= 0)
     {
         throw std::invalid_argument("[Clustering] max_doc_per_bucket_level_2 must be > 0.");
+    }
+
+    const bool compute_centroids = (vectors != nullptr && dim > 0 && l2_centroids_out != nullptr);
+    if (compute_centroids)
+    {
+        l2_centroids_out->clear();
     }
 
     TwoLevelBucketLayout layout;
@@ -177,6 +186,30 @@ inline TwoLevelBucketLayout BuildTwoLevelBucketLayout(BucketDocTable level_1_buc
                 }
                 level_2_docs.push_back(doc_id);
             }
+
+            if (compute_centroids)
+            {
+                std::vector<float> centroid(static_cast<size_t>(dim), 0.0f);
+                for (uint32_t doc_id : level_2_docs)
+                {
+                    const float *v = vectors + static_cast<size_t>(doc_id) * static_cast<size_t>(dim);
+                    for (int d = 0; d < dim; ++d)
+                    {
+                        centroid[static_cast<size_t>(d)] += v[d];
+                    }
+                }
+                float inv = 1.0f / static_cast<float>(level_2_docs.size());
+                for (float &val : centroid)
+                {
+                    val *= inv;
+                }
+                size_t old_size = l2_centroids_out->size();
+                l2_centroids_out->resize(old_size + static_cast<size_t>(dim));
+                std::memcpy(l2_centroids_out->data() + old_size,
+                            centroid.data(),
+                            static_cast<size_t>(dim) * sizeof(float));
+            }
+
             layout.level_2_bucket_doc_table.push_back(std::move(level_2_docs));
             cursor = chunk_end;
         }
@@ -232,10 +265,8 @@ inline bool ValidatePreparedQueriesAgainstPrealloc(const std::vector<DataReader:
     if (max_seen_expanded_k > static_cast<long long>(max_query_topk_prealloc))
     {
         const int adjusted = ClampSizeTToInt(static_cast<size_t>(max_seen_expanded_k));
-        std::cout << "[Config] Warning: max_query_topk_prealloc=" << max_query_topk_prealloc
-                  << " is below max query expanded_k=" << max_seen_expanded_k
-                  << " (line " << max_seen_line_no << "); auto-adjusting to "
-                  << adjusted << std::endl;
+        std::cout << "[Config] Auto-adjust: max_query_topk_prealloc="
+                  << max_query_topk_prealloc << " -> " << adjusted << std::endl;
         max_query_topk_prealloc = adjusted;
     }
 
@@ -250,58 +281,69 @@ inline bool WriteMetricFile(const fs::path &output_dir,
                             const std::string &file_name,
                             const std::vector<double> &values)
 {
-    std::ofstream out(output_dir / file_name, std::ios::out | std::ios::trunc);
-    if (!out.is_open())
+    const fs::path path = output_dir / file_name;
+    std::FILE *fp = std::fopen(path.c_str(), "w");
+    if (!fp)
     {
-        std::cerr << "[Writer] Failed to open metric file: " << (output_dir / file_name) << "\n";
+        std::cerr << "[Writer] Failed to open metric file: " << path << "\n";
         return false;
     }
 
-    out << std::fixed << std::setprecision(5);
+    std::string buf;
+    buf.reserve(values.size() * 24);
+    char tmp[32];
     for (double value : values)
     {
         if (std::isinf(value))
         {
-            out << "inf\n";
+            buf.append("inf\n", 4);
         }
         else
         {
-            out << value << '\n';
+            int n = std::snprintf(tmp, sizeof(tmp), "%.5f\n", value);
+            buf.append(tmp, static_cast<size_t>(n));
         }
     }
+    std::fwrite(buf.data(), 1, buf.size(), fp);
+    bool ok = (std::ferror(fp) == 0);
+    std::fclose(fp);
 
-    if (!out.good())
+    if (!ok)
     {
-        std::cerr << "[Writer] Failed while writing metric file: " << (output_dir / file_name) << "\n";
-        return false;
+        std::cerr << "[Writer] Failed while writing metric file: " << path << "\n";
     }
-
-    return true;
+    return ok;
 }
 
 inline bool WriteMetricFile(const fs::path &output_dir,
                             const std::string &file_name,
                             const std::vector<size_t> &values)
 {
-    std::ofstream out(output_dir / file_name, std::ios::out | std::ios::trunc);
-    if (!out.is_open())
+    const fs::path path = output_dir / file_name;
+    std::FILE *fp = std::fopen(path.c_str(), "w");
+    if (!fp)
     {
-        std::cerr << "[Writer] Failed to open metric file: " << (output_dir / file_name) << "\n";
+        std::cerr << "[Writer] Failed to open metric file: " << path << "\n";
         return false;
     }
 
+    std::string buf;
+    buf.reserve(values.size() * 16);
+    char tmp[24];
     for (size_t value : values)
     {
-        out << value << '\n';
+        int n = std::snprintf(tmp, sizeof(tmp), "%zu\n", value);
+        buf.append(tmp, static_cast<size_t>(n));
     }
+    std::fwrite(buf.data(), 1, buf.size(), fp);
+    bool ok = (std::ferror(fp) == 0);
+    std::fclose(fp);
 
-    if (!out.good())
+    if (!ok)
     {
-        std::cerr << "[Writer] Failed while writing metric file: " << (output_dir / file_name) << "\n";
-        return false;
+        std::cerr << "[Writer] Failed while writing metric file: " << path << "\n";
     }
-
-    return true;
+    return ok;
 }
 
 inline bool EnsureOutputDirectory(const fs::path &dir)

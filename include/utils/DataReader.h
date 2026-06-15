@@ -40,6 +40,7 @@ inline int total_doc_num = 0;
 inline int total_tag_num = 0;
 inline int total_bucket_num_level_1 = 10000;
 inline int total_bucket_num_level_2 = 10000; // 由一级桶切分结果推导得到
+inline int total_bucket_num_level_0 = 0; // 0 = auto (round(sqrt(total_bucket_num_level_1)))
 inline int vector_dim = 0;
 inline int max_doc_per_bucket_level_2 = 1024; // 该参数必须是16的倍数
 
@@ -47,16 +48,17 @@ inline int cpu_core_count = 24;
 inline int cores_per_group = 8;
 inline int group_count = 3;
 
-inline int valid_bucket_num_base_level_1 = 200;
-inline int valid_bucket_num_incremental_level_1 = 200;
+inline int valid_bucket_num_base_level_2 = 200;
+inline int valid_bucket_num_incremental_level_2 = 200;
 inline int bucket_level_ivf_enable = 0;
-inline int max_probe_l1_bucket_num_enable = 0;
-inline int max_probe_l1_bucket_num = 64;
+inline int max_probe_l2_bucket_num_enable = 0;
+inline int max_probe_l2_bucket_num = 960;
 inline int max_process_bucket_num_level_2 = 200;
 inline int analyze_t1 = 5;
 inline double k_expand_param = 1.0;
+inline float l0_commit_threshold = 0.0f; // L0 commit threshold: commit full L0 if ratio >= this; 0 = always
 inline std::vector<double> k_expand_param_test_set;
-inline std::vector<int> max_probe_l1_bucket_num_test_set;
+inline std::vector<int> max_probe_l2_bucket_num_test_set;
 inline std::string dataset_cache_file = "../../dataset.bin";
 inline std::string tag_map_cache_file = "../../tag_map.bin";
 inline std::string query_file = "../../QueryData_10000.txt";
@@ -64,6 +66,7 @@ inline std::string query_result_root = "../../result/";
 inline std::string ground_truth_cache_file = "../../ground_truth_cache.bin";
 inline std::string bucket_ivf_index_file = "../../bucket_ivf_index.bin";
 inline std::string bucket_index_file = "../../bucket_index.bin";
+inline std::string tag_freq_cache_file = "../../tag_freq_cache.bin";
 inline std::string raw_vector_file = "/mnt/paas/kubernetes/kubelet/DataManager/0/relevance_que2search";
 inline std::string raw_attr_dir = "/mnt/paas/kubernetes/kubelet/DataManager/0/inverted_union";
 inline std::string raw_query_file = "/mnt/paas/kubernetes/kubelet/DataManager/0/raw_query.txt";
@@ -88,6 +91,11 @@ inline std::vector<int> g_device_group_split; // per-device group count
 
 // Derived mapping tables (built by BuildDeviceGroupMapping).
 inline std::vector<int> g_group_to_device; // group_id -> device index
+
+// Global tag frequency for BucketPlan selectivity estimation.
+// Populated during index build from dataset tag bitmaps.
+// Size = total_tag_num. Value = doc_count_with_tag / total_doc_num.
+inline std::vector<float> g_global_tag_freq;
 inline std::vector<int> g_group_to_stream; // group_id -> stream index within device
 inline std::vector<std::vector<int>> g_device_to_groups; // device_idx -> list of group_ids
 
@@ -146,8 +154,6 @@ inline int max_query_topk_prealloc = 32768;
 inline int query_pool_capacity = 64;
 
 inline int query_vector_reserve_floats = 0;
-inline int query_bucket_rpn_reserve_items = 0;
-inline int query_bucket_level_ivf_rpn_reserve_items = 0;
 inline int query_compile_stack_reserve_items = 0;
 inline int query_exec_stack_reserve_items = 0;
 inline int query_merge_batch_reserve_items = 0;
@@ -445,9 +451,8 @@ inline uint64_t ComputeBucketDocTableHash(const BucketDocTable &bucket_doc_table
 inline void EnsurePreallocAtLeast(const char *key, int &actual, size_t required) {
     const int required_int = ClampSizeTToInt(required);
     if (actual < required_int) {
-        std::cout << "[Config] Warning: " << key << "=" << actual
-                  << " is below estimated minimum " << required_int
-                  << "; auto-adjusting to " << required_int << std::endl;
+        std::cout << "[Config] Auto-adjust: " << key << "=" << actual
+                  << " -> " << required_int << std::endl;
         actual = required_int;
     }
 }
@@ -466,7 +471,7 @@ inline bool IsLeader(int core_id) {
 
 inline bool FinalizePreallocationParams() {
     const size_t buckets_per_core =
-        CeilDivSizeT(static_cast<size_t>(total_bucket_num_level_1), static_cast<size_t>(cores_per_group));
+        CeilDivSizeT(static_cast<size_t>(total_bucket_num_level_2), static_cast<size_t>(cores_per_group));
     const size_t ivf_raw_stride = CeilDivSizeT(buckets_per_core, 64);
     const size_t bucket_stride = CeilDivSizeT(static_cast<size_t>(max_doc_per_bucket_level_2), 64);
     const size_t buckets_per_core_in_batch =
@@ -486,8 +491,8 @@ inline bool FinalizePreallocationParams() {
     const size_t required_batch_mask_u64 = buckets_per_core_in_batch * bucket_stride + 64;
     const size_t required_local_pq_items = buckets_per_core;
     const size_t required_bucket_results_items = buckets_per_core;
-    const size_t required_candidate_merge_items = static_cast<size_t>(total_bucket_num_level_1);
-    const size_t required_sorted_bucket_items = static_cast<size_t>(total_bucket_num_level_1);
+    const size_t required_candidate_merge_items = static_cast<size_t>(total_bucket_num_level_2);
+    const size_t required_sorted_bucket_items = static_cast<size_t>(total_bucket_num_level_2);
     const size_t required_batch_bucket_ids_items = static_cast<size_t>(max_process_bucket_num_level_2);
     const size_t required_temp_doc_mask_u64 = bucket_stride;
     const size_t required_thread_doc_results_items =
@@ -500,14 +505,6 @@ inline bool FinalizePreallocationParams() {
 
     if (query_vector_reserve_floats <= 0) {
         query_vector_reserve_floats = vector_dim;
-    }
-    if (query_bucket_rpn_reserve_items <= 0) {
-        query_bucket_rpn_reserve_items = ClampSizeTToInt(
-            std::max(static_cast<size_t>(max_rpn_length), RoundUpPow2SizeT(static_cast<size_t>(max_rpn_length))));
-    }
-    if (query_bucket_level_ivf_rpn_reserve_items <= 0) {
-        query_bucket_level_ivf_rpn_reserve_items = ClampSizeTToInt(
-            std::max(static_cast<size_t>(max_rpn_length), RoundUpPow2SizeT(static_cast<size_t>(max_rpn_length))));
     }
     if (query_compile_stack_reserve_items <= 0) {
         query_compile_stack_reserve_items =
@@ -577,12 +574,6 @@ inline bool FinalizePreallocationParams() {
     EnsurePreallocAtLeast("query_vector_reserve_floats",
                           query_vector_reserve_floats,
                           static_cast<size_t>(vector_dim));
-    EnsurePreallocAtLeast("query_bucket_rpn_reserve_items",
-                          query_bucket_rpn_reserve_items,
-                          static_cast<size_t>(max_rpn_length));
-    EnsurePreallocAtLeast("query_bucket_level_ivf_rpn_reserve_items",
-                          query_bucket_level_ivf_rpn_reserve_items,
-                          static_cast<size_t>(max_rpn_length));
     EnsurePreallocAtLeast("query_merge_batch_reserve_items",
                           query_merge_batch_reserve_items,
                           required_merge_batch_items);
@@ -635,15 +626,16 @@ inline bool LoadParams(const std::string &config_file, ResourceConfigProfile pro
     bool seen_total_bucket_num_level_1 = false;
     bool seen_max_doc_per_bucket_level_2 = false;
     bool seen_cores_per_group = false;
-    bool seen_valid_bucket_num_base_level_1 = false;
-    bool seen_valid_bucket_num_incremental_level_1 = false;
+    bool seen_valid_bucket_num_base_level_2 = false;
+    bool seen_valid_bucket_num_incremental_level_2 = false;
     bool seen_bucket_level_ivf_enable = false;
-    bool seen_max_probe_l1_bucket_num_enable = false;
-    bool seen_max_probe_l1_bucket_num = false;
+    bool seen_max_probe_l2_bucket_num_enable = false;
+    bool seen_max_probe_l2_bucket_num = false;
     bool seen_max_process_bucket_num_level_2 = false;
     bool seen_k_expand_param = false;
     bool seen_bucket_ivf_index_file = false;
     bool seen_bucket_index_file = false;
+    bool seen_tag_freq_cache_file = false; (void)seen_tag_freq_cache_file;
     bool seen_npu_device_id_start = false;
     bool seen_max_query_tags = false;
     bool seen_max_rpn_length = false;
@@ -828,6 +820,16 @@ inline bool LoadParams(const std::string &config_file, ResourceConfigProfile pro
             bucket_index_file = value;
             seen_bucket_index_file = true;
             continue;
+        } else if (key == "tag_freq_cache_file") {
+            std::string value;
+            if (!ParseConfigString(value_str, value)) {
+                std::cerr << "[Config] Error parsing value for key: " << key
+                          << ", raw value: " << value_str << std::endl;
+                return false;
+            }
+            tag_freq_cache_file = value;
+            seen_tag_freq_cache_file = true;
+            continue;
         } else if (key == "npu_debug_verify_abs_tol") {
             float value = 0.0f;
             if (!ParseConfigFloat(value_str, value)) {
@@ -856,12 +858,21 @@ inline bool LoadParams(const std::string &config_file, ResourceConfigProfile pro
             k_expand_param = value;
             seen_k_expand_param = true;
             continue;
+        } else if (key == "l0_commit_threshold") {
+            float value = 0.0f;
+            if (!ParseConfigFloat(value_str, value)) {
+                std::cerr << "[Config] Error parsing value for key: " << key
+                          << ", raw value: " << value_str << std::endl;
+                return false;
+            }
+            l0_commit_threshold = value;
+            continue;
         } else if (key == "target_qps_parallel") {
             // ignored: QPS is hardcoded in parallel.cpp
             continue;
         } else if (key == "k_expand_param_test_set") {
             continue;
-        } else if (key == "max_probe_l1_bucket_num_test_set") {
+        } else if (key == "max_probe_l2_bucket_num_test_set") {
             continue;
         } else if (key == "device_group_split") {
             // Parse comma-separated per-device group counts (e.g. "4,2")
@@ -893,6 +904,8 @@ inline bool LoadParams(const std::string &config_file, ResourceConfigProfile pro
             total_bucket_num_level_1 = value;
             total_bucket_num_level_2 = value;
             seen_total_bucket_num_level_1 = true;
+        } else if (key == "total_bucket_num_level_0") {
+            total_bucket_num_level_0 = value;
         } else if (key == "vector_dim") {
             std::cout << "[Config] Warning: vector_dim is ignored; it is read from dataset.bin or raw data.\n";
         } else if (key == "max_doc_per_bucket_level_2") {
@@ -907,21 +920,21 @@ inline bool LoadParams(const std::string &config_file, ResourceConfigProfile pro
         } else if (key == "cores_per_group") {
             cores_per_group = value;
             seen_cores_per_group = true;
-        } else if (key == "valid_bucket_num_base_level_1") {
-            valid_bucket_num_base_level_1 = value;
-            seen_valid_bucket_num_base_level_1 = true;
-        } else if (key == "valid_bucket_num_incremental_level_1") {
-            valid_bucket_num_incremental_level_1 = value;
-            seen_valid_bucket_num_incremental_level_1 = true;
+        } else if (key == "valid_bucket_num_base_level_2") {
+            valid_bucket_num_base_level_2 = value;
+            seen_valid_bucket_num_base_level_2 = true;
+        } else if (key == "valid_bucket_num_incremental_level_2") {
+            valid_bucket_num_incremental_level_2 = value;
+            seen_valid_bucket_num_incremental_level_2 = true;
         } else if (key == "bucket_level_ivf_enable") {
             bucket_level_ivf_enable = value;
             seen_bucket_level_ivf_enable = true;
-        } else if (key == "max_probe_l1_bucket_num_enable") {
-            max_probe_l1_bucket_num_enable = value;
-            seen_max_probe_l1_bucket_num_enable = true;
-        } else if (key == "max_probe_l1_bucket_num") {
-            max_probe_l1_bucket_num = value;
-            seen_max_probe_l1_bucket_num = true;
+        } else if (key == "max_probe_l2_bucket_num_enable") {
+            max_probe_l2_bucket_num_enable = value;
+            seen_max_probe_l2_bucket_num_enable = true;
+        } else if (key == "max_probe_l2_bucket_num") {
+            max_probe_l2_bucket_num = value;
+            seen_max_probe_l2_bucket_num = true;
         } else if (key == "max_process_bucket_num_level_2") {
             max_process_bucket_num_level_2 = value;
             seen_max_process_bucket_num_level_2 = true;
@@ -957,10 +970,6 @@ inline bool LoadParams(const std::string &config_file, ResourceConfigProfile pro
             query_pool_capacity = value;
         } else if (key == "query_vector_reserve_floats") {
             query_vector_reserve_floats = value;
-        } else if (key == "query_bucket_rpn_reserve_items") {
-            query_bucket_rpn_reserve_items = value;
-        } else if (key == "query_bucket_level_ivf_rpn_reserve_items") {
-            query_bucket_level_ivf_rpn_reserve_items = value;
         } else if (key == "query_compile_stack_reserve_items") {
             query_compile_stack_reserve_items = value;
         } else if (key == "query_exec_stack_reserve_items") {
@@ -1015,11 +1024,11 @@ inline bool LoadParams(const std::string &config_file, ResourceConfigProfile pro
     if (!seen_npu_device_count_parallel) missing_keys.emplace_back("npu_device_count_parallel");
     if (!seen_groups_per_device_parallel) missing_keys.emplace_back("groups_per_device_parallel");
     if (!seen_cores_per_group) missing_keys.emplace_back("cores_per_group");
-    if (!seen_valid_bucket_num_base_level_1) missing_keys.emplace_back("valid_bucket_num_base_level_1");
-    if (!seen_valid_bucket_num_incremental_level_1) missing_keys.emplace_back("valid_bucket_num_incremental_level_1");
+    if (!seen_valid_bucket_num_base_level_2) missing_keys.emplace_back("valid_bucket_num_base_level_2");
+    if (!seen_valid_bucket_num_incremental_level_2) missing_keys.emplace_back("valid_bucket_num_incremental_level_2");
     if (!seen_bucket_level_ivf_enable) missing_keys.emplace_back("bucket_level_ivf_enable");
-    if (!seen_max_probe_l1_bucket_num_enable) missing_keys.emplace_back("max_probe_l1_bucket_num_enable");
-    if (!seen_max_probe_l1_bucket_num) missing_keys.emplace_back("max_probe_l1_bucket_num");
+    if (!seen_max_probe_l2_bucket_num_enable) missing_keys.emplace_back("max_probe_l2_bucket_num_enable");
+    if (!seen_max_probe_l2_bucket_num) missing_keys.emplace_back("max_probe_l2_bucket_num");
     if (!seen_max_process_bucket_num_level_2) missing_keys.emplace_back("max_process_bucket_num_level_2");
     if (!seen_k_expand_param) missing_keys.emplace_back("k_expand_param");
     if (!seen_bucket_ivf_index_file) missing_keys.emplace_back("bucket_ivf_index_file");
@@ -1069,16 +1078,16 @@ inline bool LoadParams(const std::string &config_file, ResourceConfigProfile pro
         std::cerr << "[Config] Error: max_doc_per_bucket_level_2 must be > 0 and divisible by 16" << std::endl;
         return false;
     }
-    if (valid_bucket_num_base_level_1 <= 0 || valid_bucket_num_incremental_level_1 <= 0) {
-        std::cerr << "[Config] Error: valid_bucket_num_base_level_1 and valid_bucket_num_incremental_level_1 must be > 0" << std::endl;
+    if (valid_bucket_num_base_level_2 <= 0 || valid_bucket_num_incremental_level_2 <= 0) {
+        std::cerr << "[Config] Error: valid_bucket_num_base_level_2 and valid_bucket_num_incremental_level_2 must be > 0" << std::endl;
         return false;
     }
-    if (max_probe_l1_bucket_num_enable != 0 && max_probe_l1_bucket_num_enable != 1) {
-        std::cerr << "[Config] Error: max_probe_l1_bucket_num_enable must be 0 or 1" << std::endl;
+    if (max_probe_l2_bucket_num_enable != 0 && max_probe_l2_bucket_num_enable != 1) {
+        std::cerr << "[Config] Error: max_probe_l2_bucket_num_enable must be 0 or 1" << std::endl;
         return false;
     }
-    if (max_probe_l1_bucket_num <= 0) {
-        std::cerr << "[Config] Error: max_probe_l1_bucket_num must be > 0" << std::endl;
+    if (max_probe_l2_bucket_num <= 0) {
+        std::cerr << "[Config] Error: max_probe_l2_bucket_num must be > 0" << std::endl;
         return false;
     }
     if (max_process_bucket_num_level_2 <= 0) {
@@ -1093,8 +1102,8 @@ inline bool LoadParams(const std::string &config_file, ResourceConfigProfile pro
         std::cerr << "[Config] Error: analyze_t1 must be > 0" << std::endl;
         return false;
     }
-    if (valid_bucket_num_incremental_level_1 > valid_bucket_num_base_level_1) {
-        std::cerr << "[Config] Error: valid_bucket_num_incremental_level_1 must be <= valid_bucket_num_base_level_1" << std::endl;
+    if (valid_bucket_num_incremental_level_2 > valid_bucket_num_base_level_2) {
+        std::cerr << "[Config] Error: valid_bucket_num_incremental_level_2 must be <= valid_bucket_num_base_level_2" << std::endl;
         return false;
     }
     if (pure_cpu_compute_enable != 0 && pure_cpu_compute_enable != 1) {
@@ -1237,8 +1246,8 @@ inline bool LoadKExpandParamTestSet(const std::string &config_file) {
     return true;
 }
 
-inline bool LoadMaxProbeL1BucketNumTestSet(const std::string &config_file) {
-    max_probe_l1_bucket_num_test_set.clear();
+inline bool LoadMaxProbeL2BucketNumTestSet(const std::string &config_file) {
+    max_probe_l2_bucket_num_test_set.clear();
 
     std::ifstream file(config_file);
     if (!file.is_open()) {
@@ -1246,7 +1255,7 @@ inline bool LoadMaxProbeL1BucketNumTestSet(const std::string &config_file) {
         return false;
     }
 
-    bool seen_max_probe_l1_bucket_num_test_set = false;
+    bool seen_max_probe_l2_bucket_num_test_set = false;
     std::string line;
     while (std::getline(file, line)) {
         StripConfigComment(line);
@@ -1262,26 +1271,26 @@ inline bool LoadMaxProbeL1BucketNumTestSet(const std::string &config_file) {
 
         const std::string key = ParamTrim(line.substr(0, equal_pos));
         const std::string value_str = ParamTrim(line.substr(equal_pos + 1));
-        if (key != "max_probe_l1_bucket_num_test_set") {
+        if (key != "max_probe_l2_bucket_num_test_set") {
             continue;
         }
 
-        if (!ParseConfigIntList(value_str, max_probe_l1_bucket_num_test_set)) {
+        if (!ParseConfigIntList(value_str, max_probe_l2_bucket_num_test_set)) {
             std::cerr << "[Config] Error parsing value for key: " << key
                       << ", raw value: " << value_str << std::endl;
             return false;
         }
-        seen_max_probe_l1_bucket_num_test_set = true;
+        seen_max_probe_l2_bucket_num_test_set = true;
     }
 
-    if (!seen_max_probe_l1_bucket_num_test_set || max_probe_l1_bucket_num_test_set.empty()) {
-        std::cerr << "[Config] Error: max_probe_l1_bucket_num_test_set must contain at least one value." << std::endl;
+    if (!seen_max_probe_l2_bucket_num_test_set || max_probe_l2_bucket_num_test_set.empty()) {
+        std::cerr << "[Config] Error: max_probe_l2_bucket_num_test_set must contain at least one value." << std::endl;
         return false;
     }
 
-    for (int test_value : max_probe_l1_bucket_num_test_set) {
+    for (int test_value : max_probe_l2_bucket_num_test_set) {
         if (test_value <= 0) {
-            std::cerr << "[Config] Error: max_probe_l1_bucket_num_test_set values must be > 0" << std::endl;
+            std::cerr << "[Config] Error: max_probe_l2_bucket_num_test_set values must be > 0" << std::endl;
             return false;
         }
     }
@@ -1361,6 +1370,14 @@ struct BucketIndexFileHeaderDisk {
     uint32_t vector_dim = 0;
     uint32_t max_doc_per_bucket = 0;
     uint64_t layout_hash = 0;
+};
+
+struct TagFreqCacheHeaderDisk {
+    char magic[8];          // "TAGFREQ\0"
+    uint32_t version = 0;   // 1
+    uint64_t doc_num = 0;
+    uint32_t tag_num = 0;
+    uint32_t reserved = 0;
 };
 
 struct BucketIndexEntryDisk {

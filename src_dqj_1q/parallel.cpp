@@ -10,6 +10,7 @@
 #include <random>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -27,8 +28,74 @@ namespace fs = RunSupport::fs;
 namespace
 {
 
-constexpr double kParallelTargetQps = 10000.0;
+constexpr double kParallelTargetQps = 2000.0;
 constexpr std::chrono::microseconds kInjectorTick(1000);
+
+bool ParseConfigStringValue(const std::string &config_file,
+                            const std::string &target_key,
+                            std::string &value_out)
+{
+    std::ifstream file(config_file);
+    if (!file.is_open())
+    {
+        return false;
+    }
+
+    std::string line;
+    while (std::getline(file, line))
+    {
+        StripConfigComment(line);
+        line = ParamTrim(line);
+        if (line.empty())
+        {
+            continue;
+        }
+
+        const size_t equal_pos = line.find('=');
+        if (equal_pos == std::string::npos)
+        {
+            continue;
+        }
+
+        const std::string key = ParamTrim(line.substr(0, equal_pos));
+        if (key != target_key)
+        {
+            continue;
+        }
+
+        std::string parsed_value;
+        if (!ParseConfigString(line.substr(equal_pos + 1), parsed_value))
+        {
+            return false;
+        }
+        value_out = parsed_value;
+        return true;
+    }
+
+    return false;
+}
+
+void RestoreSrcStyleRelativePathsFromConfig(const std::string &config_file)
+{
+    auto restore_path = [&](const std::string &key, std::string &target) {
+        std::string raw_value;
+        if (ParseConfigStringValue(config_file, key, raw_value))
+        {
+            target = raw_value;
+        }
+    };
+
+    restore_path("dataset_cache_file", dataset_cache_file);
+    restore_path("tag_map_cache_file", tag_map_cache_file);
+    restore_path("query_file", query_file);
+    restore_path("query_result_root", query_result_root);
+    restore_path("ground_truth_cache_file", ground_truth_cache_file);
+    restore_path("bucket_ivf_index_file", bucket_ivf_index_file);
+    restore_path("bucket_index_file", bucket_index_file);
+    restore_path("raw_vector_file", raw_vector_file);
+    restore_path("raw_attr_dir", raw_attr_dir);
+    restore_path("raw_query_file", raw_query_file);
+}
 
 struct SharedProgressStats
 {
@@ -142,130 +209,6 @@ ParallelRunStats RunRateLimitedInjector(const std::vector<Query *> &query_ptrs,
     return run_stats;
 }
 
-
-bool LoadPreparedQueriesFromFvec(const std::vector<std::string> &query_paths,
-                                 int expected_dim,
-                                 int default_top_k,
-                                 std::vector<DataReader::PreparedQuery> &queries,
-                                 std::string &loaded_path)
-{
-    queries.clear();
-    loaded_path.clear();
-
-    if (expected_dim < 64 || default_top_k <= 0)
-    {
-        return false;
-    }
-
-    auto append_query = [&](const float *raw, int source_dim, size_t line_no) {
-        DataReader::PreparedQuery q;
-        q.query_vec.assign(static_cast<size_t>(expected_dim), 0.0f);
-        const int copy_dim = std::min<int>(64, std::min<int>(expected_dim, source_dim));
-        for (int d = 0; d < copy_dim; ++d)
-        {
-            q.query_vec[static_cast<size_t>(d)] = raw[static_cast<size_t>(d)];
-        }
-        q.filter_expr = "";
-        q.top_k = default_top_k;
-        q.line_no = line_no;
-        queries.push_back(std::move(q));
-    };
-
-    for (const auto &path : query_paths)
-    {
-        std::ifstream in(path, std::ios::binary);
-        if (!in)
-        {
-            continue;
-        }
-
-        in.seekg(0, std::ios::end);
-        const std::streamoff file_size = in.tellg();
-        in.seekg(0, std::ios::beg);
-        if (file_size < static_cast<std::streamoff>(sizeof(int32_t) * 2))
-        {
-            continue;
-        }
-
-        int32_t first = 0;
-        int32_t second = 0;
-        in.read(reinterpret_cast<char *>(&first), sizeof(int32_t));
-        in.read(reinterpret_cast<char *>(&second), sizeof(int32_t));
-        if (!in)
-        {
-            continue;
-        }
-
-        const std::streamoff headered_bytes = static_cast<std::streamoff>(sizeof(int32_t) * 2) +
-                                              static_cast<std::streamoff>(first) * static_cast<std::streamoff>(second) *
-                                                  static_cast<std::streamoff>(sizeof(float));
-
-        if (first > 0 && second >= 64 && file_size == headered_bytes)
-        {
-            const int32_t rows = first;
-            const int32_t source_dim = second;
-            std::vector<float> raw(static_cast<size_t>(source_dim));
-            queries.clear();
-            queries.reserve(static_cast<size_t>(rows));
-            for (int32_t i = 0; i < rows; ++i)
-            {
-                in.read(reinterpret_cast<char *>(raw.data()),
-                        static_cast<std::streamsize>(raw.size() * sizeof(float)));
-                if (!in)
-                {
-                    queries.clear();
-                    break;
-                }
-                append_query(raw.data(), source_dim, static_cast<size_t>(i + 1));
-            }
-            if (!queries.empty())
-            {
-                loaded_path = path;
-                return true;
-            }
-            continue;
-        }
-
-        in.clear();
-        in.seekg(0, std::ios::beg);
-        queries.clear();
-        size_t line_no = 0;
-        while (true)
-        {
-            int32_t dim = 0;
-            in.read(reinterpret_cast<char *>(&dim), sizeof(int32_t));
-            if (!in)
-            {
-                break;
-            }
-            if (dim < 64)
-            {
-                queries.clear();
-                break;
-            }
-
-            std::vector<float> raw(static_cast<size_t>(dim));
-            in.read(reinterpret_cast<char *>(raw.data()),
-                    static_cast<std::streamsize>(raw.size() * sizeof(float)));
-            if (!in)
-            {
-                queries.clear();
-                break;
-            }
-
-            ++line_no;
-            append_query(raw.data(), dim, line_no);
-        }
-
-        if (!queries.empty())
-        {
-            loaded_path = path;
-            return true;
-        }
-    }
-
-    return false;
-}
 
 bool CollectParallelLatencyMetrics(const std::vector<std::unique_ptr<Query>> &queries,
                                    std::vector<double> &total_end_to_end_ms,
@@ -652,22 +595,6 @@ void PrintParallelProgress(size_t submitted_count,
 
 int main()
 {
-    constexpr int kDefaultTopK = 100;
-    constexpr int QueryNum = 10000;
-    constexpr const char *kDatasetFile = "../../dataset_HW.bin";
-    const std::vector<std::string> kQueryPaths = {
-        "datasets/hw_queries.fvecs",
-        "../datasets/hw_queries.fvecs",
-        "../../datasets/hw_queries.fvecs",
-        "../../../datasets/hw_queries.fvecs"
-    };
-    // constexpr const char *kDatasetFile = "../../dataset_DEEP.bin";
-    // const std::vector<std::string> kQueryPaths = {
-    //     "queries/deep1B_queries.fvecs",
-    //     "../queries/deep1B_queries.fvecs",
-    //     "../../queries/deep1B_queries.fvecs",
-    //     "../../../queries/deep1B_queries.fvecs"
-    // };
     const fs::path config_path = RunSupport::ResolveConfigPath();
     std::cout << "[System] Loading config from " << config_path << "...\n";
     if (!LoadParams(config_path.string(), ResourceConfigProfile::Parallel))
@@ -675,84 +602,84 @@ int main()
         std::cerr << "[Error] Failed to load config: " << config_path << "\n";
         return -1;
     }
+    RestoreSrcStyleRelativePathsFromConfig(config_path.string());
+
     const fs::path query_result_root_dir =
         query_result_root.empty() ? fs::path(".") : fs::path(query_result_root);
     const fs::path memory_log_file = query_result_root_dir / "log" / "memory_logs.txt";
 
+    std::cout << "[Loader] Loading dataset cache...\n";
     DataReader::DatasetBuffers dataset_buffers;
-    if (!DataReader::LoadDatasetCache(kDatasetFile, dataset_buffers))
+    std::unordered_map<std::string, int> tag_map;
+    if (!DataReader::EnsureDatasetAndTagMapCaches(dataset_buffers, tag_map))
     {
-        std::cerr << "[Fatal] Failed to load dataset cache: " << kDatasetFile << "\n";
+        std::cerr << "[Fatal] Failed to prepare dataset/tag-map caches.\n";
         return -1;
     }
     std::cout << "[Loader] Dataset loaded. Docs=" << total_doc_num
               << ", Dim=" << vector_dim
               << ", Tags=" << total_tag_num
               << ", Buckets(Level1)=" << total_bucket_num_level_1 << "\n";
-
-    std::vector<DataReader::PreparedQuery> prepared_queries;
-    std::string loaded_query_path;
-    if (!LoadPreparedQueriesFromFvec(kQueryPaths,
-                                     vector_dim,
-                                     kDefaultTopK,
-                                     prepared_queries,
-                                     loaded_query_path))
+    std::cout << "[Loader] tag_map loaded. size=" << tag_map.size() << "\n";
+    std::cout << "[Loader] Loading queries...\n";
+    if (!DataReader::EnsurePreparedQueryFile())
     {
-        std::cerr << "[Fatal] Failed to read queries from deep1B_queries.fvecs\n";
+        std::cerr << "[Fatal] Failed to prepare query file: " << query_file << "\n";
         return -1;
     }
-    std::cout << "[Loader] Queries loaded from " << loaded_query_path << "\n";
+
+    std::vector<DataReader::PreparedQuery> prepared_queries;
+    std::vector<std::string> query_warnings;
+    DataReader::QueryLoadDiagnostics query_load_diagnostics;
+    DataReader::LoadFailureReason query_failure = DataReader::LoadFailureReason::None;
+    if (!DataReader::LoadPreparedQueries(query_file,
+                                         tag_map,
+                                         vector_dim,
+                                         prepared_queries,
+                                         query_warnings,
+                                         &query_load_diagnostics,
+                                         &query_failure))
+    {
+        if (query_failure != DataReader::LoadFailureReason::VectorDimMismatch)
+        {
+            std::cerr << "[Fatal] Failed to read query file: " << query_file << "\n";
+        }
+        return -1;
+    }
+    if (!RunSupport::WriteQueryLoadDiagnosticsFiles(query_result_root_dir, query_load_diagnostics))
+    {
+        std::cerr << "[Fatal] Failed to write query load diagnostics under "
+                  << (query_result_root_dir / "log") << "\n";
+        return -1;
+    }
+    if (!RunSupport::WritePreparedQueryFilterFile(query_result_root_dir, prepared_queries))
+    {
+        std::cerr << "[Fatal] Failed to write query boolean filters under "
+                  << (query_result_root_dir / "log") << "\n";
+        return -1;
+    }
+
+    for (const auto &warning : query_warnings)
+    {
+        std::cout << "[Warn] " << warning << "\n";
+    }
 
     if (prepared_queries.empty())
     {
-        std::cout << "[Info] No valid query found in " << loaded_query_path << ". Exit with code 0.\n";
+        std::cout << "[Info] No valid query found in " << query_file << ". Exit with code 0.\n";
         return 0;
     }
 
-    std::cout << "[Loader] Prepared query count from file: " << prepared_queries.size() << "\n";
-
-    // Truncate or expand to QueryNum using round-robin from loaded queries
-    if (static_cast<int>(prepared_queries.size()) > QueryNum) {
-        prepared_queries.resize(static_cast<size_t>(QueryNum));
-    } else {
-        const size_t base = prepared_queries.size();
-        prepared_queries.reserve(static_cast<size_t>(QueryNum));
-        for (size_t i = base; i < static_cast<size_t>(QueryNum); ++i) {
-            prepared_queries.push_back(prepared_queries[i % base]);
-        }
-    }
-    std::cout << "[Loader] Final query count: " << prepared_queries.size() << " (QueryNum=" << QueryNum << ")\n";
-
-    // Load filter expressions: read all from file, random assign to queries
+    // 1-query mode: duplicate first query 10000 times
     {
-        std::vector<std::string> filter_exprs;
-        const fs::path filter_expr_path = config_path.has_parent_path()
-                                              ? (config_path.parent_path() / "filter_expr_600.txt")
-                                              : fs::path("filter_expr_600.txt");
-        {
-            std::ifstream fexpr_file(filter_expr_path);
-            std::string line;
-            while (std::getline(fexpr_file, line)) {
-                if (!line.empty()) {
-                    filter_exprs.push_back(line);
-                }
-            }
+        DataReader::PreparedQuery first_q = std::move(prepared_queries[0]);
+        prepared_queries.clear();
+        prepared_queries.resize(10000, first_q);
+        for (size_t i = 0; i < prepared_queries.size(); ++i) {
+            prepared_queries[i].line_no = i + 1;
         }
-        if (filter_exprs.empty()) {
-            std::cerr << "[Warn] filter_expr.txt not found or empty at " << filter_expr_path
-                      << ". Using empty filters for all queries.\n";
-        }
-
-        if (!filter_exprs.empty()) {
-            std::mt19937 rng(42);
-            std::uniform_int_distribution<size_t> dist(0, filter_exprs.size() - 1);
-            for (size_t i = 0; i < prepared_queries.size(); ++i) {
-                prepared_queries[i].filter_expr = filter_exprs[dist(rng)];
-            }
-        }
-        std::cout << "[Loader] Assigned " << filter_exprs.size()
-                  << " filter expressions to " << prepared_queries.size() << " queries (random, seed=42)\n";
     }
+    std::cout << "[Loader] 1-query mode: first query duplicated to " << prepared_queries.size() << "\n";
 
     if (!RunSupport::ValidatePreparedQueriesAgainstPrealloc(prepared_queries))
     {
@@ -869,20 +796,9 @@ int main()
                   << ") != total_bucket_num_level_2 (" << total_bucket_num_level_2
                   << "). L0 scoring disabled.\n";
     }
-    if (!FinalizePreallocationParams())
-    {
-        return -1;
-    }
-
-    std::cout << "[Loader] Two-level bucket layout built. StoredDocRefs="
-              << RunSupport::CountStoredDocRefs(bucket_layout.level_1_bucket_doc_table)
-              << ", Level1BucketCount=" << bucket_layout.Level1BucketCount()
-              << ", Level2BucketCount=" << bucket_layout.Level2BucketCount() << "\n";
 
     std::cout << "[System] Initializing DataBaseCPU...\n";
-
-    // Scope: all NPU-dependent objects must destruct before aclFinalize.
-    {
+    { // NPU scope: db, groups, scheduler must destruct before aclFinalize
     DataBaseCPU db(dataset, std::move(bucket_layout));
 
     const size_t scheduler_capacity = prepared_queries.size() + 10000;
@@ -945,6 +861,7 @@ int main()
 
     // Warmup: push independent dummy queries through every WorkerGroup to pre-load
     // NPU kernels, warm HBM caches, and initialize thread-local buffers.
+    // Must use separate Query objects to avoid contaminating result state.
     {
         const size_t warmup_count = std::max(static_cast<size_t>(group_count) * 32, static_cast<size_t>(64));
         std::vector<std::unique_ptr<Query>> warmup_queries;

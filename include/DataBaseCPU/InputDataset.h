@@ -35,4 +35,8 @@ struct InputDataset
     // 3. 一级桶中心向量
     // 布局: [total_bucket_num_level_1 * vector_dim]
     const float *bucket_centroids;
+
+    // 4. L2→L0 mapping (optional, for L0 NPU score caching)
+    // Layout: [total_bucket_num_level_2], maps each L2 bucket to its L0 mesocluster
+    const uint32_t *l1_to_l0_map = nullptr;
 };
