@@ -1,0 +1,87 @@
+# Build
+old/out/
+new/out/
+**/build/
+# Exception: new/build/ is Huawei SOURCE (offline index builder + protos), not a
+# build-output dir. Re-include it despite the **/build/ rule above.
+!new/build/
+!new/build/**
+port/build/
+build_device/
+cmake-build-*/
+*.o
+*.a
+*.so
+
+# Data / cache (all .bin; no exceptions)
+*.bin
+*.bin.bak
+*.fvecs
+old/datasets/
+old/buckets/
+**/ground_truth_cache*
+
+# Test: restored raw production dumps (keep .py scripts)
+old/test/restored/*
+!old/test/restored/**/
+!old/test/restored/**/*.py
+old/test/restored_65k/*
+!old/test/restored_65k/**/
+!old/test/restored_65k/**/*.py
+old/test/restored_10m/
+old/test/**/section.*
+old/test/**/inverted_union/
+old/test/**/relevance_*/
+old/test/**/QueryData*.txt
+
+# Results
+old/result/
+new/result/
+
+# Large local index data (built indexes live in the repo dir on the NPU server; GBs, never commit)
+/frnew_10m/
+/frnew_idx/
+/frnew_syn*/
+
+# run.sh pipeline outputs (build+convert+index+search wrapper) + its input data drops
+# default per-config runs live under runs/<seg..._den...>/{work,result}/
+/work/
+/result/
+/runs/
+/dataset.bin
+/tag_map.bin
+/QueryData_10000.txt
+
+# Local git credentials
+.git-credentials
+**/.git-credentials
+.ssh/
+
+# Local secrets for run.sh notifications (NOTIFY_API_KEY etc.)
+.notify.env
+
+# Python
+__pycache__/
+*.pyc
+
+# Logs
+*.log
+# Server-side scratch dir for experiment runs: .log plus .tsv latency dumps that
+# the *.log rule above would miss.
+/logs/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+
+# Profiling
+*.perf.data
+flamegraph.svg
+
+# Code review graph
+.code-review-graph/

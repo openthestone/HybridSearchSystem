@@ -1,0 +1,40 @@
+syntax = "proto3";
+package Building;
+
+message IndexBuilderConfig {
+    repeated SectionInfo section_infos = 1;
+    repeated AttachmentInfo attachment_infos = 2;
+    uint32 version = 3;
+    SegmentInfo segment_info = 4;
+}
+
+message SectionInvertedInfo {
+    bool is_matrix_posting = 1; // defaults to bitmap type, otherwise matrix
+    float density_threshold = 2; // density threshold; below it means sparse posting, otherwise dense
+}
+
+message SectionInfo {
+    string name = 1;
+    bool doc_index = 2;   // if true, build posting (inverted) index
+    bool pos_index = 3;
+    bool vec_index = 4;   // if true, build vector index
+    FusionVectorInfo vector_info = 5;
+    SectionInvertedInfo inverted_info = 6;
+}
+
+message AttachmentInfo {
+    string name = 1;
+    bool is_docid = 2;  // whether this is an id file
+    bool is_sdocid = 3; // whether the id is a string type
+}
+
+message FusionVectorInfo {
+    uint32 dimension = 1;
+}
+
+message SegmentInfo {
+    uint32 doc_num = 1;  // total number of documents
+    uint32 segment_num = 2; // number of segments
+    uint32 doc_num_per_segment = 3;  // documents per segment; the last segment may be partial
+    uint32 split_doc_num_zn = 4; // vector fields are chunked by this value, Zn format within a chunk, padded if short
+}
