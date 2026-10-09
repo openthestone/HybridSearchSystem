@@ -421,6 +421,7 @@ one_run() {   # <tag> <第几个样本> [额外的 env 赋值...]
             echo 3 > /proc/sys/vm/drop_caches 2>/dev/null \
                 && echo "  [页缓存已清]" || echo "  [Warn] 清不了页缓存（要 root），这次是热的"
         fi
+        pkill -9 python
         env "${environment[@]}" "${command[@]}"
         echo "########## end tag=${tag} rep=${sample} rc=$? ##########"
     } 2>&1 | tee -a "${PARSE_LOG}"
@@ -523,7 +524,7 @@ index)
     # 加载只在进程启动时发生一次，所以每次只跑少量查询；--repeat 3 就是三次加载样本。
     PARALLEL_LOAD="${PARALLEL_LOAD:-1}"
     BATCH_SIZE="${BATCH_SIZE:-1}"; REPEAT="${REPEAT:-3}"
-    NUM_QUERIES="${NUM_QUERIES_INDEX:-100}"
+    NUM_QUERIES="${NUM_QUERIES_INDEX:-10888}"
     RUN_TOTAL=1
     SHOW_SHARD_COLUMNS=1
     echo "== 索引加载与大小 == PARALLEL_LOAD=${PARALLEL_LOAD}  ${CARD_COUNT} 卡 ${DEVICE_IDS}" \

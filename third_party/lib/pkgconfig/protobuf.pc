@@ -1,0 +1,11 @@
+prefix=/home/ma-user/work/sks/hx_npu/third_party
+exec_prefix=/home/ma-user/work/sks/hx_npu/third_party
+libdir=/home/ma-user/work/sks/hx_npu/third_party/lib
+includedir=/home/ma-user/work/sks/hx_npu/third_party/include
+
+Name: Protocol Buffers
+Description: Google's Data Interchange Format
+Version: 3.21.12.0
+Libs: -L${libdir} -lprotobuf 
+Cflags: -I${includedir}
+Conflicts: protobuf-lite
