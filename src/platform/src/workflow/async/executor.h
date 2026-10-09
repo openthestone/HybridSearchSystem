@@ -32,16 +32,13 @@
 #include <vector>
 
 #include "src/common/error_code.h"
+#include "src/utils/env_switch.h"
 
 namespace NpuRetrieval {
 
 // Worker count from env NPUR_EXECUTOR_THREADS (default 1 = serial), read once.
 inline int ExecutorThreads() {
-    static int n = [] {
-        const char* e = std::getenv("NPUR_EXECUTOR_THREADS");
-        int v = (e != nullptr) ? std::atoi(e) : 1;
-        return v > 0 ? v : 1;
-    }();
+    static int n = [] { return static_cast<int>(npur_env::PositiveOr("NPUR_EXECUTOR_THREADS", 1)); }();
     return n;
 }
 
@@ -49,10 +46,7 @@ inline int ExecutorThreads() {
 // segment tasks). Prints at most every ~2s to stderr. Enabled by default when a
 // Wait() has many tasks; disable with NPUR_PROGRESS=0.
 inline bool ProgressEnabled() {
-    static bool on = [] {
-        const char* e = std::getenv("NPUR_PROGRESS");
-        return (e == nullptr) || (std::atoi(e) != 0);
-    }();
+    static bool on = [] { return npur_env::OnByDefaultNumeric("NPUR_PROGRESS"); }();
     return on;
 }
 

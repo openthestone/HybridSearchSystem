@@ -17,33 +17,33 @@ GmMemoryManager::GmMemoryManager() {
     m_memoryPools[static_cast<size_t>(GmPoolName::TEXT_FILTER_STACK_POOL)] = std::make_shared<GmMemoryPool>(
         GmPoolName::TEXT_FILTER_STACK_POOL,
         FLAGS_full_recall_batch_search_thread_num * FLAGS_full_recall_batch_accumulation_max_size, 0);
-    // The bitlist2set bitset buffer is hundreds of MB per query; without pooling each
-    // query would aclrtMalloc/aclrtFree a huge HBM block (measured free ~36ms, 61% of
-    // query latency). Enable reuse with a non-zero blockNum; leave blockSize 0 so the
-    // first query sizes it lazily, and the pool auto-grows and refills when a block is
-    // too small (see GmMemoryPool::Allocate/Deallocate).
+    // Hundreds of MB per query; a raw aclrtFree of one measured ~36ms. blockSize 0 sizes it lazily
+    // on the first query, and the pool auto-grows when a block is too small.
     m_memoryPools[static_cast<size_t>(GmPoolName::TEXT_FILTER_BITLIST2SET_POOL)] = std::make_shared<GmMemoryPool>(
         GmPoolName::TEXT_FILTER_BITLIST2SET_POOL, FLAGS_full_recall_batch_search_thread_num, 0);
-    m_memoryPools[static_cast<size_t>(GmPoolName::AGGREGATOR_POOL)] =
-        std::make_shared<GmMemoryPool>(GmPoolName::AGGREGATOR_POOL, FLAGS_full_recall_batch_search_thread_num * 4,
-                                       0);  // 4x the scoring pool; 3x should suffice, keep one extra in reserve.
-    // Small fixed scratch buffers for the aggregation stage (effectiveCountDevice /
-    // docNumberInDevice / TOPKResultCountInDevice). These were raw aclrtMalloc/aclrtFree
-    // per query -- a device free syncs the stream and occasionally stalls for ms = the
-    // p99 tail. Use a dedicated small pool: non-zero blockSize preallocates (1280B =
-    // RESULT_MESSAGE_BYTE_SIZE_IN_DEVICE, covers the largest of the three and avoids a
-    // lazy-regrow spike), blockNum=thread_num*4 (peak concurrency is 2 blocks per query,
-    // ample margin).
+    // 3 blocks per query, and NPUR_BATCH_AGGREGATE holds every query's 3 at once, so the cap has
+    // to scale with the batch: everything past it is a raw aclrtFree of a ~20MB block per chunk
+    // (513.8 qps against 1416.0 unbatched at BATCH_SIZE=16). The 4th block per query is reserve.
+    m_memoryPools[static_cast<size_t>(GmPoolName::AGGREGATOR_POOL)] = std::make_shared<GmMemoryPool>(
+        GmPoolName::AGGREGATOR_POOL,
+        FLAGS_full_recall_batch_search_thread_num * 4 * FLAGS_full_recall_batch_accumulation_max_size, 0);
+    // Small fixed scratch for the aggregation stage. A raw device free syncs the stream and
+    // occasionally stalls for ms -- the p99 tail. blockSize 1280B =
+    // RESULT_MESSAGE_BYTE_SIZE_IN_DEVICE covers the largest of the three and avoids a regrow spike.
     m_memoryPools[static_cast<size_t>(GmPoolName::AGGREGATOR_SCRATCH_POOL)] = std::make_shared<GmMemoryPool>(
         GmPoolName::AGGREGATOR_SCRATCH_POOL, FLAGS_full_recall_batch_search_thread_num * 4, 1280);
-    // Small host->device pointer table (segmentsNum * postingsNum * 8B, a few KB) rebuilt
-    // for every query in TextFilter::Compute. It used to be a raw aclrtMalloc/aclrtFree pair
-    // per query; the device free syncs the stream and occasionally stalls for ms -- the
-    // PostingBitListToSet p99 tail. Pool it: blockSize 0 sizes lazily on the first query and
-    // the pool auto-grows to the largest table seen (postingsNum varies per filter), blockNum
-    // = thread_num since at most one table is live per in-flight query.
+    // Small host->device pointer table rebuilt per query in TextFilter::Compute. blockSize 0 sizes
+    // lazily and the pool grows to the largest table seen (postingsNum varies per filter).
+    // NPUR_OVERLAP_POSTING holds one table per query in the batch, not one per in-flight query.
     m_memoryPools[static_cast<size_t>(GmPoolName::TEXT_FILTER_POSTINGS_POOL)] = std::make_shared<GmMemoryPool>(
-        GmPoolName::TEXT_FILTER_POSTINGS_POOL, FLAGS_full_recall_batch_search_thread_num, 0);
+        GmPoolName::TEXT_FILTER_POSTINGS_POOL,
+        FLAGS_full_recall_batch_search_thread_num * FLAGS_full_recall_batch_accumulation_max_size, 0);
+    // The scorer's padded query matrix and the filter's concatenated postfix expressions, one of
+    // each per batch in flight. Only used under NPUR_POOL_SMALL_H2D=1.
+    m_memoryPools[static_cast<size_t>(GmPoolName::SCORER_QUERY_POOL)] =
+        std::make_shared<GmMemoryPool>(GmPoolName::SCORER_QUERY_POOL, FLAGS_full_recall_batch_search_thread_num, 0);
+    m_memoryPools[static_cast<size_t>(GmPoolName::TEXT_FILTER_EXPR_POOL)] =
+        std::make_shared<GmMemoryPool>(GmPoolName::TEXT_FILTER_EXPR_POOL, FLAGS_full_recall_batch_search_thread_num, 0);
 }
 
 const std::shared_ptr<GmMemoryPool> GmMemoryManager::GetMemoryPool(const GmPoolName poolName) {

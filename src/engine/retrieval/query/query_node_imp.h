@@ -16,6 +16,7 @@ class AndNode : public QueryNode {
    public:
     bool GetPostOrderExpression(const DataTable& dataTable, std::vector<uint32_t>& postExpr,
                                 std::vector<std::vector<uint8_t>*>& postingTypes,
+                                std::vector<std::vector<uint16_t>*>& postingWeights,
                                 std::vector<std::vector<uint8_t*>*>& postingDeviceAddrs,
                                 uint32_t& opNum) const override;
     QueryNodeType GetNodeType() const override {
@@ -31,6 +32,7 @@ class OrNode : public QueryNode {
    public:
     bool GetPostOrderExpression(const DataTable& dataTable, std::vector<uint32_t>& postExpr,
                                 std::vector<std::vector<uint8_t>*>& postingTypes,
+                                std::vector<std::vector<uint16_t>*>& postingWeights,
                                 std::vector<std::vector<uint8_t*>*>& postingDeviceAddrs,
                                 uint32_t& opNum) const override;
     QueryNodeType GetNodeType() const override {
@@ -46,6 +48,7 @@ class NotNode : public QueryNode {
    public:
     bool GetPostOrderExpression(const DataTable& dataTable, std::vector<uint32_t>& postExpr,
                                 std::vector<std::vector<uint8_t>*>& postingTypes,
+                                std::vector<std::vector<uint16_t>*>& postingWeights,
                                 std::vector<std::vector<uint8_t*>*>& postingDeviceAddrs,
                                 uint32_t& opNum) const override;
     QueryNodeType GetNodeType() const override {
@@ -65,12 +68,14 @@ class TermNode : public QueryLeafNode {
     bool IsNodeValid(const std::unordered_set<std::string>& postingFields) const override;
     bool GetPostOrderExpression(const DataTable& dataTable, std::vector<uint32_t>& postExpr,
                                 std::vector<std::vector<uint8_t>*>& postingTypes,
+                                std::vector<std::vector<uint16_t>*>& postingWeights,
                                 std::vector<std::vector<uint8_t*>*>& postingDeviceAddrs,
                                 uint32_t& opNum) const override;
     QueryNodeType GetNodeType() const override {
         return QueryNodeType::TermNode;
     };
     bool AppendPostings(const DataTable& dataTable, std::vector<std::vector<uint8_t>*>& postingTypes,
+                        std::vector<std::vector<uint16_t>*>& postingWeights,
                         std::vector<std::vector<uint8_t*>*>& postingDeviceAddrs) const override;
 
     std::string GetName() const override {
@@ -90,6 +95,7 @@ class TermsNode : public QueryLeafNode {
     bool IsNodeValid(const std::unordered_set<std::string>& postingFields) const override;
     bool GetPostOrderExpression(const DataTable& dataTable, std::vector<uint32_t>& postExpr,
                                 std::vector<std::vector<uint8_t>*>& postingTypes,
+                                std::vector<std::vector<uint16_t>*>& postingWeights,
                                 std::vector<std::vector<uint8_t*>*>& postingDeviceAddrs,
                                 uint32_t& opNum) const override;
     QueryNodeType GetNodeType() const override {
@@ -97,6 +103,7 @@ class TermsNode : public QueryLeafNode {
     };
 
     bool AppendPostings(const DataTable& dataTable, std::vector<std::vector<uint8_t>*>& postingTypes,
+                        std::vector<std::vector<uint16_t>*>& postingWeights,
                         std::vector<std::vector<uint8_t*>*>& postingDeviceAddrs) const override;
 
     std::string GetName() const override {
@@ -118,12 +125,14 @@ class OrTermsNode : public QueryLeafNode {
    public:
     bool GetPostOrderExpression(const DataTable& dataTable, std::vector<uint32_t>& postExpr,
                                 std::vector<std::vector<uint8_t>*>& postingTypes,
+                                std::vector<std::vector<uint16_t>*>& postingWeights,
                                 std::vector<std::vector<uint8_t*>*>& postingDeviceAddrs,
                                 uint32_t& opNum) const override;
     QueryNodeType GetNodeType() const override {
         return QueryNodeType::OrTermsNode;
     };
     bool AppendPostings(const DataTable& dataTable, std::vector<std::vector<uint8_t>*>& postingTypes,
+                        std::vector<std::vector<uint16_t>*>& postingWeights,
                         std::vector<std::vector<uint8_t*>*>& postingDeviceAddrs) const override;
 
     std::string GetName() const override {
@@ -138,6 +147,7 @@ class ConjunctionNode : public QueryNode {
     ~ConjunctionNode() override = default;
     bool GetPostOrderExpression(const DataTable& dataTable, std::vector<uint32_t>& postExpr,
                                 std::vector<std::vector<uint8_t>*>& postingTypes,
+                                std::vector<std::vector<uint16_t>*>& postingWeights,
                                 std::vector<std::vector<uint8_t*>*>& postingDeviceAddrs,
                                 uint32_t& opNum) const override;
     QueryNodeType GetNodeType() const override {

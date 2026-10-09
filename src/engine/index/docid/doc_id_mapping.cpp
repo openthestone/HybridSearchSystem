@@ -10,7 +10,6 @@
 
 namespace NpuRetrieval {
 bool DocIdMapping::ResolveIdMappingDir(std::string& realInputDir) {
-    // input directory
     std::string idMappingDir = m_dataDir + "/" + ID_MAPPING_DIR;
     if (!GetRealFilePath(idMappingDir, realInputDir)) {
         LOG_ERROR("GetRealFilePath of idMappingDir failed.");
@@ -27,7 +26,6 @@ bool DocIdMapping::ResolveIdMappingDir(std::string& realInputDir) {
 bool DocIdMapping::ResolveSegmentPath(const std::string& inputDir, uint32_t segmentId, std::string& filePath) {
     filePath = inputDir + "/" + POISSONENGINE + UNDERLINE + std::to_string(m_version) + UNDERLINE +
                std::to_string(segmentId) + ID_MAPPING_FILE_SUFFIX;
-    // check the file exists
     std::error_code ec;
     if (!std::filesystem::exists(filePath, ec)) {
         LOG_ERROR("idMapping file not exists. file path:" << filePath);
@@ -37,7 +35,6 @@ bool DocIdMapping::ResolveSegmentPath(const std::string& inputDir, uint32_t segm
 }
 
 bool DocIdMapping::Load() {
-    // read the idm segment files in order
     std::string idMappingDir;
     if (!ResolveIdMappingDir(idMappingDir)) {
         return false;
@@ -48,7 +45,6 @@ bool DocIdMapping::Load() {
         if (!ResolveSegmentPath(idMappingDir, i, filePath)) {
             return false;
         }
-        // open the file in binary mode
         std::ifstream ifs(filePath, std::ios::binary | std::ios::in);
         if (!ifs.is_open()) {
             LOG_ERROR("open idmapping file failed, file:" << filePath);
@@ -61,7 +57,6 @@ bool DocIdMapping::Load() {
             return false;
         }
         m_headerLength = static_cast<uint32_t>(ifs.tellg());
-        // version check
         if (version != m_version) {
             LOG_ERROR("m_version:" << m_version << " version:" << version << " not same, please check");
             ifs.close();
@@ -87,11 +82,9 @@ bool DocIdMapping::Load() {
 }
 
 void DocIdMapping::WarmGDocIds() const {
-    // create_result (result_aggregator.cpp) does ~topK random GetGDocId lookups
-    // into m_gDocIds (docNum * 8 bytes, ~80MB at 10M). Under memory pressure those
-    // pages get reclaimed, so the FIRST query after load faults them back in one at
-    // a time -> a cold-start p99 spike (seen: create_result x61, max ~470ms). Hint
-    // the kernel to keep/prefetch the whole array resident so lookups stay O(1).
+    // create_result does ~topK random GetGDocId lookups into m_gDocIds (~80MB at 10M docs). Under
+    // memory pressure those pages get reclaimed and the first query after load faults them back in
+    // one at a time -- a cold-start p99 spike. Hint the kernel to keep the array resident.
 #if defined(MADV_WILLNEED)
     if (!m_gDocIds.empty()) {
         madvise(const_cast<uint64_t*>(m_gDocIds.data()), m_gDocIds.size() * sizeof(uint64_t), MADV_WILLNEED);
@@ -130,7 +123,6 @@ bool DocIdMapping::ReadSdocidSegment(std::ifstream& ifs, uint32_t segmentId, uin
             return false;
         }
         uint32_t realOffset = sdocIdOffset + m_headerLength;
-        // read the length
         uint32_t sdocIdLength = 0;
         ifs.read(reinterpret_cast<char*>(&sdocIdLength), sizeof(sdocIdLength));
         if (ifs.gcount() != sizeof(sdocIdLength)) {
@@ -138,7 +130,6 @@ bool DocIdMapping::ReadSdocidSegment(std::ifstream& ifs, uint32_t segmentId, uin
             return false;
         }
         std::streampos originalPos = ifs.tellg();
-        // read the sdocid at realOffset
         ifs.seekg(realOffset, std::ios::beg);
         if (!ifs) {
             LOG_ERROR("seekg to offset fail");
@@ -151,7 +142,6 @@ bool DocIdMapping::ReadSdocidSegment(std::ifstream& ifs, uint32_t segmentId, uin
             LOG_ERROR("read sdocId fail");
             return false;
         }
-        // restore the position
         ifs.clear();
         ifs.seekg(originalPos, std::ios::beg);
         if (!ifs) {

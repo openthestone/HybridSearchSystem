@@ -33,6 +33,7 @@ class QueryNode {
 
     virtual bool GetPostOrderExpression(const DataTable& dataTable, std::vector<uint32_t>& postExpr,
                                         std::vector<std::vector<uint8_t>*>& postingTypes,
+                                        std::vector<std::vector<uint16_t>*>& postingWeights,
                                         std::vector<std::vector<uint8_t*>*>& postingDeviceAddrs,
                                         uint32_t& opNum) const = 0;
 
@@ -58,6 +59,7 @@ class QueryNode {
 class QueryLeafNode : public QueryNode {
    public:
     virtual bool AppendPostings(const DataTable& dataTable, std::vector<std::vector<uint8_t>*>& postingTypes,
+                                std::vector<std::vector<uint16_t>*>& postingWeights,
                                 std::vector<std::vector<uint8_t*>*>& postingDeviceAddrs) const = 0;
 };
 }  // namespace NpuRetrieval

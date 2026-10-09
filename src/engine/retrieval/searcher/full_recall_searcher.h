@@ -3,9 +3,9 @@
 #include <cstdint>
 #include <vector>
 #include "src/full_recall/index/data_table.h"
-#include "text_filter.h"
-#include "vector_scorer_mmad.h"
-#include "result_aggregator.h"
+#include "stage/text_filter.h"
+#include "stage/vector_scorer_mmad.h"
+#include "stage/result_aggregator.h"
 #include "src/workflow/async/executor.h"
 
 namespace NpuRetrieval {
@@ -32,6 +32,13 @@ class FullRecallSearcher {
     bool BatchSearch(std::vector<std::shared_ptr<FullRecallResult>>& fullRecallResults,
                      const std::string& vectorFieldName, bool isMultiShard);
 
+    // BatchSearch split into a device stage and a pure-CPU host stage, so a caller can overlap
+    // batch N's Extract with batch N+1's Device. deviceResults must be passed unchanged between them.
+    bool BatchSearchDevice(const std::string& vectorFieldName, bool isMultiShard,
+                           std::vector<AggrDeviceResult>& deviceResults);
+    bool BatchSearchExtract(std::vector<AggrDeviceResult>& deviceResults,
+                            std::vector<std::shared_ptr<FullRecallResult>>& fullRecallResults, bool isMultiShard);
+
     // the following combination is used for the vector-scoring-only path
     bool OneFilter(GmBlock& filterResultChunk);
     bool BatchScore(const std::string& vectorFieldName, GmBlock& resultChunk);
@@ -42,6 +49,12 @@ class FullRecallSearcher {
    private:
     bool RunAggregation(uint8_t* filterResultInDevice, uint8_t* resultInDevice,
                         std::vector<std::shared_ptr<FullRecallResult>>& fullRecallResults, bool isMultiShard);
+    // sharedStream / sharedStreamSynced: see ResultAggregator::AggrAndTopKDeviceBatch.
+    bool RunAggregationDevice(uint8_t* filterResultInDevice, uint8_t* resultInDevice,
+                              std::vector<AggrDeviceResult>& deviceResults, aclrtStream sharedStream = nullptr,
+                              bool* sharedStreamSynced = nullptr);
+    bool RunAggregationExtract(std::vector<AggrDeviceResult>& deviceResults,
+                               std::vector<std::shared_ptr<FullRecallResult>>& fullRecallResults, bool isMultiShard);
 
     const int32_t m_deviceId{};
     const std::shared_ptr<DataTable> m_dataTable{};

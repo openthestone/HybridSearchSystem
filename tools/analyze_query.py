@@ -87,7 +87,6 @@ def top_counter(name: str, ctr: Counter, top: int) -> None:
         emit(f"    {cnt:>10d}  {str(key)[:80]}")
 
 
-# ---- tag_map.bin (optional; for resolution) --------------------------------
 def load_tag_map(path: Path) -> Dict[str, int]:
     data = path.read_bytes()
     for size_t in (8, 4):
@@ -120,7 +119,6 @@ def _parse_tag_map(data: bytes, size_t: int) -> Tuple[Dict[str, int], int]:
     return out, off
 
 
-# ---- dataset.bin (optional; per-tag frequency for selectivity/commonness) ---
 def sample_tag_freq(path: Path, sample: int, seed: int) -> Optional[Dict[int, float]]:
     with path.open("rb") as f:
         head = f.read(40)
@@ -162,7 +160,6 @@ def sample_tag_freq(path: Path, sample: int, seed: int) -> Optional[Dict[int, fl
     return {t: c / S for t, c in enumerate(hits) if c}
 
 
-# ---- syntax_filter tree ----------------------------------------------------
 class FilterStats:
     def __init__(self) -> None:
         self.node_types: Counter = Counter()
@@ -271,7 +268,6 @@ def eval_prob(node: Any, tag_map: Dict[str, int], frac: Dict[int, float]) -> flo
     return 1.0
 
 
-# ---- QueryData_*.txt -------------------------------------------------------
 def load_records(path: Path) -> List[Dict[str, Any]]:
     txt = path.read_text(encoding="utf-8", errors="replace").strip()
     if not txt:

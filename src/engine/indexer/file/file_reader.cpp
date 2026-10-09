@@ -6,13 +6,11 @@
 namespace NpuRetrieval {
 bool ReadAndDoTask(const std::string& inputPath,
                    std::function<bool(GlobalDocID, uint32_t, uint32_t, const std::string&)> task) {
-    // read the file in binary mode
     std::ifstream ifs(inputPath, std::ios::binary | std::ios::in);
     if (!ifs.is_open()) {
         LOG_ERROR("open input file failed, file:" << inputPath);
         return false;
     }
-    // read the file header
     uint32_t count = 0;
     ifs.read(reinterpret_cast<char*>(&count), sizeof(count));
     if (ifs.gcount() != sizeof(count)) {
@@ -67,23 +65,19 @@ bool ReadAndDoTaskFromMemory(const std::string& fieldName, uint32_t segmentId,
     uint32_t count = *reinterpret_cast<const uint32_t*>(data.data());
     offset += sizeof(uint32_t);
     LOG_DEBUG("read memory data field:" << fieldName << " segment:" << segmentId << " doc count:" << count);
-    // process each document
     for (uint32_t i = 0; i < count; i++) {
         if (offset + sizeof(uint32_t) > data.size()) {
             LOG_ERROR("Invalid data format - missing length");
             return false;
         }
-        // read the length
         uint32_t len = *reinterpret_cast<const uint32_t*>(data.data() + offset);
         offset += sizeof(uint32_t);
         if (offset + sizeof(GlobalDocID) > data.size()) {
             LOG_ERROR("Invalid data format - missing gdocid");
             return false;
         }
-        // read gdocid
         GlobalDocID gdocid = *reinterpret_cast<const GlobalDocID*>(data.data() + offset);
         offset += sizeof(GlobalDocID);
-        // compute the pb data size
         uint32_t pbLen = len - sizeof(GlobalDocID);
         if (offset + pbLen > data.size()) {
             LOG_ERROR("Invalid data format - missing pb data");

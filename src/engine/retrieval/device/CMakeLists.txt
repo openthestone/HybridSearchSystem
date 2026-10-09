@@ -15,7 +15,8 @@ include(${ASCENDC_CMAKE_DIR}/ascendc.cmake)
 
 set(CMAKE_INSTALL_PREFIX "../ascend_device/" CACHE STRING "path for install()" FORCE)
 set(CMAKE_INSTALL_LIBDIR lib)
-file(GLOB KERNEL_FILES kernel_bitmap_text_filter.cpp kernel_aggregator.cpp kernel_vector_mmad_op.cpp kernel_topk.cpp)
+file(GLOB KERNEL_FILES filter/kernel_bitmap_text_filter.cpp aggregator/kernel_aggregator.cpp
+                      scorer/kernel_vector_mmad_op.cpp topk/kernel_topk.cpp)
 
 ascendc_library(ascend_device SHARED ${KERNEL_FILES})
 ascendc_compile_definitions(ascend_device PRIVATE TRIGGER_ERROR=0)

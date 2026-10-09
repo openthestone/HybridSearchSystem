@@ -1,6 +1,5 @@
-// Tests for src/harness/query_io.h — the .fvecs query loader (headered format
-// used by hw_queries.fvecs, and per-vector standard fvecs). Writes temp files.
-#include "src/harness/query_io.h"
+// Tests for src/harness/query/query_io.h: the .fvecs query loader. Writes temp files.
+#include "src/harness/query/query_io.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -33,7 +32,6 @@ static void wF32(std::ofstream& o, float v) {
 int main() {
     using npur_port::LoadQueries;
 
-    // ---- headered format: [i32 rows][i32 dim][rows*dim f32] (hw_queries.fvecs) ----
     {
         std::string p = tmp("headered.fvecs");
         std::ofstream o(p, std::ios::binary);
@@ -53,7 +51,6 @@ int main() {
         CHECK(q.size() == 3 && q[1][0] == 10.0f);
     }
 
-    // ---- per-vector standard fvecs: [i32 dim][dim f32] repeated ----
     {
         std::string p = tmp("pervec.fvecs");
         std::ofstream o(p, std::ios::binary);
@@ -71,7 +68,6 @@ int main() {
         CHECK(q.size() == 2 && q[1][2] == 102.0f);
     }
 
-    // ---- dim=64 headered (the real case) ----
     {
         std::string p = tmp("dim64.fvecs");
         std::ofstream o(p, std::ios::binary);
@@ -86,7 +82,6 @@ int main() {
         CHECK(q.size() == 5 && q[4][63] == static_cast<float>(5 * 64 - 1));
     }
 
-    // ---- error cases ----
     {
         std::vector<std::vector<float>> q;
         std::string err;

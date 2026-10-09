@@ -1,32 +1,16 @@
-// =============================================================================
-// build_input — Phase 5 data converter.
+// build_input: produces the offline builder's INPUT from synthetic data or a dataset_HW.bin
+// subset. Standalone (protobuf only; no gflags/CANN), built via src/CMakeLists.txt.
 //
-// Produces the offline builder's INPUT from either synthetic data or a
-// dataset_HW.bin subset. Output layout (consumed by engine/indexer/builder):
+//   <out>/schema.json                     JSON of Building.IndexBuilderConfig
+//   <out>/docid/attachment.docid.<seg>    id attachment field
+//   <out>/content/section.content.<seg>   vector + tags, one Section/doc
 //
-//   <out>/schema.json                                  (JSON of Building.IndexBuilderConfig)
-//   <out>/docid/attachment.docid.<seg>                 (id attachment field)
-//   <out>/content/section.content.<seg>                (vector + tags, one Section/doc)
+// Each field file is [u32 count], then count x [u32 len][u64 gdocid][len-8 bytes protobuf].
+// The docid payload is empty (len == 8); the content payload is a Building.Section carrying
+// float_embedding[0] and one TermInfo{uint64Value = tagId} per set tag.
 //
-// Each field file is a length-delimited stream (see engine/indexer/file/file_reader.cpp):
-//   [u32 count]
-//   repeat count: [u32 len][u64 gdocid][ len-8 bytes protobuf ]
-// For the docid file the protobuf payload is empty (len == 8): the builder only
-// records gdocid for the gdocid (non-string) case. For the content file the
-// payload is a serialized Building.Section carrying float_embedding[0] (the
-// vector, FP32) and one TermInfo{uint64Value = tagId} per set tag.
-//
-// The builder hashes tags as Hash64(std::to_string(tagId)); the search harness
-// must build TermNode tokens the same way. So here we emit RAW tag ids.
-//
-// Standalone (protobuf only; no gflags/CANN). Build via src/CMakeLists.txt.
-//
-// Usage:
-//   build_input --mode synthetic --out DIR [--docs N] [--dim 64] [--tag_num 35840]
-//               [--tags_per_doc 8] [--doc_num_per_segment 4096] [--split_doc_num_zn 0]
-//               [--density_threshold 0.05] [--seed 42]
-//   build_input --mode hw --dataset dataset_HW.bin --out DIR [--docs N] [same knobs]
-// =============================================================================
+// The builder hashes tags as Hash64(std::to_string(tagId)) and the harness must match, so RAW
+// tag ids are emitted here.
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -48,7 +32,9 @@
 #include <unordered_set>
 #include <vector>
 
+#include "../io/dataset_hw.h"
 #include "../io/record_io.h"
+#include "src/utils/env_switch.h"
 #include "src/full_recall/indexer/proto/document.pb.h"
 
 namespace {
@@ -153,11 +139,8 @@ bool ParseArgs(int argc, char** argv, Args& a) {
         return false;
     }
     if (a.split_doc_num_zn == 0) {
-        // Vector data is laid out in Zn doc-blocks. The searcher (VectorData::CheckData)
-        // requires split_doc_num_zn <= MAX_L0B_AVAILABLE_MEM_BYTES/dim = 16384/dim
-        // (256 for dim=64). Default to the largest such value that still fits a segment.
-        // NOTE: in --mode hw the real dim is read from the header later; for this
-        // project's dim=64 the default below (using the 64 default) is correct.
+        // VectorData::CheckData requires split_doc_num_zn <= MAX_L0B_AVAILABLE_MEM_BYTES/dim =
+        // 16384/dim (256 for dim=64). Default to the largest such value that still fits a segment.
         uint32_t max_zn = 16384u / (a.dim ? a.dim : 64u);
         if (max_zn == 0)
             max_zn = 1;
@@ -166,9 +149,7 @@ bool ParseArgs(int argc, char** argv, Args& a) {
     return true;
 }
 
-// Recursive mkdir -p: create every parent component, not just the last, so a
-// deep --out (e.g. .../builder_input/shardN) works even when the parents are
-// absent. EEXIST is ignored.
+// Recursive mkdir -p, so a deep --out works when the parents are absent. EEXIST is ignored.
 void MkDir(const std::string& p) {
     std::string cur;
     for (size_t i = 0; i < p.size(); ++i) {
@@ -180,26 +161,7 @@ void MkDir(const std::string& p) {
     }
 }
 
-// Record-envelope writers (WriteU32/WriteU64/WriteRecord) come from
-// ../common/record_io.h (shared with tests) via the using-declarations above.
-
-// --- dataset_HW.bin (HYDSET2) minimal reader --------------------------------
-#pragma pack(push, 1)
-struct HwHeader {
-    char magic[8];  // "HYDSET2\0"
-    uint32_t version;
-    uint32_t _pad0;
-    uint64_t doc_num;
-    uint32_t vector_dim;
-    uint32_t tag_num;
-    uint32_t reserved;
-    uint32_t _pad1;
-};
-#pragma pack(pop)
-static_assert(sizeof(HwHeader) == 40, "HYDSET2 header must be 40 bytes");
-
 std::string WriteSchemaJson(const Args& a, uint32_t seg_num, uint64_t doc_num) {
-    // JSON of Building.IndexBuilderConfig (lowerCamelCase json names).
     char buf[2048];
     std::snprintf(buf, sizeof(buf),
                   "{\n"
@@ -232,44 +194,25 @@ int main(int argc, char** argv) {
     if (!ParseArgs(argc, argv, a))
         return 1;
 
-    // Resolve corpus size / accessors.
-    const HwHeader* hdr = nullptr;
+    npur_port::HwDataset hw;
     const float* hw_vectors = nullptr;
     const uint64_t* hw_bitmaps = nullptr;
     uint32_t hw_stride = 0;
     uint64_t total_docs = 0;
 
     if (a.mode == "hw") {
-        // mmap (read-only) rather than reading the whole (up to 45G) file into RAM;
-        // we only touch the first N docs' vectors + bitmaps.
-        int fd = ::open(a.dataset.c_str(), O_RDONLY);
-        if (fd < 0) {
-            std::fprintf(stderr, "cannot open %s\n", a.dataset.c_str());
+        std::string err;
+        // `hw` holds the mapping the pointers below point into, so it must outlive the conversion.
+        if (!hw.Open(a.dataset, &err)) {
+            std::fprintf(stderr, "%s: %s\n", err.c_str(), a.dataset.c_str());
             return 1;
         }
-        struct stat st;
-        if (fstat(fd, &st) != 0) {
-            std::fprintf(stderr, "fstat failed\n");
-            return 1;
-        }
-        void* map = ::mmap(nullptr, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-        if (map == MAP_FAILED) {
-            std::fprintf(stderr, "mmap failed\n");
-            return 1;
-        }
-        const char* base = reinterpret_cast<const char*>(map);
-        hdr = reinterpret_cast<const HwHeader*>(base);
-        if (std::memcmp(hdr->magic, "HYDSET2", 7) != 0) {
-            std::fprintf(stderr, "bad magic\n");
-            return 1;
-        }
-        a.dim = hdr->vector_dim;
-        a.tag_num = hdr->tag_num;
-        hw_stride = (a.tag_num + 63u) / 64u;
-        hw_vectors = reinterpret_cast<const float*>(base + sizeof(HwHeader));
-        hw_bitmaps = reinterpret_cast<const uint64_t*>(base + sizeof(HwHeader) + hdr->doc_num * a.dim * sizeof(float));
-        total_docs = hdr->doc_num;
-        // map stays mapped until process exit (fine for a one-shot tool).
+        a.dim = hw.dim;
+        a.tag_num = hw.tag_num;
+        hw_stride = hw.stride;
+        hw_vectors = hw.vectors;
+        hw_bitmaps = hw.bitmaps;
+        total_docs = hw.doc_num;
     } else if (a.mode == "synthetic") {
         total_docs = a.docs;
     } else {
@@ -277,10 +220,9 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // This shard covers source docs [doc_offset, doc_offset + N). doc_offset=0 (default)
-    // reproduces the original prefix behavior. The written global id and the hw source
-    // row both use the absolute index (doc_offset + shard-local position), so each shard's
-    // DocIdMapping returns absolute global ids while its on-device local space stays [0, N).
+    // This shard covers source docs [doc_offset, doc_offset + N). The written global id and the hw
+    // source row both use the absolute index, so each shard's DocIdMapping returns absolute global
+    // ids while its on-device local space stays [0, N).
     if (a.doc_offset >= total_docs) {
         std::fprintf(stderr, "--doc_offset %llu >= source doc_num %llu, nothing to convert\n",
                      static_cast<unsigned long long>(a.doc_offset), static_cast<unsigned long long>(total_docs));
@@ -299,15 +241,11 @@ int main(int argc, char** argv) {
     MkDir(a.out + "/docid");
     MkDir(a.out + "/content");
 
-    // Per-tag document frequency for the exact corpus emitted to builder input.
-    // This is a diagnostic bridge for query-side posting misses: tag_map.bin only
-    // proves an id exists in the dictionary, while this proves whether the indexed
-    // documents actually contain that tag.
+    // tag_map.bin only proves an id exists in the dictionary; this proves the indexed documents
+    // actually contain that tag.
     std::vector<uint64_t> tagDocFreq(a.tag_num, 0);
     std::mutex tagDocFreqMtx;
 
-    // Each segment writes its own two files and (synthetic) uses a per-segment
-    // seeded RNG, so segments are independent and processed in parallel.
     std::atomic<bool> failed{false};
     auto processSeg = [&](uint32_t seg) {
         uint64_t seg_begin = static_cast<uint64_t>(seg) * P;
@@ -381,8 +319,7 @@ int main(int argc, char** argv) {
     nthreads = std::min<unsigned>(nthreads, seg_num);
 
     // Throttled progress (at most one line / ~2s). Disable with NPUR_PROGRESS=0.
-    const char* progEnv = std::getenv("NPUR_PROGRESS");
-    const bool progress = (progEnv == nullptr || std::atoi(progEnv) != 0) && seg_num >= 8;
+    const bool progress = npur_env::OnByDefaultNumeric("NPUR_PROGRESS") && seg_num >= 8;
     auto t0 = std::chrono::steady_clock::now();
     std::mutex printMtx;
     std::chrono::steady_clock::time_point lastPrint = t0;

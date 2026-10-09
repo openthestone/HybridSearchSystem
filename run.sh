@@ -3,15 +3,35 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE:-$0}")" && pwd)"
 
+_last_cmd=""
+trap '_last_cmd=${BASH_COMMAND}' DEBUG
+_on_exit() {
+    local rc=$?
+    [[ ${rc} -eq 0 ]] && return 0
+    echo "" >&2
+    echo "[FATAL] run.sh aborted: exit ${rc} at line ${BASH_LINENO[0]}" >&2
+    echo "        last command: ${_last_cmd}" >&2
+    echo "        (re-run with DEBUG=1 for stage checkpoints, DEBUG=2 for a full trace)" >&2
+}
+trap _on_exit EXIT
+
+DEBUG="${DEBUG:-0}"
+dbg() {
+    [[ "${DEBUG}" != "0" ]] || return 0
+    echo "[DEBUG] $*" >&2
+}
+if [[ "${DEBUG}" == "2" ]]; then
+    export PS4='+ ${BASH_SOURCE##*/}:${LINENO}: '
+    set -x
+fi
+dbg "run.sh start: pid=$$ bash=${BASH_VERSION} pwd=$(pwd)"
+
 # Local, gitignored secrets/config (e.g. NOTIFY_API_KEY). Never committed.
 if [[ -f "${ROOT_DIR}/.notify.env" ]]; then
     # shellcheck disable=SC1091
     source "${ROOT_DIR}/.notify.env"
 fi
 
-# SoC: honor an explicit SOC_VERSION override; otherwise auto-detect from
-# npu-smi (e.g. 910B3 on one server, 910B4 on another) so the same script runs
-# on both environments. Falls back to Ascend910B4 if detection is unavailable.
 if [[ -z "${SOC_VERSION:-}" ]]; then
     _soc_detected="$(npu-smi info 2>/dev/null | grep -oiE '910B[0-9]' | head -1 | tr '[:lower:]' '[:upper:]')"
     if [[ -n "${_soc_detected}" ]]; then
@@ -33,15 +53,16 @@ DATASET_FILE="${DATASET_FILE:-${ROOT_DIR}/dataset.bin}"
 TAG_MAP_FILE="${TAG_MAP_FILE:-${ROOT_DIR}/tag_map.bin}"
 QUERYDATA_FILE="${QUERYDATA_FILE:-${ROOT_DIR}/QueryData_10000.txt}"
 
-# Index-encoding knobs. Defined here (before WORK_DIR) so the default work/result
-# dirs can be tagged with them: each (segment, density) combo gets its own index
-# dir and never clobbers another. Explicit WORK_DIR/RESULT_DIR still override.
-# 262144: halves the segment count vs 131072, which halves the per-query posting
-# pointer table that PostingBitListToSet copies H2D. That stage drops from ~180us
-# to ~110us avg and, more importantly, its p99 from ~1000us to ~590us -- the p99
-# driver. See the block below for how this interacts with the filter core count.
+# Defined before WORK_DIR so the default work/result dirs can be tagged with them: each
+# (segment, density) combo gets its own index dir.
 DOC_NUM_PER_SEGMENT="${DOC_NUM_PER_SEGMENT:-262144}"
 DENSITY_THRESHOLD="${DENSITY_THRESHOLD:-0.05}"
+# Both are no-ops at threshold 0 (no sparse postings). Set either to 0 explicitly as a control arm.
+DENSITY_NONZERO=$(awk -v t="${DENSITY_THRESHOLD}" 'BEGIN { print (t + 0 > 0) ? 1 : 0 }')
+SPARSE_DIRECT="${SPARSE_DIRECT:-${DENSITY_NONZERO}}"
+OVERLAP_POSTING_BITLIST="${OVERLAP_POSTING_BITLIST:-${DENSITY_NONZERO}}"
+# Only ApplySparse reads it, and only for a tagged operand, so it is a no-op without SPARSE_DIRECT.
+OR_NO_TILE_CHECK="${OR_NO_TILE_CHECK:-${SPARSE_DIRECT}}"
 CONFIG_TAG="seg${DOC_NUM_PER_SEGMENT}_den${DENSITY_THRESHOLD}"
 RUNS_DIR="${RUNS_DIR:-${ROOT_DIR}/runs}"
 
@@ -53,6 +74,12 @@ RESULT_DIR="${RESULT_DIR:-${RUNS_DIR}/${CONFIG_TAG}/result}"
 
 GFLAGS_LIBRARY_DIR="${GFLAGS_LIBRARY_DIR:-}"
 PROTOBUF_LIBRARY_DIR="${PROTOBUF_LIBRARY_DIR:-}"
+# FindProtobuf matches libprotobuf.so/.a only -- a versioned libprotobuf.so.25.1.0 with no bare
+# symlink is NOT found, and the error reads "found version 4.25.1, missing Protobuf_LIBRARIES".
+PROTOBUF_ROOT="${PROTOBUF_ROOT:-}"
+PROTOBUF_LIBRARY="${PROTOBUF_LIBRARY:-}"
+PROTOBUF_INCLUDE_DIR="${PROTOBUF_INCLUDE_DIR:-}"
+PROTOC="${PROTOC:-}"
 ABSL_LIBRARY_DIR="${ABSL_LIBRARY_DIR:-}"
 EXTRA_LD_LIBRARY_PATH="${EXTRA_LD_LIBRARY_PATH:-}"
 
@@ -82,82 +109,61 @@ if [[ -n "${RAPIDJSON_INCLUDE_DIR}" \
 fi
 
 DOCS="${DOCS:-0}"
-# Scorer/filter AI-core counts. The two kernels run on separate hardware: the MMad
-# scorer on Cube (20 on 910B3), the bitmap filter on Vector (40).
-#
-# Filter = 40, i.e. the Vector core count. The filter's work is quantized by segment
-# count -- wall time is ceil(segments/cores) segments -- so the useful ceiling is
-# really min(40, segments). At DOC_NUM_PER_SEGMENT=131072 (~39 segments for 5M
-# docs/shard) the sweep showed exactly that shape: 16 cores -> 377us kernel, 20 ->
-# 291us, 32 -> 310us (WORSE -- still 2 segments/core, just more launch overhead),
-# 40 -> 233us (1 segment/core), 48 -> 233us (flat, segments used up). At the current
-# 262144 there are only ~20 segments, so 20 and 40 cores measure identically (265 vs
-# 268us) -- the extra 20 cores simply idle. 40 is kept because it degrades safely:
-# idle cores cost nothing, and it stays optimal if the segment count ever grows.
-# Note the kernel is dominated by ~200us of fixed overhead (fit: 201us + 2.06us/KB),
-# so doubling the per-core bytes only costs ~14% -- do not expect core count or
-# segment size to move this stage much.
-#
-# Scorer = 20, i.e. the Cube core count. Sweep of the kernel avg: 884us at 8, 820
-# at 12, 791 at 16, 782 at 20 (floor), 864 at 24 -- past 20 it oversubscribes Cube
-# and regresses. The returns are poor because the scorer is HBM-bandwidth bound
-# rather than compute bound (5x the cores buys only 1.67x), but 20 is still the
-# floor and nothing competes for Cube: the filter runs on Vector, and with the
-# score||filter overlap off by default the two never even run at the same time.
+# Scorer on Cube (20 cores on 910B3), filter on Vector (40). The filter is quantized by SEGMENT
+# count, so its useful ceiling is min(40, segments).
 FULL_RECALL_TEXT_FILTER_BLOCK_DIM="${FULL_RECALL_TEXT_FILTER_BLOCK_DIM:-40}"
+# Also the block count of four GmMemoryPools, so it multiplies the transient device memory.
+BATCH_SEARCH_THREADS="${BATCH_SEARCH_THREADS:-8}"
 SCORER_BLOCK_DIM="${SCORER_BLOCK_DIM:-20}"
-# NPU topk early-quit tolerance: the kernel stops narrowing once it is down to
-# topK*ratio candidates and returns them all, letting the host trim to topK. It
-# trades NPU iterations against host sort work, and the two nearly cancel:
-#
-#   ratio   TopK_NPU   std_sort_sort   sum     BatchSearch
-#   <=1.0     204us        297us       501us     2461us   (early-quit disabled)
-#   1.2       181          315         496       2414     <- knee
-#   1.5       178          329         507       2450
-#   2.0       174          345         519       2501
-#
-# 1.2 wins by ~36us on BatchSearch (-1.5%); recall is 100% at every value. Values
-# <=1.0 are all equivalent to disabling early-quit: the check sits in the branch
-# where candidates still exceed topK, so `accepted + candidates <= topK*ratio` is
-# unsatisfiable and the kernel always runs the full loop_count. See kernel_topk.h.
+# Capped at 40. The TAIL core gets the remainder, so pick a count that divides
+# blockNumber = ceil(docs/5888): at 5M docs/shard that is 850 = 2*5^2*17.
+AGGREGATOR_BLOCK_DIM="${AGGREGATOR_BLOCK_DIM:-16}"
+# Any value <= 1.0 disables early-quit -- the check is unsatisfiable there. See kernel_topk.h.
 NPU_TOPK_FINISH_BUFFER_RATIO="${NPU_TOPK_FINISH_BUFFER_RATIO:-1.2}"
 NUM_QUERIES="${NUM_QUERIES:-0}"
-# Queries per FullRecallSearcher batch. Default 1 = one query per BatchSearch, the
-# latency-oriented path. With >1 the harness times the whole batch and divides the
-# wall time by the batch size, so the reported "latency ms avg" becomes ms/query --
-# i.e. inverse throughput. Two caveats at BATCH_SIZE>1: p99 degenerates (every query
-# in a batch shares the batch-average value, so it is no longer a tail), and a
-# query's true latency is avg*BATCH_SIZE (the whole batch's wall). Use =1 for the p99
-# target, >1 to measure throughput headroom.
+# At >1, "latency ms avg" is ms/query, p99 degenerates (every query gets the batch average) and a
+# query's TRUE latency is avg*BATCH_SIZE. Use 1 for the p99 target.
 BATCH_SIZE="${BATCH_SIZE:-1}"
 WARMUP="${WARMUP:-5}"
-# ROUND_ROBIN=1: round-robin BASELINE (vs the sharded scheme). Every card loads the FULL
-# corpus and queries are work-stolen onto idle cards, each searched entirely on one card
-# (no cross-card merge). Pass ONE full-index dir in SHARD_INDEX_DIRS; it is replicated
-# across all DEVICE_IDS below. Reports throughput (queries/wall) + single-card latency.
+# Pass ONE full-index dir in SHARD_INDEX_DIRS; it is replicated across DEVICE_IDS below.
 ROUND_ROBIN="${ROUND_ROBIN:-0}"
+# The contract's "固定任务分配" baseline. Only differs from dynamic when workers are NOT equally fast.
+STATIC_ASSIGN="${STATIC_ASSIGN:-0}"
+# Simulated NPU load fluctuation (contract: 模拟的 NPU 负载波动), two mechanisms: SLOW_CARDS is a
+# host-side delay, NPU_LOAD_CARDS is real contention from fr_npuload (prefer it for acceptance).
+# Do NOT enable both at once or the disturbance is counted twice.
+NPU_LOAD_CARDS="${NPU_LOAD_CARDS:-}"
+NPU_LOAD_DUTY="${NPU_LOAD_DUTY:-0.5}"
+NPU_LOAD_PERIOD_MS="${NPU_LOAD_PERIOD_MS:-1000}"
+NPU_LOAD_COMPUTE_WORKERS="${NPU_LOAD_COMPUTE_WORKERS:-1}"
+NPU_LOAD_COPY_WORKERS="${NPU_LOAD_COPY_WORKERS:-1}"
+NPU_LOAD_COPY_BUFFER_MB="${NPU_LOAD_COPY_BUFFER_MB:-256}"
+NPU_LOAD_COPY_GAP_MS="${NPU_LOAD_COPY_GAP_MS:-2.0}"
+SLOW_CARDS="${SLOW_CARDS:-}"
+SLOW_FACTOR="${SLOW_FACTOR:-2.0}"
+SLOW_PERIOD_MS="${SLOW_PERIOD_MS:-1000}"
+SLOW_DUTY="${SLOW_DUTY:-0.5}"
+# Open-loop pacing: latency is measured from each query's ARRIVAL, so queueing counts. 0 = off.
+TARGET_QPS="${TARGET_QPS:-0}"
+# Multi-card only, and latency is NOT meaningful in this mode. Composes with SHARD_GROUP_SIZE.
+PIPELINE="${PIPELINE:-0}"
+# No cross-card merge here, so a per-shard ratio <1 would silently truncate (0.6 -> recall ~60%).
+if [[ "${ROUND_ROBIN}" == "1" && -n "${SHARD_TOPK_RATIO:-}" \
+      && "${SHARD_TOPK_RATIO}" != "1" && "${SHARD_TOPK_RATIO}" != "1.0" ]]; then
+    echo "[Warn] ROUND_ROBIN=1: ignoring SHARD_TOPK_RATIO=${SHARD_TOPK_RATIO} (no merge to restore the" >&2
+    echo "       dropped results; it would cap recall at ~${SHARD_TOPK_RATIO}x). Forcing 1.0." >&2
+    SHARD_TOPK_RATIO=1.0
+fi
 RECALL_QUERIES="${RECALL_QUERIES:-20}"
 DEFAULT_TOPK="${DEFAULT_TOPK:-100}"
 DEVICE_ID="${DEVICE_ID:-0}"
-# Multi-card: comma-separated NPU device ids (e.g. "0,1"). When set, the corpus
-# is split into one disjoint doc shard per card, each converted+built into its
-# own index, then searched multi-card with a host-side global top-K merge. Empty
-# = single-card on DEVICE_ID (unchanged).
 DEVICE_IDS="${DEVICE_IDS:-}"
-# Reuse pre-built shard indexes: comma-separated index dirs (one per DEVICE_IDS
-# entry). When set, convert+build are skipped and these are searched directly.
 SHARD_INDEX_DIRS="${SHARD_INDEX_DIRS:-}"
-# Optional: cache the CPU brute-force recall ground truth (fr_search
-# --recall_ref_file), computed once for all queries with RECALL_REF_THREADS cores.
 RECALL_REF_FILE="${RECALL_REF_FILE:-}"
 RECALL_REF_THREADS="${RECALL_REF_THREADS:-0}"
 BUILD_THREADS="${BUILD_THREADS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 32)}"
 CONVERT_THREADS="${CONVERT_THREADS:-${BUILD_THREADS}}"
 
-# Derive the shard layout. MULTICARD=1 activates the N-shard search path.
-# EXTERNAL_SHARDS=1 (SHARD_INDEX_DIRS set) reuses pre-built shard indexes and
-# skips convert+build; otherwise the corpus is split into DOCS/SHARD_NUM slices
-# and each is converted+built.
 SHARD_DEVICES=()
 if [[ -n "${DEVICE_IDS}" ]]; then
     IFS=',' read -r -a SHARD_DEVICES <<< "${DEVICE_IDS}"
@@ -169,19 +175,43 @@ if [[ -n "${SHARD_INDEX_DIRS}" ]]; then
     EXTERNAL_SHARDS=1
     IFS=',' read -r -a SHARD_INDEX_LIST <<< "${SHARD_INDEX_DIRS}"
 fi
-# Round-robin baseline: every card holds the WHOLE corpus, so replicate the single
-# full-index dir across all DEVICE_IDS (the user passes SHARD_INDEX_DIRS=<full> once).
+# Replicate the single full-index dir across all DEVICE_IDS.
 if [[ "${ROUND_ROBIN}" == "1" && "${EXTERNAL_SHARDS}" == "1" && "${#SHARD_INDEX_LIST[@]}" -eq 1 && "${SHARD_NUM}" -gt 1 ]]; then
     _full="${SHARD_INDEX_LIST[0]}"
     SHARD_INDEX_LIST=()
     for ((_i = 0; _i < SHARD_NUM; _i++)); do SHARD_INDEX_LIST+=("${_full}"); done
     SHARD_INDEX_DIRS="$(IFS=,; echo "${SHARD_INDEX_LIST[*]}")"
 fi
+# Every GROUP holds a full corpus split SHARD_GROUP_SIZE ways, so pass ONE group's shard dirs and
+# they are repeated per group. Cards group contiguously: the list must read s0,s1,...,s0,s1,...
+SHARD_GROUP_SIZE="${SHARD_GROUP_SIZE:-0}"
+if [[ "${SHARD_GROUP_SIZE}" -gt 0 && "${EXTERNAL_SHARDS}" == "1" \
+      && "${#SHARD_INDEX_LIST[@]}" -eq "${SHARD_GROUP_SIZE}" && "${SHARD_NUM}" -gt "${SHARD_GROUP_SIZE}" ]]; then
+    if (( SHARD_NUM % SHARD_GROUP_SIZE != 0 )); then
+        echo "[ERROR] DEVICE_IDS count (${SHARD_NUM}) is not a multiple of SHARD_GROUP_SIZE (${SHARD_GROUP_SIZE})." >&2
+        exit 1
+    fi
+    _grp=("${SHARD_INDEX_LIST[@]}")
+    SHARD_INDEX_LIST=()
+    for ((_g = 0; _g < SHARD_NUM / SHARD_GROUP_SIZE; _g++)); do SHARD_INDEX_LIST+=("${_grp[@]}"); done
+    SHARD_INDEX_DIRS="$(IFS=,; echo "${SHARD_INDEX_LIST[*]}")"
+fi
+# A group's merge spans only its OWN shards, so the ratio cannot go below 1/group-size.
+if [[ "${SHARD_GROUP_SIZE}" -gt 0 && -n "${SHARD_TOPK_RATIO:-}" \
+      && "${SHARD_TOPK_RATIO}" != "1" && "${SHARD_TOPK_RATIO}" != "1.0" ]]; then
+    if [[ "${SHARD_GROUP_SIZE}" -eq 1 ]]; then
+        echo "[Warn] SHARD_GROUP_SIZE=1: ignoring SHARD_TOPK_RATIO=${SHARD_TOPK_RATIO} (a one-shard group has" >&2
+        echo "       no merge to restore the dropped results; it would cap recall at ~${SHARD_TOPK_RATIO}x). Forcing 1.0." >&2
+        SHARD_TOPK_RATIO=1.0
+    elif awk -v r="${SHARD_TOPK_RATIO}" -v g="${SHARD_GROUP_SIZE}" 'BEGIN{exit !(r < 1/g)}'; then
+        echo "[ERROR] SHARD_TOPK_RATIO=${SHARD_TOPK_RATIO} is below 1/SHARD_GROUP_SIZE (1/${SHARD_GROUP_SIZE}): the" >&2
+        echo "        group's ${SHARD_GROUP_SIZE} shards cannot together supply a full topK, so recall is capped." >&2
+        exit 1
+    fi
+fi
 MULTICARD=0
 { [[ "${SHARD_NUM}" -gt 0 ]] || [[ "${EXTERNAL_SHARDS}" == "1" ]]; } && MULTICARD=1
 
-# Per-shard doc range: prints "<offset> <count>" for shard $1 over DOCS docs
-# split into SHARD_NUM contiguous slices (the last shard absorbs the remainder).
 shard_doc_range() {
     local i="$1"
     local base=$(( DOCS / SHARD_NUM ))
@@ -192,9 +222,7 @@ shard_doc_range() {
     echo "${off} ${cnt}"
 }
 
-# Email notification on successful search. Opt-in: NOTIFY=1. The API key must be
-# provided via NOTIFY_API_KEY (put it in the gitignored .notify.env). If NOTIFY=1
-# but no key is set, the run still succeeds and just skips the email.
+# Key in NOTIFY_API_KEY (the gitignored .notify.env). NOTIFY=1 with no key just skips the mail.
 NOTIFY="${NOTIFY:-0}"
 NOTIFY_URL="${NOTIFY_URL:-https://mail.xihe.me/api/send/notification}"
 NOTIFY_API_KEY="${NOTIFY_API_KEY:-}"
@@ -205,20 +233,11 @@ DO_CONVERT_DATA=1
 DO_BUILD_INDEX=1
 DO_SEARCH=1
 PROFILE_MODE=0
-# Repeat the search stage N times and report the cross-run median of the
-# end-to-end latency stats. The p99 tail of a single 10k-query run is not
-# reproducible run-to-run; the median de-noises it. Env-overridable, CLI wins.
+# Cross-run MEDIAN: a single 10k-query run's p99 is not reproducible run to run.
 REPEAT="${REPEAT:-1}"
-# A/B toggle for the devicePostings pooling optimization (engine env
-# NPUR_POOL_POSTINGS): 1=pooled (default), 0=raw per-query aclrtMalloc/aclrtFree
-# baseline. Lets the SAME binary profile both paths -- pair with --repeat for a
-# de-noised A/B. Env-overridable, CLI wins.
+# 1=pooled (default), 0=raw per-query aclrtMalloc/Free. Same binary either way; pair with --repeat.
 POOL_POSTINGS="${NPUR_POOL_POSTINGS:-1}"
-# Print a detailed memory report after the search: host peak RSS + per-device NPU
-# HBM used/total ([MEM] lines from fr_search --mem_report). Env-overridable, CLI wins.
 MEM_REPORT="${MEM_REPORT:-0}"
-# Background-sample per-device NPU AI Core usage (%) with npu-smi while the search
-# runs, then report avg/max/min per device. Tooling-only (no engine rebuild).
 NPU_UTIL="${NPU_UTIL:-0}"
 
 usage() {
@@ -231,7 +250,7 @@ Options:
   --convert-data <0|1>       Convert dataset.bin to builder input. Default: ${DO_CONVERT_DATA}
   --build-index <0|1>        Build new-project full-recall index. Default: ${DO_BUILD_INDEX}
   --search <0|1>             Run fr_search. Default: ${DO_SEARCH}
-  --profile <0|1|2>          1=per-stage NPU timing (NPUR_PERF): aggregate [PERF] lines into an
+  --profile <0|1|2>          1=per-stage NPU timing (NPUR_PERF): aggregate [Perf] lines into an
                              avg-per-stage table (add PERF_DUMP=1 for p99 tail attribution;
                              single-card only -- parallel shards scramble its buckets).
                              2=same timing, quiet: convert/build chatter goes to a log file and
@@ -255,6 +274,10 @@ Important environment overrides:
   QUERYDATA_FILE                     Original QueryData_10000.txt. Current: ${QUERYDATA_FILE}
   RAPIDJSON_INCLUDE_DIR              Directory containing rapidjson/document.h. Current: ${RAPIDJSON_INCLUDE_DIR:-not found}
   GFLAGS_LIBRARY_DIR                 Directory containing libgflags.so, if not in a standard path. Current: ${GFLAGS_LIBRARY_DIR:-auto}
+  PROTOBUF_ROOT                      Install prefix for find_package(Protobuf). Current: ${PROTOBUF_ROOT:-auto}
+  PROTOBUF_LIBRARY                   Full path to libprotobuf.so, if the prefix layout does not fit. Current: ${PROTOBUF_LIBRARY:-auto}
+  PROTOBUF_INCLUDE_DIR               Directory containing google/protobuf/. Current: ${PROTOBUF_INCLUDE_DIR:-auto}
+  PROTOC                             Full path to the protoc binary. Current: ${PROTOC:-auto}
   EXTRA_LD_LIBRARY_PATH              Extra runtime library dirs, colon-separated. Current: ${EXTRA_LD_LIBRARY_PATH:-empty}
   WORK_DIR                           Intermediate output root. Current: ${WORK_DIR}
   DOCS                               Docs to index, 0=all. Current: ${DOCS}
@@ -264,6 +287,7 @@ Important environment overrides:
   SCORER_BLOCK_DIM                   Runtime scorer (MMad) AI-core block dim. Current: ${SCORER_BLOCK_DIM}
   NUM_QUERIES                        Queries to run, 0=all converted queries. Current: ${NUM_QUERIES}
   RECALL_QUERIES                     CPU brute-force recall checks, 0=off. Current: ${RECALL_QUERIES}
+  HBM_SAMPLE                         Poll NPU memory every N seconds DURING the search and report the peak, 0=off. The before/after reports bracket the process and cannot see it. Costs one npu-smi fork per poll, so leave it off while measuring. Current: ${HBM_SAMPLE:-0}
   DEVICE_ID                          NPU device id (single-card). Current: ${DEVICE_ID}
   DEVICE_IDS                         comma-separated device ids for multi-card (e.g. 0,1); splits the
                                      corpus into one shard per card. Requires DOCS>0. Current: ${DEVICE_IDS:-unset (single-card)}
@@ -294,13 +318,10 @@ parse_profile_arg() {
     fi
 }
 
-# Run a compile/convert/build command, sending its output to a log file under
-# --profile 2 instead of the console. cmake alone emits a few hundred lines and
-# fr_converter/fr_builder add their own; none of it is interesting unless the step
-# fails, so on failure the tail is printed and the path named. Nothing is lost either
-# way, and the exit code always propagates.
+SKIPPED_STEPS=()
+
 run_build_tool() {
-    if [[ "${PROFILE_MODE}" != "2" ]]; then
+    if [[ "${VERBOSE_BUILD:-0}" == "1" ]]; then
         "$@"
         return $?
     fi
@@ -313,6 +334,23 @@ run_build_tool() {
         tail -30 "${build_log}" >&2 || true
     fi
     return "${rc}"
+}
+
+# Export <engine var>=1 when the wrapper switch is "1". A third argument is the wrapper's
+# default; WITHOUT one the wrapper must already be set, so `set -u` still catches a switch that
+# lost its definition. Always returns 0 so an off switch does not trip `set -e`.
+npur_switch() {
+    local val
+    if [[ $# -ge 3 ]]; then
+        val="${!1:-$3}"
+    elif [[ -z "${!1+set}" ]]; then
+        echo "[ERROR] $1 is unset; it has no default here and must be assigned above" >&2
+        exit 1
+    else
+        val="${!1}"
+    fi
+    [[ "${val}" == "1" ]] && export "$2=1"
+    return 0
 }
 
 parse_posint_arg() {
@@ -398,7 +436,6 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# Pre-built shards: reuse them, so convert+build are meaningless -> force off.
 if [[ "${EXTERNAL_SHARDS}" == "1" ]]; then
     if [[ "${SHARD_NUM}" -ne "${#SHARD_INDEX_LIST[@]}" ]]; then
         echo "[ERROR] SHARD_INDEX_DIRS has ${#SHARD_INDEX_LIST[@]} dir(s) but DEVICE_IDS has ${SHARD_NUM} id(s);" >&2
@@ -467,40 +504,57 @@ join_by_semicolon() {
     IFS="${old_ifs}"
 }
 
-# ---- optional NPU AI-core utilization sampler (npu-smi, tooling-only) --------
 NPU_UTIL_DIR=""
 NPU_UTIL_PID=""
 NPU_UTIL_DEVS=()
 
-# Per-device HBM already in use, sampled BEFORE fr_search starts. This is the only
-# unambiguous reading available: --mem-report calls aclrtGetMemInfo, which reports
-# device-wide HBM and cannot tell our allocations from anyone else's, so on a shared
-# card another tenant's memory lands in our "index" delta. Before our process exists,
-# whatever is on the card is by definition not ours.
-#
-# This is not hypothetical. An 8-card run was credited with 27GB of "index" on dev4/dev5
-# against ~4.6GB on the six clean cards -- 5.9x, on shards that are equal by
-# construction -- and the host RSS total contradicted it. Those cards sat at 97% HBM and
-# the run took a 285ms stall that showed up in every stage at once.
-#
-# npu-smi's second table gives per-process-per-card memory, which is the piece
-# aclrtGetMemInfo structurally cannot provide, so "not-ours" here is measured rather
-# than inferred. Falls back to the raw table if the parse yields nothing -- the format
-# is version-specific (written against 24.1.0.3) and a wrong number is worse than none.
-#
-# Called before and after the search. fr_search has exited by the after call, so its
-# own memory is already released and the after table cannot show what we used --
-# --mem-report covers that. What the pair does show is whether the cards came back to
-# where they started (a leak, or someone else's job arriving mid-run, both of which
-# would explain stragglers and stalls).
+# Sampled BEFORE fr_search starts, because --mem-report's aclrtGetMemInfo reports DEVICE-WIDE HBM
+# and cannot tell our allocations from another tenant's. The two samples BRACKET the search rather
+# than covering it, so the pair shows whether the cards came back to where they started, not what
+# we used. HBM_SAMPLE=<seconds> polls WHILE it runs and reports the per-device peak instead.
+npu_hbm_sample_start() {
+    [[ "${HBM_SAMPLE:-0}" == "0" ]] && return 0
+    command -v npu-smi >/dev/null 2>&1 || return 0
+    HBM_SAMPLE_FILE="$(mktemp)"
+    (
+        while :; do
+            npu-smi info 2>/dev/null || true
+            sleep "${HBM_SAMPLE}"
+        done
+    ) > "${HBM_SAMPLE_FILE}" 2>/dev/null &
+    HBM_SAMPLE_PID=$!
+    echo "[Step] sampling NPU memory every ${HBM_SAMPLE}s while the search runs (HBM_SAMPLE)"
+}
+
+npu_hbm_sample_stop() {
+    [[ -z "${HBM_SAMPLE_PID:-}" ]] && return 0
+    kill "${HBM_SAMPLE_PID}" 2>/dev/null || true
+    wait "${HBM_SAMPLE_PID}" 2>/dev/null || true
+    HBM_SAMPLE_PID=""
+    echo "[Step] NPU memory peak DURING the search:"
+    # Process row "| 3  0 | 594489 | fr_search | 18629 |": $2 is "<npu> <chip>", $3 a pid, $5 the MB.
+    awk -F"|" '
+        $2 ~ /^ *[0-9]+ +[0-9]+ *$/ && $3 ~ /^ *[0-9]+ *$/ {
+            split($2,a," "); split($4,nm," "); split($5,m," ")
+            if (nm[1] != "" && m[1]+0 > peak[a[1]]) { peak[a[1]]=m[1]+0; who[a[1]]=nm[1] }
+        }
+        END {
+            if (length(peak) == 0) {
+                print "  (no process rows sampled -- the run may be shorter than one HBM_SAMPLE interval)"
+                exit
+            }
+            for (d in peak) printf "  NPU %-4s %-14s peak %6d MB\n", d, who[d], peak[d]
+        }' "${HBM_SAMPLE_FILE}" || true
+    rm -f "${HBM_SAMPLE_FILE}"
+}
+
 npu_hbm_report() {
     local label="$1"
     command -v npu-smi >/dev/null 2>&1 || return 0
     local out parsed
     out="$(npu-smi info 2>/dev/null)" || return 0
     parsed="$(printf '%s\n' "${out}" | awk -F'|' '
-        # Chip header "| 3  910B3 | OK |": $3 is the health string. The process rows
-        # below look the same in $2, so key off $3 being alphabetic to tell them apart.
+        # Chip header "| 3  910B3 | OK |": process rows look the same in $2, so key off $3 being alphabetic.
         $2 ~ /^ *[0-9]+ +[0-9A-Za-z]+ *$/ && $3 ~ /^ *[A-Za-z]/ { split($2,a," "); npu=a[1]; next }
         # Bus-Id row: HBM sits at the end of $4 as "21990/ 65536" or "4090 / 65536".
         $3 ~ /[0-9A-Fa-f]+:[0-9A-Fa-f]+:[0-9A-Fa-f]+\./ {
@@ -508,7 +562,6 @@ npu_hbm_report() {
                 hbm=substr($4, RSTART, RLENGTH); gsub(/ /,"",hbm);
                 split(hbm,h,"/"); used[npu]=h[1]; tot[npu]=h[2]; order[++n]=npu
             } next }
-        # Process row "| 3  0 | 594489 | fr_search | 18629 |": $3 is a pid.
         $2 ~ /^ *[0-9]+ +[0-9]+ *$/ && $3 ~ /^ *[0-9]+ *$/ {
             split($2,a," "); split($4,nm," "); split($5,m," ");
             proc[a[1]] = proc[a[1]] nm[1] "(" m[1] "MB) "; pmem[a[1]] += m[1] }
@@ -519,7 +572,7 @@ npu_hbm_report() {
                 printf "  %-4s %6d/%-6d %6.1f%%  %-24s %d MB\n", d, used[d], tot[d],
                        used[d]/tot[d]*100, (proc[d]==""?"-":proc[d]), used[d]-pmem[d] }
         }' 2>/dev/null)" || parsed=""  # awk exits 1 on an unrecognised table; set -e must not see it
-    echo "[Step] NPU memory ${label} the search:"
+    echo "[Step] NPU memory ${label} the search (fr_search is not running at this point; see HBM_SAMPLE):"
     if [[ -n "${parsed}" ]]; then
         printf '%s\n' "${parsed}"
         echo "  (note: npu-smi ids are physical; DEVICE_IDS are ACL logical ids and may differ)"
@@ -541,15 +594,8 @@ npu_util_start() {
         NPU_UTIL_DEVS=("${DEVICE_ID}")
     fi
     NPU_UTIL_DIR="$(mktemp -d)"
-    # Sample AI Core(%) and HBM(MB) from one `npu-smi info` call (it covers every card,
-    # and both metrics live in the same table). Emits "npu aicore hbm_used" per chip.
-    #
-    # The id must come from the chip HEADER row ("| 3  910B3 | OK |"), not the Bus-Id
-    # row: the latter's field 2 is the Chip index, which is 0 on every card, so reading
-    # it there labels all cards 0 -- one card's samples get merged and the rest report
-    # "no samples". These are npu-smi's PHYSICAL ids (this box exposes 3 and 7) and do
-    # not have to match DEVICE_IDS, which are ACL logical ids, so report every card
-    # found rather than filtering.
+    # The id MUST come from the chip HEADER row ("| 3  910B3 | OK |"), not the Bus-Id row: field 2
+    # there is the Chip index, which is 0 on every card, so all cards would be labelled 0.
     (
         set +e
         while :; do
@@ -567,22 +613,48 @@ npu_util_start() {
         done
     ) &
     NPU_UTIL_PID=$!
-    # Kill the sampler on any exit so it never orphans (report path clears the pid).
     trap '[[ -n "${NPU_UTIL_PID}" ]] && kill "${NPU_UTIL_PID}" 2>/dev/null' EXIT
     echo "[NPUUTIL] sampling AI Core usage for devices: ${NPU_UTIL_DEVS[*]}"
 }
 
+# Started just before the timed runs and killed right after, so it covers exactly them.
+NPU_LOAD_PID=""
+npu_load_start() {
+    [[ -n "${NPU_LOAD_CARDS}" ]] || return 0
+    local bin="${ROOT_DIR}/build/fr_npuload"
+    if [[ ! -x "${bin}" ]]; then
+        echo "[ERROR] NPU_LOAD_CARDS set but ${bin} is missing; rebuild with --compile 1." >&2
+        exit 1
+    fi
+    "${bin}" --devices "${NPU_LOAD_CARDS}" --duty "${NPU_LOAD_DUTY}" \
+             --period_ms "${NPU_LOAD_PERIOD_MS}" \
+             --compute_workers "${NPU_LOAD_COMPUTE_WORKERS}" \
+             --copy_workers "${NPU_LOAD_COPY_WORKERS}" \
+             --copy_buffer_mb "${NPU_LOAD_COPY_BUFFER_MB}" \
+             --copy_gap_ms "${NPU_LOAD_COPY_GAP_MS}" > "${RESULT_DIR}/log/npuload.log" 2>&1 &
+    NPU_LOAD_PID=$!
+    sleep 3  # let it allocate and reach steady state before the first timed query
+    if ! kill -0 "${NPU_LOAD_PID}" 2>/dev/null; then
+        echo "[ERROR] fr_npuload died on startup; see ${RESULT_DIR}/log/npuload.log" >&2
+        exit 1
+    fi
+    echo "[NpuLoad] real contention on cards ${NPU_LOAD_CARDS}: duty ${NPU_LOAD_DUTY} of every ${NPU_LOAD_PERIOD_MS}ms, ${NPU_LOAD_COMPUTE_WORKERS} compute + ${NPU_LOAD_COPY_WORKERS} copy worker(s) (pid ${NPU_LOAD_PID}, log: ${RESULT_DIR}/log/npuload.log)"
+}
+
+npu_load_stop() {
+    [[ -n "${NPU_LOAD_PID}" ]] || return 0
+    kill "${NPU_LOAD_PID}" 2>/dev/null || true
+    wait "${NPU_LOAD_PID}" 2>/dev/null || true
+    NPU_LOAD_PID=""
+}
+
 npu_util_stop() {
     [[ -n "${NPU_UTIL_PID}" ]] || return 0
-    # || true: wait on a killed job returns 143, and kill of a gone job is non-zero;
-    # under `set -e` either would abort the script before the report below.
+    # || true: wait on a killed job returns 143 and kill of a gone job is non-zero; `set -e` would abort.
     kill "${NPU_UTIL_PID}" 2>/dev/null || true
     wait "${NPU_UTIL_PID}" 2>/dev/null || true
     NPU_UTIL_PID=""
-    # Report every card npu-smi showed. The ids are physical and need not line up with
-    # DEVICE_IDS (ACL logical), so filtering by DEVICE_IDS would drop real samples.
-    # HBM peak is the number a spot-check by hand tends to miss: load and search have
-    # different footprints, and a mid-run climb on a card means another tenant arrived.
+    # npu-smi ids are PHYSICAL and need not line up with DEVICE_IDS (ACL logical) -- report every card.
     echo "[NPUUTIL] ==== per-card AI Core (%) and HBM (MB) during search ===="
     awk '{ n[$1]++; s[$1]+=$2; if($2>umx[$1]) umx[$1]=$2;
            if(hmn[$1]==""||$3<hmn[$1]) hmn[$1]=$3; if($3>hmx[$1]) hmx[$1]=$3 }
@@ -598,72 +670,161 @@ npu_util_stop() {
 
 if [[ "${PROFILE_MODE}" != "0" ]]; then
     echo "[Info] --profile ${PROFILE_MODE}: per-stage timing enabled (NPUR_PERF=1); the search"
-    echo "       step aggregates [PERF] RecordGuard lines into an avg-per-stage table."
+    echo "       step aggregates [Perf] RecordGuard lines into an avg-per-stage table."
     [[ "${PROFILE_MODE}" == "2" ]] && \
         echo "       quiet: convert/build output -> log file, per-query recall lines -> count."
 fi
 
-echo "========================================"
-echo "FullRecall new-project wrapper"
-echo "Root:       ${ROOT_DIR}"
-echo "CANN:       ${CANN}"
-echo "SoC:        ${SOC_VERSION}"
-echo "Dataset:    ${DATASET_FILE}"
+# The KEY tokens ("Mode:", "Aggregate:", ...) are grep targets in the run docs -- keep them verbatim.
+brow() { printf '  %-26s%s\n' "$1" "$2"; }
+bsep() { printf -- '--[ %s ]%s\n' "$1" "$(printf -- '-%.0s' $(seq 1 $((72 - ${#1} - 7))))"; }
+printf -- '=%.0s' $(seq 1 72); echo
+echo "  FullRecall wrapper  |  ${SOC_VERSION}  |  $(date '+%F %T')"
+printf -- '=%.0s' $(seq 1 72); echo
+bsep "environment"
+brow "Root:" "${ROOT_DIR}"
+brow "CANN:" "${CANN}"
+brow "RapidJSON:" "${RAPIDJSON_INCLUDE_DIR:-not found}"
+bsep "data"
+brow "Dataset:" "${DATASET_FILE}"
 if [[ "${DO_CONVERT_QUERY}" == "1" ]]; then
-    echo "Tag map:    ${TAG_MAP_FILE}"
-    echo "QueryData:  ${QUERYDATA_FILE}"
+    brow "Tag map:" "${TAG_MAP_FILE}"
+    brow "QueryData:" "${QUERYDATA_FILE}"
 else
-    echo "Queries:    reusing ${QUERY_OUT_DIR} (conversion skipped)"
+    brow "Queries:" "reusing ${QUERY_OUT_DIR} (conversion skipped)"
 fi
-echo "RapidJSON:  ${RAPIDJSON_INCLUDE_DIR:-not found}"
-echo "Work dir:   ${WORK_DIR}"
-if [[ "${ROUND_ROBIN}" == "1" ]]; then
-    echo "Mode:       ROUND-ROBIN baseline (${SHARD_NUM} cards, each = FULL corpus; queries work-stolen to idle cards, no merge)"
-elif [[ "${MULTICARD}" == "1" ]]; then
-    echo "Mode:       multi-card (${SHARD_NUM} shards on devices ${DEVICE_IDS})"
-else
-    echo "Mode:       single-card (device ${DEVICE_ID})"
-fi
-if [[ "${POOL_POSTINGS}" == "1" ]]; then
-    echo "Postings:   pooled (NPUR_POOL_POSTINGS=1)"
-else
-    echo "Postings:   raw-malloc baseline (NPUR_POOL_POSTINGS=0)"
-fi
-if [[ "${NPUR_PARALLEL_SCORE_FILTER:-0}" == "1" ]]; then
-    echo "Score/filter: parallel (NPUR_PARALLEL_SCORE_FILTER=1; better p50/p90, worse p99)"
-elif [[ "${NPUR_OVERLAP_POSTEXPR:-1}" == "0" ]]; then
-    echo "Score/filter: serial via executor (NPUR_OVERLAP_POSTEXPR=0; pre-overlap baseline)"
-elif [[ "${NPUR_OVERLAP_POSTEXPR:-1}" == "2" ]]; then
-    echo "Score/filter: serial, direct dispatch, no overlap (NPUR_OVERLAP_POSTEXPR=2; control arm for the default)"
-else
-    echo "Score/filter: serial, post-expr built inside the scorer kernel window (default)"
-fi
-if [[ "${NPUR_OVERLAP_POSTING:-0}" == "1" ]]; then
-    echo "Posting prep: overlapped into the scorer window too (NPUR_OVERLAP_POSTING=1; PostingBitListToSet off the critical path)"
-fi
-if [[ "${STREAM_MERGE:-0}" == "1" ]]; then
-    echo "Merge:      streaming (STREAM_MERGE=1; shards fold into a running top-K as they finish, hiding the k-way merge behind the straggler wait)"
-fi
-if [[ "${PACKED_SORT:-0}" == "1" || "${RADIX_SORT:-0}" == "1" ]]; then
-    _hostsort="packed 8-byte keys"
-    [[ "${RADIX_SORT:-0}" == "1" ]] && _hostsort="${_hostsort} + radix sort"
-    echo "Host sort:  ${_hostsort} (per-shard top-K on the packed path)"
-fi
-if [[ -n "${SHARD_TOPK_RATIO:-}" && "${SHARD_TOPK_RATIO}" != "1" && "${SHARD_TOPK_RATIO}" != "1.0" ]]; then
-    echo "Shard topK: ${SHARD_TOPK_RATIO}x per shard (SHARD_TOPK_RATIO; merge still returns the full topK; trades a little recall for smaller per-shard sort/TopK)"
-fi
-echo "Cores:      scorer ${SCORER_BLOCK_DIM} (Cube) + filter ${FULL_RECALL_TEXT_FILTER_BLOCK_DIM} (Vector)"
-if [[ "${BATCH_SIZE}" != "1" ]]; then
-    echo "Batch:      ${BATCH_SIZE} queries/batch (avg = ms/query = 1/throughput; p99 not a tail here)"
-fi
+brow "Work dir:" "${WORK_DIR}"
 if [[ -n "${RECALL_REF_FILE}" ]]; then
-    echo "Recall ref: ${RECALL_REF_FILE} (cached, all queries)"
+    brow "Recall ref:" "${RECALL_REF_FILE} (cached, all queries)"
 else
-    echo "Recall ref: unset (spot-check ${RECALL_QUERIES} queries)"
+    brow "Recall ref:" "unset (spot-check ${RECALL_QUERIES} queries)"
 fi
-echo "========================================"
+bsep "run"
+if [[ "${ROUND_ROBIN}" == "1" ]]; then
+    if [[ "${STATIC_ASSIGN}" == "1" ]]; then
+        brow "Mode:" "ROUND-ROBIN baseline, FIXED assignment (${SHARD_NUM} cards, each = FULL corpus; chunk k bound to card k%N, no work stealing, no merge)"
+    else
+        brow "Mode:" "ROUND-ROBIN baseline, dynamic (${SHARD_NUM} cards, each = FULL corpus; queries work-stolen to idle cards, no merge)"
+    fi
+elif [[ "${MULTICARD}" == "1" && "${SHARD_GROUP_SIZE}" -gt 0 && "${SHARD_NUM}" -ge "${SHARD_GROUP_SIZE}" ]]; then
+    _grp_pipe=""
+    [[ "${PIPELINE}" == "1" ]] && _grp_pipe=", pipelined"
+    _grp_disp="groups work-steal"
+    [[ "${STATIC_ASSIGN}" == "1" ]] && _grp_disp="FIXED assignment, chunk k bound to group k%G, no work stealing"
+    brow "Mode:" "shard GROUPS ($((SHARD_NUM / SHARD_GROUP_SIZE)) groups x ${SHARD_GROUP_SIZE} shards on ${DEVICE_IDS}${_grp_pipe}; a query fans out inside one group, ${_grp_disp})"
+elif [[ "${MULTICARD}" == "1" && "${PIPELINE}" == "1" ]]; then
+    brow "Mode:" "multi-card PIPELINE (${SHARD_NUM} shards on ${DEVICE_IDS}; batch N Extract overlaps batch N+1 Device)"
+elif [[ "${MULTICARD}" == "1" ]]; then
+    brow "Mode:" "multi-card (${SHARD_NUM} shards on devices ${DEVICE_IDS})"
+else
+    brow "Mode:" "single-card (device ${DEVICE_ID})"
+fi
+if [[ "${BATCH_SIZE}" != "1" ]]; then
+    brow "Batch:" "${BATCH_SIZE} queries/batch (avg = ms/query = 1/throughput; p99 not a tail here)"
+fi
+brow "Cores:" "scorer ${SCORER_BLOCK_DIM} (Cube) + filter ${FULL_RECALL_TEXT_FILTER_BLOCK_DIM} (Vector) + aggregator ${AGGREGATOR_BLOCK_DIM}"
+if [[ -n "${CARD_CPUS:-}" ]]; then
+    brow "Affinity:" "per-card pinning ${CARD_CPUS} (CARD_CPUS, one core list per DEVICE_IDS entry; keeps each card's DMA and host buffers on its own NUMA node)"
+fi
+if [[ "${TARGET_QPS}" != "0" ]]; then
+    brow "Load:" "open-loop, offered ${TARGET_QPS} qps (TARGET_QPS; latency measured from each query's arrival, so queueing counts)"
+fi
+if [[ -n "${NPU_LOAD_CARDS}" ]]; then
+    brow "Fluctuation:" "REAL contention on cards ${NPU_LOAD_CARDS} (NPU_LOAD_CARDS; fr_npuload takes Cube + HBM ${NPU_LOAD_DUTY} of every ${NPU_LOAD_PERIOD_MS}ms)"
+fi
+if [[ -n "${SLOW_CARDS}" ]]; then
+    brow "Fluctuation:" "cards ${SLOW_CARDS} run ${SLOW_FACTOR}x slower for ${SLOW_DUTY} of every ${SLOW_PERIOD_MS}ms (SLOW_CARDS; host-side delay injection)"
+fi
+if [[ -n "${NPU_LOAD_CARDS}" && -n "${SLOW_CARDS}" ]]; then
+    echo "[ERROR] NPU_LOAD_CARDS and SLOW_CARDS are both set; the disturbance would be applied twice." >&2
+    echo "        Use NPU_LOAD_CARDS (real contention) for acceptance numbers, or SLOW_CARDS alone." >&2
+    exit 1
+fi
+bsep "optimizations"
+# Every row starts with two spaces + the CAPS env name, so what is ON can be grepped.
+if [[ "${POOL_POSTINGS}" == "1" ]]; then
+    brow "POOL_POSTINGS=1" "posting tables pooled"
+else
+    brow "POOL_POSTINGS=0" "raw-malloc baseline"
+fi
+case "${NPUR_PARALLEL_SCORE_FILTER:-0}:${NPUR_OVERLAP_POSTEXPR:-1}" in
+    1:*) brow "PARALLEL_SCORE_FILTER=1" "scorer/filter on two threads (worse p99)" ;;
+    *:0) brow "OVERLAP_POSTEXPR=0" "serial via executor (pre-overlap baseline)" ;;
+    *:2) brow "OVERLAP_POSTEXPR=2" "no overlap (control arm)" ;;
+    *)   brow "OVERLAP_POSTEXPR=1" "post-expr built inside the scorer kernel window" ;;
+esac
+[[ "${NPUR_OVERLAP_POSTING:-0}" == "1" ]] && \
+    brow "OVERLAP_POSTING=1" "posting prep inside the scorer window too"
+[[ "${STREAM_MERGE:-0}" == "1" ]] && \
+    brow "STREAM_MERGE=1" "k-way merge folds shards as they finish"
+if [[ "${PACKED_SORT:-0}" == "1" || "${RADIX_SORT:-0}" == "1" ]]; then
+    _hostsort="host sort on packed 8-byte keys"
+    [[ "${RADIX_SORT:-0}" == "1" ]] && _hostsort="${_hostsort} + radix"
+    brow "PACKED_SORT=1" "${_hostsort}"
+fi
+[[ -n "${SHARD_TOPK_RATIO:-}" && "${SHARD_TOPK_RATIO}" != "1" && "${SHARD_TOPK_RATIO}" != "1.0" ]] && \
+    brow "SHARD_TOPK_RATIO=${SHARD_TOPK_RATIO}" "each shard aggregates only topK x ratio (merge returns full topK)"
+[[ "${BATCH_AGGREGATE:-0}" == "1" ]] && \
+    brow "BATCH_AGGREGATE=1" "aggregation launched/synced once per chunk, not per query"
+[[ "${BATCH_FILTER:-0}" == "1" ]] && \
+    brow "BATCH_FILTER=1" "filter launched/synced once per chunk, not per query"
+[[ "${TOPK_CONCURRENT:-0}" == "1" ]] && \
+    brow "TOPK_CONCURRENT=1" "a batch's single-core TopK kernels run side by side on their own streams"
+[[ "${POOL_SMALL_H2D:-0}" == "1" ]] && \
+    brow "POOL_SMALL_H2D=1" "scorer query matrix + filter postExpr from pools, no per-batch aclrtMalloc/Free"
+[[ "${EARLY_FILTER_PREP:-0}" == "1" ]] && \
+    brow "EARLY_FILTER_PREP=1" "filter setup + postExpr H2D inside the scorer window (pays at BS=1, not BS=4)"
+[[ "${SHARE_FILTER_STREAM:-0}" == "1" ]] && \
+    brow "SHARE_FILTER_STREAM=1" "aggregator queues behind the filter kernels; one sync for both"
+[[ "${TOPK_COUNTS_IN_PLACE:-0}" == "1" ]] && \
+    brow "TOPK_COUNTS_IN_PLACE=1" "TopK reads the aggregator's per-core counts on device; no re-upload"
+[[ "${FUSE_AGG_TOPK:-0}" == "1" ]] && \
+    brow "FUSE_AGG_TOPK=1" "TopK queued behind the aggregator, one sync and one count read for both"
+[[ "${DEFER_CONV_SYNC:-0}" == "1" ]] && \
+    brow "DEFER_CONV_SYNC=1" "in-window bitlist conversions launched without a wait; drained after the scorer"
+[[ "${STREAM_POOL:-0}" == "1" ]] && \
+    brow "STREAM_POOL=1" "each card gets the service's stream pool; kernels leave the default stream"
+[[ "${OVERLAP_FILTER:-0}" == "1" ]] && \
+    brow "OVERLAP_FILTER=1" "filter kernels launched inside the scorer window; Vector runs beside Cube"
+[[ "${EXTRACT_FAST:-0}" == "1" ]] && \
+    brow "EXTRACT_FAST=1" "host extract: 4-pass radix on the score bytes + prefetched global-id lookups"
+[[ -n "${AGG_CONCURRENT:-}" && "${AGG_CONCURRENT}" != "1" && "${AGG_CONCURRENT}" != "0" ]] && \
+    brow "AGG_CONCURRENT=${AGG_CONCURRENT}" "a batch's Aggregator kernels spread over ${AGG_CONCURRENT} streams"
+[[ "${SCORER_TRIM_WRITE:-0}" == "1" ]] && \
+    brow "SCORER_TRIM_WRITE=1" "scorer writes back only the real query rows"
+[[ "${PARALLEL_LOAD:-0}" == "1" ]] && \
+    brow "PARALLEL_LOAD=1" "index shards load on one thread each"
+if [[ "${DENSITY_NONZERO}" == "1" ]]; then
+    case "${SPARSE_DIRECT}" in
+    1) brow "SPARSE_DIRECT=1" "OR nodes read sparse postings in place; no bitlist->bitset pass" ;;
+    *) brow "SPARSE_DIRECT=0" "every sparse posting is converted to a 16KB bitset first" ;;
+    esac
+    case "${OVERLAP_POSTING_BITLIST}" in
+    1) brow "OVERLAP_POSTING_BITLIST=1" "their posting tables are built in the scorer window" ;;
+    *) brow "OVERLAP_POSTING_BITLIST=0" "posting tables serialised after the scorer sync" ;;
+    esac
+    case "${OR_NO_TILE_CHECK}" in
+    1) brow "OR_NO_TILE_CHECK=1" "ApplySparse places units without the dead tile bound" ;;
+    *) brow "OR_NO_TILE_CHECK=0" "ApplySparse bounds-checks every unit against its tile" ;;
+    esac
+    case "${OR_ALIGNED_COPY:-${SPARSE_DIRECT}}" in
+    1) brow "OR_ALIGNED_COPY=1" "sparse CopyIn rounded to a block; no scalar tail" ;;
+    *) brow "OR_ALIGNED_COPY=0" "DataCopyPadCustom walks each operand's tail" ;;
+    esac
+    case "${CLASSIFY_FAST:-${SPARSE_DIRECT}}" in
+    1) brow "CLASSIFY_FAST=1" "OR operands written straight to the table" ;;
+    *) brow "CLASSIFY_FAST=0" "every pair goes through emit's branch tree" ;;
+    esac
+fi
+case "${LAZY_POSTING_WEIGHTS:-1}" in
+1) brow "LAZY_POSTING_WEIGHTS=1" "posting weights built only if a switch reads them" ;;
+*) brow "LAZY_POSTING_WEIGHTS=0" "weights built and looked up whether read or not" ;;
+esac
+printf -- '=%.0s' $(seq 1 72); echo
 
+dbg "banner done; checking dataset: ${DATASET_FILE}"
 require_file "${DATASET_FILE}" "dataset.bin"
+dbg "dataset ok; MULTICARD=${MULTICARD} EXTERNAL_SHARDS=${EXTERNAL_SHARDS} DOCS=${DOCS} SHARD_NUM=${SHARD_NUM}"
 
 if [[ "${MULTICARD}" == "1" && "${EXTERNAL_SHARDS}" == "0" && "${DOCS}" -eq 0 ]]; then
     echo "[ERROR] multi-card build (DEVICE_IDS=${DEVICE_IDS}) needs DOCS=<total corpus size> so the" >&2
@@ -672,12 +833,26 @@ if [[ "${MULTICARD}" == "1" && "${EXTERNAL_SHARDS}" == "0" && "${DOCS}" -eq 0 ]]
     exit 1
 fi
 
+dbg "sourcing CANN setenv: ${CANN}/bin/setenv.bash (exists=$([[ -f "${CANN}/bin/setenv.bash" ]] && echo yes || echo no))"
 if [[ -f "${CANN}/bin/setenv.bash" ]]; then
+    # Without the guard a setenv.bash whose last command returns non-zero would kill the run silently.
     set +u
+    set +e
     # shellcheck disable=SC1090
     source "${CANN}/bin/setenv.bash"
+    _setenv_rc=$?
+    set -e
     set -u
+    if [[ "${_setenv_rc}" -ne 0 ]]; then
+        echo "[Warn] ${CANN}/bin/setenv.bash exited ${_setenv_rc}; continuing (library paths are set explicitly below)." >&2
+    fi
+    # A non-zero rc with all vars set is harmless; EMPTY vars mean it stopped before configuring CANN.
+    dbg "setenv rc=${_setenv_rc} ASCEND_HOME_PATH=${ASCEND_HOME_PATH:-<unset>}"
+    dbg "  ASCEND_OPP_PATH=${ASCEND_OPP_PATH:-<unset>}"
+    dbg "  ASCEND_AICPU_PATH=${ASCEND_AICPU_PATH:-<unset>}"
+    dbg "  ASCEND_TOOLKIT_HOME=${ASCEND_TOOLKIT_HOME:-<unset>}"
 fi
+dbg "setenv block done"
 
 append_runtime_library_dir "${ROOT_DIR}/build_device/lib"
 append_runtime_library_dir "${ROOT_DIR}/lib64"
@@ -704,7 +879,9 @@ RUNTIME_RPATH_DIRS="$(join_by_semicolon "${RUNTIME_LIBRARY_DIRS[@]}")"
 if [[ -n "${RUNTIME_LD_LIBRARY_PATH}" ]]; then
     export LD_LIBRARY_PATH="${RUNTIME_LD_LIBRARY_PATH}:${LD_LIBRARY_PATH:-}"
 fi
-echo "Host libs:   ${RUNTIME_LD_LIBRARY_PATH}"
+dbg "Host libs: ${RUNTIME_LD_LIBRARY_PATH}"
+echo "[Info] host library path: ${#RUNTIME_LIBRARY_DIRS[@]} dirs on LD_LIBRARY_PATH (DEBUG=1 to print them)"
+dbg "entering stages: compile=${DO_COMPILE} convert_query=${DO_CONVERT_QUERY} convert_data=${DO_CONVERT_DATA} build_index=${DO_BUILD_INDEX} search=${DO_SEARCH}"
 
 if [[ "${DO_COMPILE}" == "1" ]]; then
     if [[ -z "${RAPIDJSON_INCLUDE_DIR}" || ! -f "${RAPIDJSON_INCLUDE_DIR}/rapidjson/document.h" ]]; then
@@ -716,25 +893,41 @@ if [[ "${DO_COMPILE}" == "1" ]]; then
 
     echo "[Step] Cleaning previous compile outputs..."
     rm -rf "${ROOT_DIR}/build" "${ROOT_DIR}/build_device"
-    [[ "${PROFILE_MODE}" == "2" ]] && \
-        echo "[Step] Compiling quietly (--profile 2); output -> ${RESULT_DIR}/log/build.log"
+    [[ "${VERBOSE_BUILD:-0}" != "1" ]] && \
+        echo "[Step] Compiling quietly; full output -> ${RESULT_DIR}/log/build.log (VERBOSE_BUILD=1 to stream it)"
 
+    _build_t0=${SECONDS}
     echo "[Step] Building device kernels (serial; AscendC ExternalProject is not -j safe)..."
     run_build_tool cmake -S "${ROOT_DIR}/src/device" -B "${ROOT_DIR}/build_device" \
         -DASCEND_CANN_PACKAGE_PATH="${CANN}" \
         -DSOC_VERSION="${SOC_VERSION}"
     run_build_tool cmake --build "${ROOT_DIR}/build_device"
+    echo "[Step]   device kernels done ($((SECONDS - _build_t0))s)"
 
+    PROTOBUF_CMAKE_ARGS=()
+    [[ -n "${PROTOBUF_ROOT}" ]]        && PROTOBUF_CMAKE_ARGS+=(-DProtobuf_ROOT="${PROTOBUF_ROOT}")
+    [[ -n "${PROTOBUF_LIBRARY}" ]]     && PROTOBUF_CMAKE_ARGS+=(-DProtobuf_LIBRARY="${PROTOBUF_LIBRARY}")
+    [[ -n "${PROTOBUF_INCLUDE_DIR}" ]] && PROTOBUF_CMAKE_ARGS+=(-DProtobuf_INCLUDE_DIR="${PROTOBUF_INCLUDE_DIR}")
+    [[ -n "${PROTOC}" ]]               && PROTOBUF_CMAKE_ARGS+=(-DProtobuf_PROTOC_EXECUTABLE="${PROTOC}")
+
+    _build_t0=${SECONDS}
     echo "[Step] Building host tools..."
     run_build_tool cmake -S "${ROOT_DIR}/src" -B "${ROOT_DIR}/build" \
         -DASCEND_CANN_PACKAGE_PATH="${CANN}" \
         -DSOC_VERSION="${SOC_VERSION}" \
         -DRAPIDJSON_INCLUDE_DIR="${RAPIDJSON_INCLUDE_DIR}" \
-        -DNPUR_EXTRA_RPATH_DIRS="${RUNTIME_RPATH_DIRS}"
+        -DNPUR_EXTRA_RPATH_DIRS="${RUNTIME_RPATH_DIRS}" \
+        "${PROTOBUF_CMAKE_ARGS[@]}"
     run_build_tool cmake --build "${ROOT_DIR}/build" -j "${BUILD_THREADS}"
+    echo "[Step]   host tools done ($((SECONDS - _build_t0))s)"
 else
     echo "[Step] Skipping compile due to -c 0. Reusing existing build/fr_* artifacts."
 fi
+
+# Write-side switch, so the A/B is two indexes rather than two binaries; changing it needs
+# --convert-data 1. An index written this way needs a binary that knows the layout -- an older
+# one reads layout code 4 as a pair-encoded posting and computes K wrong.
+export NPUR_SPARSE_PACKED="${SPARSE_PACKED:-1}"
 
 require_executable "${ROOT_DIR}/build/fr_converter"
 require_executable "${ROOT_DIR}/build/fr_builder"
@@ -752,7 +945,7 @@ if [[ "${DO_CONVERT_QUERY}" == "1" ]]; then
         --dataset "${DATASET_FILE}" \
         --out-dir "${QUERY_OUT_DIR}"
 else
-    echo "[Step] Skipping query conversion."
+    SKIPPED_STEPS+=("query conversion")
 fi
 
 QUERY_FVECS="${QUERY_OUT_DIR}/queries.fvecs"
@@ -765,9 +958,7 @@ require_file "${TOPK_FILE}" "converted topk.txt"
 if [[ "${DO_CONVERT_DATA}" == "1" ]]; then
     echo "[Step] Converting HYDSET2 dataset to builder input..."
     if [[ "${MULTICARD}" == "1" ]]; then
-        # one disjoint doc slice per shard; --doc_offset keeps ids globally absolute.
-        # Create the shared parent first: fr_converter's mkdir is per-directory, so
-        # the per-shard --out (CONVERTER_IN_DIR/shardN) needs its parent to exist.
+        # fr_converter's mkdir is per-directory, so the per-shard --out needs its parent to exist.
         mkdir -p "${CONVERTER_IN_DIR}"
         for ((s = 0; s < SHARD_NUM; s++)); do
             read -r off cnt <<< "$(shard_doc_range "${s}")"
@@ -794,7 +985,7 @@ if [[ "${DO_CONVERT_DATA}" == "1" ]]; then
         run_build_tool "${ROOT_DIR}/build/fr_converter" "${converter_args[@]}"
     fi
 else
-    echo "[Step] Skipping dataset conversion."
+    SKIPPED_STEPS+=("dataset conversion")
 fi
 
 if [[ "${DO_BUILD_INDEX}" == "1" ]]; then
@@ -809,11 +1000,7 @@ if [[ "${DO_BUILD_INDEX}" == "1" ]]; then
             NPUR_EXECUTOR_THREADS="${BUILD_THREADS}" NPUR_LOG_LEVEL=WARN \
                 run_build_tool "${ROOT_DIR}/build/fr_builder" --data_dir "${shard_in}" --data_out "${shard_index}"
         done
-        # Per-shard on-disk size. Shards are equal in doc count by construction, but not
-        # in bytes -- posting lists follow content, and an 8-card build measured shard0
-        # 29% smaller than its peers. This is also the only per-shard index figure that
-        # is trustworthy on a shared card: --mem-report reads device-wide HBM
-        # (aclrtGetMemInfo), so another tenant's allocations land in our numbers.
+        # The only per-shard figure trustworthy on a shared card: --mem-report reads device-wide HBM.
         echo "[Step] Per-shard index size:"
         du -sh "${INDEX_DIR}"/shard* 2>/dev/null | sed 's/^/  /'
         du -sh "${INDEX_DIR}" 2>/dev/null | sed 's/^/  total: /'
@@ -825,15 +1012,13 @@ if [[ "${DO_BUILD_INDEX}" == "1" ]]; then
         du -sh "${INDEX_DIR}" 2>/dev/null | sed 's/^/  /'
     fi
 else
-    echo "[Step] Skipping index build."
+    SKIPPED_STEPS+=("index build")
 fi
 
 if [[ "${DO_SEARCH}" == "1" ]]; then
-    # locate index metadata; in multi-card mode assemble the shard dir list too
     shard_index_dirs=""
     tag_freq_file="${CONVERTER_IN_DIR}/tag_doc_freq.txt"
     if [[ "${EXTERNAL_SHARDS}" == "1" ]]; then
-        # pre-built shards: search the given dirs directly
         shard_index_dirs="${SHARD_INDEX_DIRS}"
         for d in "${SHARD_INDEX_LIST[@]}"; do
             shopt -s nullglob
@@ -866,11 +1051,10 @@ if [[ "${DO_SEARCH}" == "1" ]]; then
             exit 1
         fi
     fi
-    # On-disk size of the index actually being searched. The build step prints this too,
-    # but a search-only run reuses a prebuilt index and would otherwise show nothing.
-    # du reads the disk, so it is right on a shared card where --mem-report (device-wide
-    # HBM) is not.
-    echo "[Step] Index on disk:"
+    if [[ ${#SKIPPED_STEPS[@]} -gt 0 ]]; then
+    echo "[Step] Skipping: $(IFS=', '; echo "${SKIPPED_STEPS[*]}")"
+fi
+echo "[Step] Index on disk:"
     if [[ -n "${shard_index_dirs}" ]]; then
         du -sh ${shard_index_dirs//,/ } 2>/dev/null | sed 's/^/  /' || true
     else
@@ -888,17 +1072,15 @@ if [[ "${DO_SEARCH}" == "1" ]]; then
         --warmup "${WARMUP}"
         --recall_queries "${RECALL_QUERIES}"
         --full_recall_text_filter_block_dim="${FULL_RECALL_TEXT_FILTER_BLOCK_DIM}"
+        --full_recall_batch_search_thread_num="${BATCH_SEARCH_THREADS}"
         --effective_filter_file "${RESULT_DIR}/log/effective_filter_expressions.txt"
     )
-    # tag-freq is a converter-produced diagnostic; absent when reusing prebuilt shards
     [[ -f "${tag_freq_file}" ]] && search_args+=(--converted_tag_freq_file "${tag_freq_file}")
-    # index/device selection: multi-card searches N shards, single-card one index
     if [[ "${MULTICARD}" == "1" ]]; then
         search_args+=(--shard_index_dirs "${shard_index_dirs}" --device_ids "${DEVICE_IDS}")
     else
         search_args+=(--index_dir "${INDEX_DIR}" --device_id "${DEVICE_ID}")
     fi
-    # optional recall ground-truth cache (computed once, reused across runs)
     if [[ -n "${RECALL_REF_FILE}" ]]; then
         search_args+=(--recall_ref_file "${RECALL_REF_FILE}" --recall_ref_threads "${RECALL_REF_THREADS}")
     fi
@@ -906,96 +1088,203 @@ if [[ "${DO_SEARCH}" == "1" ]]; then
         search_args+=(--num_queries "${NUM_QUERIES}")
     fi
     search_args+=(--batch_size "${BATCH_SIZE}")
-    # Optional aggregator / NPU-topk tuning knobs (gflags in the linked binary).
-    # NPU_TOPK_LOOP_COUNT: more passes -> NPU topk converges closer to topK, so
-    #   fewer over-returned candidates reach the host (cuts AggrAndTopK_fill_d2h_emplace).
-    # NPU_TOPK_THRESHOLD_RATIO: matches>topK*ratio -> use NPU topk (lower = kicks in sooner).
+    # NPU_TOPK_LOOP_COUNT: more passes -> closer to topK, so fewer over-returned candidates.
+    # NPU_TOPK_THRESHOLD_RATIO: matches > topK*ratio -> use NPU topk (lower = kicks in sooner).
     [[ -n "${NPU_TOPK_LOOP_COUNT:-}" ]] && \
         search_args+=(--full_recall_npu_topk_loop_count="${NPU_TOPK_LOOP_COUNT}")
     [[ -n "${NPU_TOPK_THRESHOLD_RATIO:-}" ]] && \
         search_args+=(--full_recall_npu_topk_enters_threshold_ratio="${NPU_TOPK_THRESHOLD_RATIO}")
-    # NPU_TOPK_FINISH_BUFFER_RATIO: topk early-quit tolerance (wrapper default 1.2,
-    # overriding the gflag default of 1.5). See the sweep in the defaults block above.
+    # Wrapper defaults overriding the gflag defaults (1.5 / 8 / 8).
     search_args+=(--full_recall_npu_topk_finish_buffer_ratio="${NPU_TOPK_FINISH_BUFFER_RATIO}")
-    [[ -n "${AGGREGATOR_BLOCK_DIM:-}" ]] && \
-        search_args+=(--full_recall_aggregator_block_dim="${AGGREGATOR_BLOCK_DIM}")
-    # SCORER_BLOCK_DIM: Cube cores for the vector MMad scorer kernel (wrapper default
-    # 20, overriding the gflag default of 8). See the sweep in the defaults block near
-    # the top. Recall unchanged (100%) at every value swept.
+    search_args+=(--full_recall_aggregator_block_dim="${AGGREGATOR_BLOCK_DIM}")
     search_args+=(--full_recall_scorer_block_dim="${SCORER_BLOCK_DIM}")
-    # LATENCY_DUMP=1 -> per-query idx/ms/topk table for tail/outlier analysis.
+    # Defaults to 0.05 whatever the index was BUILT with, and the index meta does not carry the
+    # threshold, so this is the only place the two can be kept equal.
+    search_args+=(--full_recall_bitlist_denseness_threshold="${DENSITY_THRESHOLD}")
+    # MEASURED AND REFUTED (+41.5% on the kernel). Control arm only -- do not turn it on.
+    npur_switch BITLIST_CLEAR_SPARSE NPUR_BITLIST_CLEAR_SPARSE "0"
+    npur_switch BITLIST_ONE_H2D NPUR_BITLIST_ONE_H2D "0"
+    # Needs BITLIST_ONE_H2D=1 (the table has to be written by index).
+    npur_switch BITLIST_POSTING_MAJOR NPUR_BITLIST_POSTING_MAJOR "0"
+    # Pools grow a block to the largest size EVER requested, not the current one. Set 0 for the old.
+    export NPUR_POOL_HIGH_WATER="${POOL_HIGH_WATER:-1}"
+    # Scatter is a silent no-op on some CANN builds, so RECALL is the result here, not the timing.
+    # 1 = offsets as stored (bytes), 2 = halved to element indices.
+    if [[ -n "${BITLIST_SCATTER:-}" && "${BITLIST_SCATTER}" != "0" ]]; then
+        export NPUR_BITLIST_SCATTER="${BITLIST_SCATTER}"
+    fi
+    # Needs NPUR_OVERLAP_POSTING=1, which alone skips these queries (~98% at a non-zero threshold).
+    npur_switch OVERLAP_POSTING_BITLIST NPUR_OVERLAP_POSTING_BITLIST
+    # [POOLSTAT] pool ids: 0 vector-score result, 1 filter result, 2 filter stack, 3 bitlist->bitset,
+    # 4 aggregator, 5 aggregator scratch, 6 filter postings. No device id on the line, so with two
+    # cards each id appears twice -- sum them.
+    if [[ "${POOL_STATS:-0}" != "0" ]]; then
+        export NPUR_POOL_STATS=1
+    fi
+    # =1 is free and can stay on for a timing run. =2 also reads each converted posting's header back
+    # ([BITSTAT-DEEP]) -- one D2H per posting. NEVER leave 2 on for a run whose latency you read.
+    if [[ -n "${BITLIST_STATS:-}" && "${BITLIST_STATS}" != "0" ]]; then
+        export NPUR_BITLIST_STATS="${BITLIST_STATS}"
+        [[ -n "${BITLIST_STATS_EVERY:-}" ]] && export NPUR_BITLIST_STATS_EVERY="${BITLIST_STATS_EVERY}"
+        [[ -n "${BITLIST_STATS_CALLS:-}" ]] && export NPUR_BITLIST_STATS_CALLS="${BITLIST_STATS_CALLS}"
+        # Level 2 only. A run-based encoding would only pay if the mean run exceeds 1.5 units.
+        [[ -n "${BITLIST_STATS_SAMPLE:-}" ]] && export NPUR_BITLIST_STATS_SAMPLE="${BITLIST_STATS_SAMPLE}"
+        if [[ "${BITLIST_STATS}" == "2" ]]; then
+            echo "[WARN] BITLIST_STATS=2 adds a per-posting D2H on the first calls: diagnostic only,"
+            echo "[WARN] the latency of those calls is meaningless."
+        fi
+    fi
+    # Output-identical at tileNum == 1, which CreateContextData always sets. 0 = the checked path.
+    npur_switch OR_NO_TILE_CHECK NPUR_OR_NO_TILE_CHECK
+    # Needs SPARSE_DIRECT=1 (it reuses the same OR-operand mask).
+    npur_switch OR_SKIP_EMPTY NPUR_OR_SKIP_EMPTY "0"
+    # Walks every pair a second time, so leave it off for timing runs. _EVERY = print interval.
+    if [[ "${EMPTY_STATS:-0}" == "1" ]]; then
+        export NPUR_EMPTY_STATS=1
+        [[ -n "${EMPTY_STATS_EVERY:-}" ]] && export NPUR_EMPTY_STATS_EVERY="${EMPTY_STATS_EVERY}"
+        echo "[WARN] EMPTY_STATS=1 adds a second pass over every (posting, segment) pair:"
+        echo "[WARN] diagnostic only, the latency under it is not comparable."
+    fi
+    # MEASURED NEUTRAL at both batch sizes; kept as a control arm, off.
+    npur_switch ONE_COUNT_PASS NPUR_ONE_COUNT_PASS "0"
+    # Builds the weight arrays only when something reads them -- only OR_SKIP_EMPTY and EMPTY_STATS do.
+    npur_switch LAZY_POSTING_WEIGHTS NPUR_LAZY_POSTING_WEIGHTS "1"
+    # Defaults to SPARSE_DIRECT -- without it nothing is an OR operand and this never triggers.
+    npur_switch CLASSIFY_FAST NPUR_CLASSIFY_FAST "${SPARSE_DIRECT}"
+    # Defaults to SPARSE_DIRECT. 0 = the padded helper that walks the remainder with scalar GM reads.
+    npur_switch OR_ALIGNED_COPY NPUR_OR_ALIGNED_COPY "${SPARSE_DIRECT}"
+    # OR_ABLATE=1|2|3 leaves one step out of ApplySparse; the three are strict subsets, so each piece
+    # is a difference between arms:
+    #   full - 1 = the placement loop   1 - 2 = the input DataCopy   3 = the floor
+    #   2 - 3 = AllocTensor, both queue round trips and FreeTensor
+    # WRONG RESULTS BY DESIGN: read only TextFilter_BitmapTextFilter_Kernel under --profile 2.
+    if [[ -n "${OR_ABLATE:-}" && "${OR_ABLATE}" != "0" ]]; then
+        export NPUR_OR_ABLATE="${OR_ABLATE}"
+        echo "[WARN] OR_ABLATE=${OR_ABLATE}: FilterOrOp is deliberately skipping work, so the"
+        echo "[WARN] filter results and the recall under it are WRONG BY DESIGN. Only the"
+        echo "[WARN] per-stage kernel timing is meaningful."
+    fi
+    # OR nodes take their sparse postings encoded instead of converted; AND and NOT keep converting.
+    # Automatically refused when GetMaxPostingLength exceeds the 16KB tile buffer (den >= ~0.021).
+    npur_switch SPARSE_DIRECT NPUR_SPARSE_DIRECT
+    # Cheap (it rides on CheckPostExpr's own walk) but it prints, so keep it off for timing runs.
+    if [[ "${EXPR_STATS:-0}" == "1" ]]; then
+        export NPUR_EXPR_STATS=1
+        [[ -n "${EXPR_STATS_EVERY:-}" ]] && export NPUR_EXPR_STATS_EVERY="${EXPR_STATS_EVERY}"
+    fi
+    # WRONG RESULTS BY DESIGN: read only the per-stage kernel timing, never recall.
+    if [[ -n "${BITLIST_ABLATE:-}" && "${BITLIST_ABLATE}" != "0" ]]; then
+        export NPUR_BITLIST_ABLATE="${BITLIST_ABLATE}"
+        echo "[WARN] BITLIST_ABLATE=${BITLIST_ABLATE}: the bitlist->bitset kernel is deliberately"
+        echo "       incomplete. Results are WRONG; only the kernel timing is meaningful."
+    fi
     if [[ "${LATENCY_DUMP:-0}" == "1" ]]; then
         search_args+=(--latency_dump "${RESULT_DIR}/log/per_query_latency.tsv")
     fi
-    # SHARD_WORKER_POOL: persistent per-shard worker threads instead of spawning one
-    # per shard per query. Default ON; =0 restores the spawn-per-query path for A/B.
-    #
-    # This is the largest p99 win found so far. 2-shard, 3 interleaved rounds, every
-    # metric better in all 3 (medians):
-    #
-    #     p99 6.336 -> 3.108ms (-51%)   p95 3.106 -> 2.826   avg 2.639 -> 2.473
-    #
-    # More telling is the spread: p99 over 9 runs was 5.07..9.98 spawning, 3.01..3.28
-    # pooled. The spawn jitter was the dominant source of p99 noise all along -- what
-    # earlier rounds of this work kept misattributing to "machine state".
-    #
-    # --shard_latency_dump shows the mechanism: merge_ms is untouched (0.132 ->
-    # 0.130ms p99) and the entire win is in max_shard_ms (6.890 -> 2.851 p99, max
-    # 32.1 -> 6.5ms). Spawning does not just add its own latency; the cold, freshly
-    # scheduled thread makes the shard's own work slow and erratic. Pooled workers
-    # are already warm and just wake on a condvar. The cost scales with shard count
-    # (7 spawns per query at 8 shards vs 1 at 2), so this matters more, not less, on
-    # the 8-card target config.
+    # Default ON; =0 restores the spawn path for A/B. Spawn jitter was the dominant p99 noise source.
     if [[ "${SHARD_WORKER_POOL:-1}" != "0" ]]; then
         search_args+=(--shard_worker_pool)
     fi
-    # STREAM_MERGE=1 -> fold each shard's sorted top-K into a running merge as it
-    # finishes, hiding the O(K*N) host merge behind the straggler's wait. Default OFF
-    # (barrier then k-way merge). Byte-identical results (deterministic tie-break).
+    # Comes off chunk LATENCY, not throughput. Groups only; needs group size > 1.
+    if [[ "${GROUP_EXTRACT_PARALLEL:-0}" == "1" ]]; then
+        search_args+=(--group_extract_parallel)
+    fi
+    # Needs PIPELINE=1 and the worker pool.
+    if [[ "${GROUP_PREFETCH:-0}" == "1" ]]; then
+        search_args+=(--group_prefetch)
+    fi
+    if [[ "${PARALLEL_LOAD:-0}" == "1" ]]; then
+        search_args+=(--parallel_load)
+    fi
+    # One core list per DEVICE_IDS entry, ';'-separated. The cards do NOT share a NUMA node, so a
+    # process-wide taskset is remote to at least one. Read the lists off `npu-smi info -t topo`
+    # (CPU Affinity column); machine-specific, so there is no default.
+    if [[ -n "${CARD_CPUS:-}" ]]; then
+        search_args+=(--card_cpus "${CARD_CPUS}")
+    fi
+    # Hides the host merge behind the straggler. Byte-identical results (deterministic tie-break).
     if [[ "${STREAM_MERGE:-0}" == "1" ]]; then
         search_args+=(--stream_merge)
     fi
-    # ROUND_ROBIN=1 -> baseline dispatch: each (full-corpus) card pulls query chunks off a
-    # shared cursor, no cross-card merge. See the ROUND_ROBIN note near the top.
     if [[ "${ROUND_ROBIN}" == "1" ]]; then
         search_args+=(--round_robin)
     fi
-    # SHARD_LATENCY_DUMP=1 -> per-query per-shard TSV: shard0_ms..shardN_ms,
-    # max_shard_ms, merge_ms, total_ms. Decomposes multi-card latency into "slowest
-    # shard" vs "host merge" -- the ~0.8ms between BatchSearch and end-to-end that no
-    # other timer covers. Needs --batch_size 1 to be per-query.
+    if [[ "${SHARD_GROUP_SIZE}" -gt 0 ]]; then
+        search_args+=(--shard_group_size "${SHARD_GROUP_SIZE}")
+    fi
+    if [[ "${STATIC_ASSIGN}" == "1" ]]; then
+        search_args+=(--static_assign)
+    fi
+    if [[ -n "${SLOW_CARDS}" ]]; then
+        search_args+=(--slow_cards "${SLOW_CARDS}" --slow_factor "${SLOW_FACTOR}"
+                      --slow_period_ms "${SLOW_PERIOD_MS}" --slow_duty "${SLOW_DUTY}")
+    fi
+    if [[ "${TARGET_QPS}" != "0" ]]; then
+        search_args+=(--target_qps "${TARGET_QPS}")
+    fi
+    if [[ "${PIPELINE}" == "1" ]]; then
+        search_args+=(--pipeline)
+    fi
+    # Per-query per-shard TSV: slowest shard vs host merge. Needs --batch_size 1 to be per-query.
     if [[ "${SHARD_LATENCY_DUMP:-0}" == "1" ]]; then
         search_args+=(--shard_latency_dump "${RESULT_DIR}/log/per_shard_latency.tsv")
     fi
-    # --mem-report 1 -> host peak RSS + per-device NPU HBM usage after the search.
     if [[ "${MEM_REPORT}" == "1" ]]; then
         search_args+=(--mem_report)
     fi
 
-    # Repeat the search REPEAT times (compile/convert/build already ran once above;
-    # only the search stage repeats). Per-run logs/perf files are suffixed so nothing
-    # clobbers, and each run's end-to-end latency line is collected for the cross-run
-    # median printed after the loop. The loop body keeps its original indentation on
-    # purpose: re-indenting would break the column-0 <<'PY' heredoc terminators below.
-    # Engine A/B toggle: fr_search reads NPUR_POOL_POSTINGS once at startup
-    # (pooled vs raw-malloc devicePostings). Export so both invocations inherit it.
+    # The loop body keeps its original indentation ON PURPOSE: re-indenting would break the column-0
+    # <<'PY' heredoc terminators below. fr_search reads NPUR_POOL_POSTINGS once, so export it.
     export NPUR_POOL_POSTINGS="${POOL_POSTINGS}"
-    # PACKED_SORT=1 -> the per-shard host top-K sorts 8-byte packed keys instead of the
-    # 16-byte ScoreWithIndex (~-150us on that stage). Default off keeps the struct sort.
-    if [[ "${PACKED_SORT:-0}" == "1" ]]; then
-        export NPUR_PACKED_SORT=1
-    fi
-    # RADIX_SORT=1 -> sort the packed keys with LSD radix instead of std::sort (implies the
-    # packed path, ~-40us on the sort stage). Off by default.
-    if [[ "${RADIX_SORT:-0}" == "1" ]]; then
-        export NPUR_RADIX_SORT=1
-    fi
-    # SHARD_TOPK_RATIO=<0..1> -> each shard aggregates only its top ceil(topK*ratio); the
-    # host merge still returns the full topK from all shards. Smaller per-shard sort/TopK at
-    # a little recall (global topK is split ~topK/N per shard). Default 1 (full).
+    npur_switch PACKED_SORT NPUR_PACKED_SORT "0"
+    # LSD radix instead of std::sort; implies the packed path.
+    npur_switch RADIX_SORT NPUR_RADIX_SORT "0"
+    # Each shard aggregates only its top ceil(topK*ratio); the merge still returns the full topK.
+    # Costs a little recall (the global topK splits ~topK/N per shard). Default 1 = full.
     [[ -n "${SHARD_TOPK_RATIO:-}" ]] && export NPUR_SHARD_TOPK_RATIO="${SHARD_TOPK_RATIO}"
+    # Phases across queries instead of query at a time, so the per-query syncs become a constant.
+    npur_switch BATCH_AGGREGATE NPUR_BATCH_AGGREGATE "0"
+    # Only does anything with BATCH_AGGREGATE=1 and BATCH_SIZE >= 2.
+    npur_switch TOPK_CONCURRENT NPUR_TOPK_CONCURRENT "0"
+    npur_switch POOL_SMALL_H2D NPUR_POOL_SMALL_H2D "0"
+    # Needs NPUR_OVERLAP_POSTING and BATCH_FILTER; only on BatchSearchDevice (groups, or PIPELINE=1).
+    npur_switch EARLY_FILTER_PREP NPUR_EARLY_FILTER_PREP "0"
+    # The filter kernels' time then shows up inside AggrAndTopK_Aggregator_NPU. Needs BATCH_FILTER=1
+    # and BATCH_AGGREGATE=1; only on BatchSearchDevice (groups, or PIPELINE=1).
+    npur_switch SHARE_FILTER_STREAM NPUR_SHARE_FILTER_STREAM "0"
+    # Changes the TOPK kernel's arguments, so the first run after pulling it needs --compile 1.
+    # Only with BATCH_AGGREGATE=1.
+    npur_switch TOPK_COUNTS_IN_PLACE NPUR_TOPK_COUNTS_IN_PLACE "0"
+    # Needs TOPK_COUNTS_IN_PLACE=1 and a single aggregator lane (AGG_CONCURRENT unset or 1);
+    # otherwise it QUIETLY STAYS OFF.
+    npur_switch FUSE_AGG_TOPK NPUR_FUSE_AGG_TOPK "0"
+    # Needs OVERLAP_POSTING and BITLIST_ONE_H2D; only on BatchSearchDevice. Does nothing on an index
+    # where no query converts anything.
+    npur_switch DEFER_CONV_SYNC NPUR_DEFER_CONV_SYNC "0"
+    # Each Aggregator takes 16 of the 40 vector cores, so 2 is the natural setting. IGNORED under
+    # SHARE_FILTER_STREAM, whose one stream is what orders the aggregator behind the filter.
+    [[ -n "${AGG_CONCURRENT:-}" ]] && export NPUR_AGG_CONCURRENT="${AGG_CONCURRENT}"
+    # WITHOUT IT every GetStream() returns nullptr and every kernel runs on the default stream, so
+    # TOPK_CONCURRENT, AGG_CONCURRENT and DEFER_CONV_SYNC do nothing. It is an arm of its own in any A/B.
+    npur_switch STREAM_POOL NPUR_STREAM_POOL "0"
+    # Implies the early filter prepare. Needs STREAM_POOL=1 for a second stream (without it they queue
+    # behind the scorer -- correct, but not overlapped), plus OVERLAP_POSTING and BATCH_FILTER.
+    npur_switch OVERLAP_FILTER NPUR_OVERLAP_FILTER_KERNEL "0"
+    # Output-identical (keys built index-descending, so ties come out as before); needs RADIX_SORT=1.
+    npur_switch EXTRACT_FAST NPUR_EXTRACT_FAST "0"
+    # Only takes effect where BatchCompute is handed prepared expressions, i.e. NPUR_OVERLAP_POSTEXPR
+    # != 0 (the default).
+    npur_switch BATCH_FILTER NPUR_BATCH_FILTER "0"
+    npur_switch SCORER_TRIM_WRITE NPUR_SCORER_TRIM_WRITE "0"
+    npur_switch TOPK_LOOP_STATS NPUR_TOPK_LOOP_STATS "0"
+    # Point RECALL_REF_FILE at a SEPARATE file or the two modes overwrite each other's cache.
+    if [[ "${RECALL_FP32:-0}" == "1" ]]; then
+        search_args+=(--recall_fp32)
+    fi
     npu_hbm_report before
+    npu_hbm_sample_start
     npu_util_start
+    npu_load_start
     run_latency_lines=()
     for ((run = 1; run <= REPEAT; run++)); do
     run_suffix=""
@@ -1006,42 +1295,28 @@ if [[ "${DO_SEARCH}" == "1" ]]; then
     search_log="${RESULT_DIR}/log/fr_search${run_suffix}.log"
     set +e
     if [[ "${PROFILE_MODE}" != "0" ]]; then
-        # Per-stage timing: fr_search's RecordGuard prints "[PERF] <stage> <us> us"
-        # per query when NPUR_PERF=1. Stream-aggregate those lines with awk (so
-        # the 10k-query x N-stage raw output never hits the log), pass [RESULT] and
-        # everything else through, then print an avg-per-stage table sorted desc.
+        # awk stream-aggregates the [Perf] lines so the 10k x N-stage raw output never hits the log.
         perf_file="${RESULT_DIR}/log/fr_search_perf${run_suffix}.txt"
         : > "${perf_file}"
-        # PERF_DUMP=1 also writes raw per-query 'q<TAB>stage<TAB>us' so we can
-        # attribute the TAIL (slowest 1% of queries) per stage, not just the avg.
-        # RecordGuard prints the outer "BatchSearch" line LAST per query (RAII), so
-        # we tag every [PERF] line with the current query index q and bump q after
-        # each BatchSearch. (q 0..4 are the 5 warmup queries; the post-process drops them.)
-        # raw per-invocation 'q<TAB>stage<TAB>us' — always written. Used for the
-        # per-stage percentile table below (which ignores q, so it is correct even
-        # in multi-card) and, with PERF_DUMP=1, for the q-based tail attribution --
-        # which is single-card only; see the guard on it below.
+        # RecordGuard prints the outer "BatchSearch" line LAST per query (RAII), so every [Perf] line is
+        # tagged with the current q and q is bumped after each BatchSearch. q 0..4 are the warmup queries.
         perf_raw="${RESULT_DIR}/log/fr_search_perf_raw${run_suffix}.tsv"
         : > "${perf_raw}"
-        # quiet=1 (--profile 2) folds the per-query recall lines into a count. The
-        # harness prints one per mismatching query, which on a 10k cached run is a
-        # screenful that the CPU-recall summary already totals. The count is still
-        # printed, so a recall regression cannot hide -- and the raw lines survive in
-        # fr_search_perf_raw / can be had back with --profile 1.
-        NPUR_PERF=1 NPUR_LOG_LEVEL=ERROR "${ROOT_DIR}/build/fr_search" "${search_args[@]}" 2>&1 \
+        # quiet=1 (--profile 2) folds the per-query recall lines into a count -- the count is still printed.
+        NPUR_PERF=1 NPUR_LOG_LEVEL="${NPUR_LOG_LEVEL:-ERROR}" "${ROOT_DIR}/build/fr_search" "${search_args[@]}" 2>&1 \
             | awk -v pf="${perf_file}" -v raw="${perf_raw}" -v quiet="$([[ "${PROFILE_MODE}" == "2" ]] && echo 1 || echo 0)" '
-                /^\[PERF\]/ {
+                /^\[Perf\]/ {
                     us=$(NF-1); tag=$2; for (i=3;i<=NF-2;i++) tag=tag " " $i;
                     s[tag]+=us; c[tag]++;
                     if (raw != "") printf "%d\t%s\t%d\n", q, tag, us > raw;
                     if (tag == "BatchSearch") q++;
                     next
                 }
-                quiet == 1 && /^\[RESULT\] q[0-9]+ recall=/ { mismatch++; next }
+                quiet == 1 && /^\[Result\] q[0-9]+ recall=/ { mismatch++; next }
                 { print }
                 END {
                     if (quiet == 1 && mismatch > 0)
-                        printf "[RESULT] %d per-query recall lines suppressed (--profile 2); see the CPU-recall summary\n", mismatch
+                        printf "[Result] %d per-query recall lines suppressed (--profile 2); see the CPU-recall summary\n", mismatch
                     for (k in s) printf "%.1f\t%.0f\t%d\t%s\n", s[k]/c[k], s[k], c[k], k > pf
                 }' \
             | tee "${search_log}"
@@ -1055,9 +1330,7 @@ if [[ "${DO_SEARCH}" == "1" ]]; then
             } | tee -a "${search_log}"
         fi
         if [[ -s "${perf_raw}" ]]; then
-            # Per-stage percentiles over ALL timed invocations. Percentiles need no
-            # query grouping (only each stage's own duration list), so this is
-            # correct in multi-card where q is per-shard, not per-query.
+            # Percentiles need no query grouping, so this is correct in multi-card where q is per-shard.
             PERF_RAW="${perf_raw}" python3 - <<'PY' | tee -a "${search_log}"
 import os, math
 from collections import defaultdict
@@ -1084,23 +1357,13 @@ for p99, p50, p90, mx, cnt, stage in rows:
     print(f"{p50:>10d} {p90:>10d} {p99:>10d} {mx:>10d} {cnt:>9d}  {stage}")
 PY
         fi
-        # Tail attribution needs the q tagging above, which assumes ONE BatchSearch is
-        # in flight at a time: it bumps q on each BatchSearch line and buckets every
-        # [PERF] line into the current q. Multi-card breaks that -- the shards run in
-        # parallel threads writing [PERF] to the same stderr, so q advances once per
-        # shard rather than per query and the two shards' stages interleave into
-        # arbitrary buckets. The output looks plausible and is not: a 2-shard run had
-        # stages 7x FASTER on the "slow" queries, only 54% of the slow bucket's
-        # BatchSearch accounted for by its own sub-stages (vs 91% overall), and a
-        # different culprit each round. The percentile table above is unaffected --
-        # it ignores q entirely.
+        # Needs the q tagging above, which assumes ONE BatchSearch in flight. Multi-card breaks it and THE
+        # OUTPUT LOOKS PLAUSIBLE ANYWAY -- single-card only. The percentile table above ignores q entirely.
         if [[ "${PERF_DUMP:-0}" == "1" && -s "${perf_raw}" && "${SHARD_NUM}" -gt 1 ]]; then
             echo "[Info] PERF_DUMP tail attribution skipped: it needs single-card (${SHARD_NUM} shards here)." >&2
             echo "       The q tagging assumes serial BatchSearch; parallel shards scramble the buckets." >&2
         elif [[ "${PERF_DUMP:-0}" == "1" && -s "${perf_raw}" ]]; then
-            # Tail attribution: per-stage avg over ALL timed queries vs over the
-            # slowest 1% (ranked by their BatchSearch total). Shows which stage
-            # blows up on the p99 queries.
+            # Per-stage avg over all timed queries vs the slowest 1%, ranked by their BatchSearch total.
             PERF_RAW="${perf_raw}" python3 - <<'PY' | tee -a "${search_log}"
 import os, collections
 raw = os.environ["PERF_RAW"]
@@ -1128,7 +1391,7 @@ for s in stages:
 PY
         fi
     else
-        NPUR_LOG_LEVEL=ERROR "${ROOT_DIR}/build/fr_search" "${search_args[@]}" 2>&1 | tee "${search_log}"
+        NPUR_LOG_LEVEL="${NPUR_LOG_LEVEL:-ERROR}" "${ROOT_DIR}/build/fr_search" "${search_args[@]}" 2>&1 | tee "${search_log}"
         rc=${PIPESTATUS[0]}
     fi
     set -e
@@ -1136,16 +1399,16 @@ PY
         echo "[ERROR] fr_search failed (run ${run}/${REPEAT}) with exit code ${rc}. See ${search_log}" >&2
         exit "${rc}"
     fi
-    lat_line="$(grep -m1 '^\[RESULT\] latency ms:' "${search_log}" 2>/dev/null || true)"
+    lat_line="$(grep -m1 '^\[Result\] latency ms:' "${search_log}" 2>/dev/null || true)"
     [[ -n "${lat_line}" ]] && run_latency_lines+=("${lat_line}")
     echo "[Done] Search log: ${search_log}"
     done
+    npu_load_stop
     npu_util_stop
+    npu_hbm_sample_stop
     npu_hbm_report after
 
-    # Cross-run median of the end-to-end latency stats. A single 10k-query run's p99
-    # tail is not reproducible run-to-run; the median over REPEAT runs de-noises it.
-    # Each run's value is shown alongside so the spread is visible.
+    # A single 10k-query run's p99 is not reproducible; each run's value is shown so the spread shows.
     if [[ "${REPEAT}" -gt 1 && "${#run_latency_lines[@]}" -gt 0 ]]; then
         median_src="${RESULT_DIR}/log/fr_search_latency_runs.txt"
         printf '%s\n' "${run_latency_lines[@]}" > "${median_src}"
@@ -1166,18 +1429,19 @@ print(f"{'metric':<8}" + "".join(f"{'run'+str(i+1):>10}" for i in range(n)) + f"
 for k in keys:
     vals = [r[k] for r in runs]
     print(f"{k:<8}" + "".join(f"{v:>10.4f}" for v in vals) + f"{statistics.median(vals):>12.4f}")
-# The harness now prints qps directly (queries / wall-clock). Median it across runs.
+# qps as a table row too (queries / wall-clock, printed per run by the harness),
+# in .1f -- .4f would suggest precision a wall-clock measurement does not have.
 if all("qps" in r for r in runs):
-    print(f"\n[RESULT] throughput (median): {statistics.median([r['qps'] for r in runs]):.1f} qps")
+    vals = [r["qps"] for r in runs]
+    print(f"{'qps':<8}" + "".join(f"{v:>10.1f}" for v in vals) + f"{statistics.median(vals):>12.1f}")
+    print(f"\n[Result] throughput (median): {statistics.median(vals):.1f} qps")
 PY
     fi
 else
     echo "[Step] Skipping search."
 fi
 
-# Opt-in email notification: only after a search that actually ran (we reach here
-# only on success; a failed fr_search exits above). Never fail the run on a
-# notify error.
+# Reached only on success (a failed fr_search exits above). Never fail the run on a notify error.
 if [[ "${DO_SEARCH}" == "1" && "${NOTIFY}" == "1" ]]; then
     if [[ -z "${NOTIFY_API_KEY}" ]]; then
         echo "[Notify] NOTIFY=1 but NOTIFY_API_KEY is empty; skipping email." \
@@ -1185,8 +1449,7 @@ if [[ "${DO_SEARCH}" == "1" && "${NOTIFY}" == "1" ]]; then
     elif ! command -v curl >/dev/null 2>&1; then
         echo "[Notify] curl not found; skipping email." >&2
     else
-        # Headline latency: prefer the cross-run median -- a single run's p99 is not
-        # reproducible, so the last run's number would be actively misleading here.
+        # Prefer the cross-run median: the last run's p99 alone would be actively misleading here.
         notify_median_log="${RESULT_DIR}/log/fr_search_median.log"
         notify_lat_src="single run"
         notify_avg="?"
@@ -1199,16 +1462,13 @@ if [[ "${DO_SEARCH}" == "1" && "${NOTIFY}" == "1" ]]; then
             notify_avg="$(sed -n 's/.*avg=\([0-9.]*\).*/\1/p' <<<"${lat_line}" || true)"
             notify_p99="$(sed -n 's/.*p99=\([0-9.]*\).*/\1/p' <<<"${lat_line}" || true)"
         fi
-        # Recall headline. The harness prints "[RESULT] CPU-recall over N queries:
-        # avg=X%" only when verification actually ran, so its absence is itself a
-        # result: report it loudly instead of omitting it, or a quiet email reads as
-        # a pass when recall was never checked at all.
+        # The harness prints this only when verification ran, so its ABSENCE is itself a result -- report
+        # it loudly, or a quiet email reads as a pass when recall was never checked.
         notify_recall="$(grep -m1 'CPU-recall over' "${search_log}" 2>/dev/null \
                          | sed -n 's/.*avg=\(.*\)/\1/p' || true)"
         [[ -z "${notify_recall}" ]] && notify_recall="NOT-VERIFIED"
-        # Per-query lines are printed for every mismatch, plus the first 10 as a
-        # sanity check when the ref is not cached -- so only recall<1 counts as bad.
-        notify_bad="$(grep '^\[RESULT\] q[0-9]* recall=' "${search_log}" 2>/dev/null \
+        # The first 10 are printed as a sanity check even when they pass, so only recall<1 counts as bad.
+        notify_bad="$(grep '^\[Result\] q[0-9]* recall=' "${search_log}" 2>/dev/null \
                       | grep -v 'recall=1\.0000' || true)"
         notify_bad_n=0
         [[ -n "${notify_bad}" ]] && notify_bad_n="$(wc -l <<<"${notify_bad}" | tr -d ' ')"
@@ -1218,10 +1478,8 @@ if [[ "${DO_SEARCH}" == "1" && "${NOTIFY}" == "1" ]]; then
         else
             notify_devices="${DEVICE_ID} (single card)"
         fi
-        # Knobs that deviate from the tuned defaults, appended to the subject. CONFIG_TAG
-        # only carries segment size and density, so without this every mail from an A/B
-        # sweep of any other knob has an identical subject and only the body tells them
-        # apart. Empty on a default run.
+        # CONFIG_TAG carries only segment size and density, so without this every mail from an A/B sweep
+        # of any other knob has an identical subject.
         notify_diff=""
         [[ "${NPUR_PARALLEL_SCORE_FILTER:-0}" != "0" ]] && notify_diff+=" parallel_sf=1"
         [[ "${NPUR_OVERLAP_POSTEXPR:-1}" != "1" ]] && notify_diff+=" overlap_postexpr=${NPUR_OVERLAP_POSTEXPR}"
@@ -1272,7 +1530,6 @@ if [[ "${DO_SEARCH}" == "1" && "${NOTIFY}" == "1" ]]; then
             fi
             printf '\nlog:      %s\n' "${search_log}"
         )"
-        # Build the JSON payload with python3 so subject/body are escaped safely.
         notify_payload="$(
             NS="${notify_subject}" NB="${notify_body}" python3 -c \
                 'import json,os;print(json.dumps({"subject":os.environ["NS"],"text":os.environ["NB"]}))'
@@ -1290,4 +1547,4 @@ if [[ "${DO_SEARCH}" == "1" && "${NOTIFY}" == "1" ]]; then
     fi
 fi
 
-echo "[Done] hx_npu run completed."
+echo "[Done] FullRecall run completed."

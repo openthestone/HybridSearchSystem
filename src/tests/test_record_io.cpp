@@ -1,7 +1,5 @@
-// Tests the builder-input record envelope: write with the converter's writer
-// (src/io/record_io.h) and read back with engine/'s ACTUAL consumer,
-// NpuRetrieval::ReadAndDoTask (engine/indexer/file/file_reader.cpp). This pins the
-// on-disk contract between fr_converter and fr_builder against the real reader.
+// Writes with the converter's writer (src/io/record_io.h) and reads back with engine/'s ACTUAL
+// consumer, NpuRetrieval::ReadAndDoTask, pinning the on-disk contract against the real reader.
 #include <cstdint>
 #include <cstdio>
 #include <fstream>
@@ -25,8 +23,7 @@ static int g_fail = 0, g_pass = 0;
 int main() {
     const std::string path = "/tmp/npur_record_io.bin";
 
-    // Ground-truth records: gdocid + payload (payloads incl. empty and binary bytes,
-    // mirroring docid files (empty payload) and section files (serialized proto)).
+    // Payloads include empty and binary bytes, mirroring docid files and section files.
     std::vector<std::pair<uint64_t, std::string>> recs = {
         {0ULL, std::string()},                                     // docid-style: empty payload
         {1ULL, std::string("hello")},                              // ascii

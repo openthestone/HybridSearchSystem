@@ -12,8 +12,8 @@ bash port/tests/run_tests.sh          # builds + runs all; exits non-zero on fai
 
 | test | target | what it pins |
 |---|---|---|
-| `test_filter_expr` | [filter_expr.h](../harness/filter_expr.h) | parser precedence (NOT>AND>OR), parens, n-ary AND/OR, `NOT` of groups, empty=match-all, malformed→parse-error; and that the tag-set evaluator and the bitmap evaluator **always agree** (incl. boundary tags 0 / 63 / 64 / 35839). |
-| `test_query_io` | [query_io.h](../harness/query_io.h) | `.fvecs` loader: headered `[i32 rows][i32 dim][floats]` (hw_queries.fvecs) vs per-vector standard fvecs; dim=64; missing/truncated/too-small files don't crash. |
+| `test_filter_expr` | [filter_expr.h](../harness/query/filter_expr.h) | parser precedence (NOT>AND>OR), parens, n-ary AND/OR, `NOT` of groups, empty=match-all, malformed→parse-error; and that the tag-set evaluator and the bitmap evaluator **always agree** (incl. boundary tags 0 / 63 / 64 / 35839). |
+| `test_query_io` | [query_io.h](../harness/query/query_io.h) | `.fvecs` loader: headered `[i32 rows][i32 dim][floats]` (hw_queries.fvecs) vs per-vector standard fvecs; dim=64; missing/truncated/too-small files don't crash. |
 | `test_record_io` | [record_io.h](../common/record_io.h) | the builder-input record envelope round-trips through new/'s **actual** `TianjiEngine::ReadAndDoTask` (compiled from `new/build/file/`): gdocid (incl. > 2³²) and payload bytes (incl. empty + binary/NUL) come back exactly. This locks the `fr_converter` → `fr_builder` on-disk contract to the real reader. |
 
 ## Notes / limits

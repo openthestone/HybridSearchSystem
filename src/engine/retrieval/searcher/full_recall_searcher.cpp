@@ -3,6 +3,7 @@
 #include <string>
 #include <thread>
 #include "acl/acl.h"
+#include "src/utils/env_switch.h"
 #include "src/utils/logger.h"
 #include "src/full_recall/core/constant_definition.h"
 #include "src/full_recall/core/log_definition.h"
@@ -13,83 +14,18 @@
 
 namespace NpuRetrieval {
 
-// A/B switch for overlapping the scorer and text filter. Default OFF: they run
-// serially via the single-threaded executor. NPUR_PARALLEL_SCORE_FILTER=1 runs
-// them on two host threads -> two distinct StreamManager streams, so the MMad
-// scorer (Cube) and the bitmap filter (Vector) co-reside on the NPU. Read once;
-// constant for the process.
-//
-// The overlap is real -- the scorer kernel costs the same (~818us) whether serial
-// or parallel, because Cube and Vector are separate units, so it completes for
-// free inside the filter's window. But it is off by default because it trades the
-// tail for the median. Same-window measurement on 910B3 (2-shard, scorer 12 /
-// filter 40) vs serial:
-//
-//     avg  2.704 -> 2.650ms   p50  2.663 -> 2.404ms   p90 3.025 -> 2.777ms
-//     p95  3.223 -> 3.336ms   p99  3.817 -> 6.832ms   max 26 -> 41ms
-//
-// The p99 cost is not noise: all three parallel runs were >= 6.2ms, all three
-// serial runs <= 4.85ms. The extra thread inflates the known cross-shard ACL D2H
-// contention (fill_d2h_copy p99 70/71/69us serial vs 85/114/6534us parallel).
-// Turn it on only if median latency matters more than the tail.
+// NPUR_PARALLEL_SCORE_FILTER=1: scorer (Cube) and text filter (Vector) on two host threads, so
+// they co-reside. Off by default: p50 2.66 -> 2.40ms but p99 3.82 -> 6.83ms.
 static bool ParallelScoreFilterEnabled() {
-    static const bool enabled = []() {
-        const char* v = std::getenv("NPUR_PARALLEL_SCORE_FILTER");
-        return v != nullptr && std::string(v) == "1";
-    }();
+    static const bool enabled = npur_env::OnExact("NPUR_PARALLEL_SCORE_FILTER");
     return enabled;
 }
 
-// A/B switch for hiding the text filter's host-side postfix-expression build inside
-// the scorer kernel's execution window. Default OFF. Read once; constant for the
-// process. Ignored when NPUR_PARALLEL_SCORE_FILTER=1, which already overlaps far more.
-//
-// Serially the device goes idle mid-query for no reason: the scorer's
-// aclrtSynchronizeStream returns before the filter task even starts, and the filter
-// then spends TextFilter_Compute_GetPostOrderExpression walking the query tree on the
-// host with nothing running on the NPU. This launches the scorer, builds the
-// expression while its kernel runs, and only then waits.
-//
-// Why this is not the parallel path that failed:
-//   - No second thread, so none of the spawn jitter that --shard_worker_pool exists
-//     to avoid.
-//   - The build issues zero ACL calls (query_node_imp.cpp includes only its own
-//     header and the logger), so it cannot reproduce the ACL contention that made
-//     NPUR_PARALLEL_SCORE_FILTER's D2H go 39.2 -> 71.3us.
-//   - The scorer is synced before the filter touches the device, so the two kernels
-//     still never co-reside and cannot fight over HBM bandwidth (filter 233 -> 719us).
-//
-// Modes (default 1):
-//   1  the postfix build runs inside the scorer kernel's execution window.
-//   2  same calls in the same order, but the Sync sits right after the launch so
-//      nothing overlaps. The control arm that isolates the overlap.
-//   0  the pre-overlap baseline: both tasks through the executor, each re-entering
-//      aclrtSetDevice/aclrtResetDevice.
-//
-// 2-shard, 3 interleaved rounds, medians, recall 100% on all nine runs:
-//
-//                    avg      p50      p90      p99
-//     0 baseline   2.5765   2.5489   2.8243   3.2674
-//     2 control    2.5560   2.5362   2.8270   3.2171
-//     1 overlap    2.4497   2.4327   2.7175   2.9864
-//
-// The control arm is what makes this readable. 2-vs-0 is worth -20us avg (ranges
-// overlap -- not a result) and -50us p99: dropping the executor round trip and those
-// redundant per-task Set/Reset buys almost nothing. The whole win is 1-vs-2, whose
-// p99 ranges do not overlap.
-//
-// And it lands where the mechanism says it should. The build itself costs 101.1us avg
-// / 251us p99 per shard, and both shards hide their own concurrently, so those are the
-// ceilings; the overlap measures -106.3us avg (105% of ceiling) and -230.7us p99
-// (92%). p99 gains more than avg precisely because the build's own p99 is 2.5x its
-// avg -- more to hide on the slow queries. Two independent points predicted by one
-// stage's distribution is what makes this causal rather than a coincidence.
-//
-// Safe where NPUR_PARALLEL_SCORE_FILTER was not: no second thread (no spawn jitter),
-// the build issues no ACL calls at all (query_node_imp.cpp includes only its own
-// header and the logger, so no repeat of D2H 39.2 -> 71.3us), and the scorer is synced
-// before the filter touches the device, so the kernels never co-reside and cannot
-// fight over HBM (filter 233 -> 719us).
+// NPUR_OVERLAP_POSTEXPR (default 1): hide the filter's postfix-expression build inside the scorer
+// kernel's window. Ignored when NPUR_PARALLEL_SCORE_FILTER=1.
+//   1  the build runs inside the scorer kernel's execution window.
+//   2  same calls in the same order, Sync right after the launch (control arm).
+//   0  pre-overlap baseline: both tasks through the executor.
 static int OverlapPostExprMode() {
     static const int mode = []() {
         const char* v = std::getenv("NPUR_OVERLAP_POSTEXPR");
@@ -108,16 +44,50 @@ static int OverlapPostExprMode() {
     return mode;
 }
 
-// NPUR_OVERLAP_POSTING=1 (default off): also build the filter's posting pointer table
-// (PostingBitListToSet) inside the scorer's execution window, not after the sync. Only
-// applies on the overlap path (OverlapPostExprMode()==1). Nearly pure host + a small H2D,
-// so it does not fight the scorer for HBM the way the filter kernel would.
+// NPUR_OVERLAP_POSTING=1: also build the posting pointer table inside the scorer's window.
 static bool OverlapPostingMode() {
-    static const bool enabled = [] {
-        const char* v = std::getenv("NPUR_OVERLAP_POSTING");
-        return v != nullptr && v[0] == '1';
-    }();
+    static const bool enabled = npur_env::On("NPUR_OVERLAP_POSTING");
     return enabled;
+}
+
+// NPUR_EARLY_FILTER_PREP=1: also run TextFilter::FusedPrepare inside the scorer's window. Needs
+// NPUR_BATCH_FILTER, NPUR_OVERLAP_POSTING and ReadyForEarlyPrep.
+static bool EarlyFilterPrepMode() {
+    static const bool enabled = npur_env::On("NPUR_EARLY_FILTER_PREP");
+    return enabled;
+}
+
+// NPUR_SHARE_FILTER_STREAM=1 (needs NPUR_BATCH_FILTER and NPUR_BATCH_AGGREGATE): hand the filter
+// kernels' stream to the aggregator, whose first sync waits for both. Their time is then
+// reported inside AggrAndTopK_Aggregator_NPU.
+static bool ShareFilterStreamMode() {
+    static const bool enabled = npur_env::On("NPUR_SHARE_FILTER_STREAM");
+    return enabled;
+}
+
+// NPUR_DEFER_CONV_SYNC=1 (needs NPUR_OVERLAP_POSTING and NPUR_BITLIST_ONE_H2D): a conversion
+// launched in the scorer window is waited on after the scorer sync, before any filter kernel.
+static bool DeferConvSyncMode() {
+    static const bool enabled = npur_env::On("NPUR_DEFER_CONV_SYNC");
+    return enabled;
+}
+
+// NPUR_OVERLAP_FILTER_KERNEL=1: also LAUNCH the filter kernels inside the scorer window. Needs
+// NPUR_STREAM_POOL for a second stream, implies the early prepare, and drains any pending
+// conversion first since the filter reads what it writes.
+static bool OverlapFilterKernelMode() {
+    static const bool enabled = npur_env::On("NPUR_OVERLAP_FILTER_KERNEL");
+    return enabled;
+}
+
+// FusedPrepare stays cheap only when every query already has a posting table and none is empty.
+static bool ReadyForEarlyPrep(const std::vector<FilterExpr>& exprs) {
+    for (const FilterExpr& e : exprs) {
+        if (!e.valid || e.emptyTree || !e.postingsPrepared) {
+            return false;
+        }
+    }
+    return true;
 }
 
 void FullRecallSearcher::AddQuery(QueryNode* queryTrees, const std::vector<float>& queryVectors, uint32_t topK) {
@@ -131,9 +101,6 @@ void FullRecallSearcher::AddQuery(QueryNode* queryTrees, const std::vector<float
     LOG_DEBUG("query sum=" << vectorSum);
     m_topKs.emplace_back(topK);
     m_queries.emplace_back(queryTrees);
-    // The query and doc-side embeddings correspond. Model/doc dimension alignment is
-    // validated by the model-index consistency management, and only requests from the
-    // same model are accumulated together.
     m_dimension = queryVectors.size();
 }
 
@@ -155,7 +122,7 @@ bool FullRecallSearcher::BatchSearch(std::vector<std::shared_ptr<FullRecallResul
         LOG_ERROR("aclrtSetDevice fail, deviceId is:" << m_deviceId << " error code is:" << ret);
         return false;
     }
-    // In the offline data the bitset uses uint16 as its unit, so it is always divisible by 8; validated at load time.
+    // The offline bitset unit is uint16, so this is always divisible by 8 (checked at load).
     uint32_t allResultsByteSize =
         segmentsNum * docNumPerSegment / 8 * m_queries.size();  // all filter results for the batch
     GmMemoryManager::GetByDeviceId(m_deviceId)
@@ -200,19 +167,8 @@ bool FullRecallSearcher::BatchSearch(std::vector<std::shared_ptr<FullRecallResul
         return ErrorCode::ResultType::SUCCESS;
     };
 
-    // Wait for scoring and filtering to finish. They write disjoint device buffers
-    // (resultChunk vs filterResultInDevice), so they are independent. The outer
-    // aclrtSetDevice above holds a device refcount for the whole BatchSearch, so the
-    // per-task Set/ResetDevice in the parallel threads only bump the count and never
-    // tear the context down.
     bool isSuccess = true;
     if (ParallelScoreFilterEnabled()) {
-        // Overlap on two host threads -> two distinct StreamManager streams. The two
-        // kernels never contend for compute (Cube vs Vector are separate units); what
-        // they share is HBM bandwidth, and the scorer -- which is bandwidth-bound --
-        // wins it, so the filter absorbs the whole slowdown (kernel 233 -> 719us) and
-        // becomes the long pole. Filter runs inline on this thread; only the scorer
-        // gets a spawned thread.
         ErrorCode::ResultType scoreRet = ErrorCode::ResultType::FAIL;
         std::thread scoreThread([&scoreRet, &scoreTask]() { scoreRet = scoreTask(); });
         ErrorCode::ResultType filterRet = filterTask();
@@ -221,10 +177,6 @@ bool FullRecallSearcher::BatchSearch(std::vector<std::shared_ptr<FullRecallResul
             isSuccess = false;
         }
     } else if (OverlapPostExprMode() != 0) {
-        // All on this thread; BatchSearch's outer aclrtSetDevice already covers it, so no
-        // Set/Reset here. Mode 1 and mode 2 run the identical calls in the identical
-        // order -- the only difference is whether the postfix build lands before or after
-        // the Sync, which is exactly the thing being priced.
         const bool overlap = OverlapPostExprMode() == 1;
         const bool overlapPosting = overlap && OverlapPostingMode();
         ScorerLaunch launch;
@@ -237,13 +189,11 @@ bool FullRecallSearcher::BatchSearch(std::vector<std::shared_ptr<FullRecallResul
             LOG_ERROR("m_textFilter.BatchPrepareExpr failed.");
             isSuccess = false;
         } else if (overlapPosting && !m_textFilter.BatchPreparePostings(exprs)) {
-            // Still done inside the scorer window: it's host bookkeeping + a small H2D.
             LOG_ERROR("m_textFilter.BatchPreparePostings failed.");
             isSuccess = false;
         }
-        // Sync even when the build failed: the launched kernel still owns the stream and
-        // the query buffer, and skipping this would leak them and free resultChunk out
-        // from under a kernel still writing to it.
+        // Sync even when the build failed: skipping it would free resultChunk out from under a
+        // kernel still writing it.
         if (!m_vectorScorerMmad.BatchComputeSync(launch)) {
             LOG_ERROR("m_vectorScorerMmad.BatchComputeSync failed.");
             isSuccess = false;
@@ -256,8 +206,6 @@ bool FullRecallSearcher::BatchSearch(std::vector<std::shared_ptr<FullRecallResul
             LOG_ERROR("textFilter.BatchCompute failed.");
             isSuccess = false;
         }
-        // Free the pre-built posting tables (if any) -- BatchCompute is done consuming them.
-        // Runs on success and failure alike; FreePreparedPostings skips un-prepared exprs.
         if (overlapPosting) {
             m_textFilter.FreePreparedPostings(exprs);
         }
@@ -271,7 +219,6 @@ bool FullRecallSearcher::BatchSearch(std::vector<std::shared_ptr<FullRecallResul
         });
     }
     if (isSuccess) {
-        // wait for aggregation to finish
         uint8_t* resultInDevice = reinterpret_cast<uint8_t*>(resultChunk.data);  // scoring / aggregation result
         isSuccess = RunAggregation(filterResultInDevice, resultInDevice, fullRecallResults, isMultiShard);
     } else {
@@ -300,7 +247,7 @@ bool FullRecallSearcher::OneFilter(GmBlock& filterResultChunk) {
     }
     uint32_t docNumPerSegment = m_dataTable->GetDocNumPerSegment();
     uint32_t segmentsNum = m_dataTable->GetSegmentNum();
-    // In the offline data the bitset uses uint16 as its unit, so it is always divisible by 8; validated at load time.
+    // The offline bitset unit is uint16, so this is always divisible by 8 (checked at load).
     uint32_t resultsByteSize = segmentsNum * docNumPerSegment / 8;  // 8 bits per byte
     GmMemoryManager::GetByDeviceId(m_deviceId)
         ->AllocateBlock(GmPoolName::TEXT_FILTER_RESULT_POOL, resultsByteSize, filterResultChunk);
@@ -454,5 +401,282 @@ bool FullRecallSearcher::RunAggregation(uint8_t* filterResultInDevice, uint8_t* 
         LOG_ERROR("Aggregator and topK fail, please check");
     }
     return isSuccessAggregator;
+}
+
+bool FullRecallSearcher::RunAggregationDevice(uint8_t* filterResultInDevice, uint8_t* resultInDevice,
+                                              std::vector<AggrDeviceResult>& deviceResults, aclrtStream sharedStream,
+                                              bool* sharedStreamSynced) {
+    RecordGuard guard{"Aggregator all"};
+    uint32_t docNum = m_dataTable->GetDocNum();
+    uint32_t segmentsNum = m_dataTable->GetSegmentNum();
+    uint32_t vectorResultOffsetOne = m_dataTable->GetScoreExtendDocNum() * sizeof(float);
+    uint32_t docAllByteSize = docNum * sizeof(float);
+    uint32_t resultInDeviceOffset = 0;
+    uint32_t filterResultInDeviceByteOffset = 0;
+    uint32_t filterResultInDeviceByteSize = segmentsNum * (m_dataTable->GetSegmentByteSize());
+    // NPUR_BATCH_AGGREGATE: one phased call for the whole batch.
+    if (ResultAggregator::BatchAggregateMode()) {
+        std::vector<uint8_t*> filterResults(m_topKs.size(), nullptr);
+        std::vector<uint8_t*> docScores(m_topKs.size(), nullptr);
+        for (size_t q = 0; q < m_topKs.size(); ++q) {
+            if (m_queries[q] == nullptr)
+                continue;  // offsets still advance only for real queries, as in the loop below
+            filterResults[q] = filterResultInDevice + filterResultInDeviceByteOffset;
+            docScores[q] = resultInDevice + resultInDeviceOffset;
+            resultInDeviceOffset += vectorResultOffsetOne;
+            filterResultInDeviceByteOffset += filterResultInDeviceByteSize;
+        }
+        ResultAggregator batchAggregator{};
+        batchAggregator.SetDocIdMapping(m_docIdMapping);
+        batchAggregator.SetDeviceId(m_deviceId);
+        return batchAggregator.AggrAndTopKDeviceBatch(filterResults, docScores, docAllByteSize, m_docLocationInDevice,
+                                                      m_topKs, deviceResults, sharedStream, sharedStreamSynced);
+    }
+    // The per-query tasks take streams of their own, so drain the shared one rather than race it.
+    if (sharedStream != nullptr) {
+        if (aclrtSynchronizeStream(sharedStream) != ACL_SUCCESS) {
+            LOG_ERROR("aclrtSynchronizeStream (shared filter stream) fail, m_deviceId=" << m_deviceId);
+            return false;
+        }
+        if (sharedStreamSynced != nullptr) {
+            *sharedStreamSynced = true;
+        }
+    }
+    std::shared_ptr<LogContext> logContext = std::make_shared<LogContext>();
+    auto asyncAggregator = m_executor->CreateExecuteContext(*logContext);
+    deviceResults.assign(m_topKs.size(), AggrDeviceResult{});
+    uint32_t index = 0;
+    for (uint32_t topK : m_topKs) {
+        if (m_queries[index] == nullptr) {
+            index++;
+            continue;  // deviceResults[index] stays empty; offsets advance only for real queries
+        }
+        uint8_t* filterResultInDeviceNew = filterResultInDevice + filterResultInDeviceByteOffset;
+        uint8_t* resultInDeviceNew = resultInDevice + resultInDeviceOffset;
+        auto devTask = [this, topK, filterResultInDeviceNew, resultInDeviceNew, docAllByteSize, &deviceResults,
+                        index]() -> ErrorCode::ResultType {
+            auto ret = aclrtSetDevice(m_deviceId);
+            if (ret != ACL_SUCCESS) {
+                LOG_ERROR("aclrtSetDevice fail, deviceId is:" << m_deviceId << " error code is:" << ret);
+                return ErrorCode::ResultType::FAIL;
+            }
+            ResultAggregator resultAggregator{};
+            resultAggregator.SetDocIdMapping(m_docIdMapping);
+            resultAggregator.SetTopK(topK);
+            resultAggregator.SetDeviceId(m_deviceId);
+            if (!resultAggregator.AggrAndTopKDevice(filterResultInDeviceNew, resultInDeviceNew, docAllByteSize,
+                                                    m_docLocationInDevice, deviceResults[index])) {
+                LOG_ERROR("AggrAndTopKDevice failed.");
+                CHECK_ACL_ONLY_LOG(aclrtResetDevice(m_deviceId));
+                return ErrorCode::ResultType::FAIL;
+            }
+            CHECK_ACL_ONLY_LOG(aclrtResetDevice(m_deviceId));
+            return ErrorCode::ResultType::SUCCESS;
+        };
+        asyncAggregator->AddTask(devTask);
+        resultInDeviceOffset += vectorResultOffsetOne;
+        filterResultInDeviceByteOffset += filterResultInDeviceByteSize;
+        index++;
+    }
+    bool ok = true;
+    asyncAggregator->Wait([&ok](ErrorCode::ResultType ret) {
+        if (ret != ErrorCode::ResultType::SUCCESS)
+            ok = false;
+    });
+    return ok;
+}
+
+bool FullRecallSearcher::RunAggregationExtract(std::vector<AggrDeviceResult>& deviceResults,
+                                               std::vector<std::shared_ptr<FullRecallResult>>& fullRecallResults,
+                                               bool isMultiShard) {
+    RecordGuard guard{"Aggregator extract"};
+    std::shared_ptr<LogContext> logContext = std::make_shared<LogContext>();
+    auto asyncExtract = m_executor->CreateExecuteContext(*logContext);
+    fullRecallResults.assign(m_topKs.size(), nullptr);
+    uint32_t index = 0;
+    for (uint32_t topK : m_topKs) {
+        auto result = std::make_shared<FullRecallResult>();
+        result->isMultiShard = isMultiShard;
+        fullRecallResults[index] = result;
+        if (m_queries[index] == nullptr || index >= deviceResults.size() || deviceResults[index].empty) {
+            index++;
+            continue;  // empty result (no candidates / no query), nothing staged to extract
+        }
+        // Capture by reference: AggrAndTopKExtract takes a non-const reference, and a by-value
+        // capture is const inside a non-mutable lambda.
+        auto exTask = [this, topK, index, &deviceResults, &fullRecallResults]() -> ErrorCode::ResultType {
+            auto ret = aclrtSetDevice(m_deviceId);  // aclrtFreeHost inside Extract needs a device context
+            if (ret != ACL_SUCCESS) {
+                LOG_ERROR("aclrtSetDevice fail, deviceId is:" << m_deviceId << " error code is:" << ret);
+                return ErrorCode::ResultType::FAIL;
+            }
+            ResultAggregator resultAggregator{};
+            resultAggregator.SetDocIdMapping(m_docIdMapping);
+            resultAggregator.SetTopK(topK);
+            resultAggregator.SetDeviceId(m_deviceId);
+            bool ok = resultAggregator.AggrAndTopKExtract(deviceResults[index], fullRecallResults[index]);
+            CHECK_ACL_ONLY_LOG(aclrtResetDevice(m_deviceId));
+            return ok ? ErrorCode::ResultType::SUCCESS : ErrorCode::ResultType::FAIL;
+        };
+        asyncExtract->AddTask(exTask);
+        index++;
+    }
+    bool ok = true;
+    asyncExtract->Wait([&ok](ErrorCode::ResultType ret) {
+        if (ret != ErrorCode::ResultType::SUCCESS)
+            ok = false;
+    });
+    return ok;
+}
+
+bool FullRecallSearcher::BatchSearchDevice(const std::string& vectorFieldName, bool isMultiShard,
+                                           std::vector<AggrDeviceResult>& deviceResults) {
+    RecordGuard guard{"BatchSearchDevice"};
+    (void)isMultiShard;  // isMultiShard is applied in Extract (result flag); Device stages raw top-K
+    if (m_dataTable == nullptr) {
+        LOG_ERROR("m_dataTable is nullptr, vectorFieldName" << vectorFieldName);
+        return false;
+    }
+    uint32_t docNumPerSegment = m_dataTable->GetDocNumPerSegment();
+    uint32_t segmentsNum = m_dataTable->GetSegmentNum();
+    GmBlock resultChunk{};
+    GmBlock filterResultChunk{};
+    auto ret = aclrtSetDevice(m_deviceId);
+    if (ret != ACL_SUCCESS) {
+        LOG_ERROR("aclrtSetDevice fail, deviceId is:" << m_deviceId << " error code is:" << ret);
+        return false;
+    }
+    uint32_t allResultsByteSize = segmentsNum * docNumPerSegment / 8 * m_queries.size();
+    GmMemoryManager::GetByDeviceId(m_deviceId)
+        ->AllocateBlock(GmPoolName::TEXT_FILTER_RESULT_POOL, allResultsByteSize, filterResultChunk);
+    uint8_t* filterResultInDevice = reinterpret_cast<uint8_t*>(filterResultChunk.data);
+    if (filterResultInDevice == nullptr) {
+        LOG_ERROR("GmMemoryManager allocate failed.");
+        CHECK_ACL_ONLY_LOG(aclrtResetDevice(m_deviceId));
+        return false;
+    }
+    // ParallelScoreFilterEnabled() is deliberately NOT replicated here: it spawns a thread per batch.
+    bool ok = true;
+    // Under NPUR_SHARE_FILTER_STREAM the filter batch outlives this branch, so its state and the
+    // posting tables its kernels read have to as well.
+    std::vector<FilterExpr> exprs;
+    FusedFilterBatch fused;
+    bool filterPending = false;  // filter kernels queued on fused.stream; FusedFinish owed after the aggregator
+    bool overlapPosting = false;
+    if (OverlapPostExprMode() != 0) {
+        const bool overlap = OverlapPostExprMode() == 1;
+        overlapPosting = overlap && OverlapPostingMode();
+        ScorerLaunch launch;
+        bool fusedPrepared = false;  // NPUR_EARLY_FILTER_PREP ran FusedPrepare inside the window
+        ok = m_vectorScorerMmad.BatchComputeLaunch(m_queryVectors, m_dimension, vectorFieldName, resultChunk, launch);
+        if (!ok) {
+            LOG_ERROR("m_vectorScorerMmad.BatchComputeLaunch failed. m_deviceId=" << m_deviceId);
+        } else if (overlap && !m_textFilter.BatchPrepareExpr(m_queries, exprs)) {
+            LOG_ERROR("m_textFilter.BatchPrepareExpr failed.");
+            ok = false;
+        } else if (overlapPosting && !m_textFilter.BatchPreparePostings(exprs, DeferConvSyncMode())) {
+            LOG_ERROR("m_textFilter.BatchPreparePostings failed.");
+            ok = false;
+        } else if (overlapPosting && (EarlyFilterPrepMode() || OverlapFilterKernelMode()) &&
+                   TextFilter::FusedPathApplies(&exprs) && ReadyForEarlyPrep(exprs)) {
+            if (!m_textFilter.FusedPrepare(m_queries, filterResultInDevice, exprs, fused)) {
+                LOG_ERROR("m_textFilter.FusedPrepare (in the scorer window) failed.");
+                ok = false;
+            } else {
+                fusedPrepared = true;
+                if (OverlapFilterKernelMode()) {
+                    if (!m_textFilter.DrainPreparedConversions(exprs)) {
+                        LOG_ERROR("m_textFilter.DrainPreparedConversions (before the early filter) failed.");
+                        ok = false;
+                    } else {
+                        m_textFilter.FusedLaunch(fused, /*timeKernel=*/false);
+                    }
+                }
+            }
+        }
+        // Sync even when the build failed: skipping it would free resultChunk out from under a
+        // kernel still writing it.
+        if (!m_vectorScorerMmad.BatchComputeSync(launch)) {
+            LOG_ERROR("m_vectorScorerMmad.BatchComputeSync failed.");
+            ok = false;
+        }
+        // Pending conversions must finish before any filter kernel reads their bitsets.
+        if (!m_textFilter.DrainPreparedConversions(exprs)) {
+            LOG_ERROR("m_textFilter.DrainPreparedConversions failed.");
+            ok = false;
+        }
+        if (ok && !overlap && !m_textFilter.BatchPrepareExpr(m_queries, exprs)) {
+            LOG_ERROR("m_textFilter.BatchPrepareExpr failed.");
+            ok = false;
+        }
+        const bool share =
+            ShareFilterStreamMode() && ResultAggregator::BatchAggregateMode() && TextFilter::FusedPathApplies(&exprs);
+        if (ok && (fusedPrepared || share)) {
+            if (!fusedPrepared && !m_textFilter.FusedPrepare(m_queries, filterResultInDevice, exprs, fused)) {
+                LOG_ERROR("m_textFilter.FusedPrepare failed.");
+                ok = false;
+            } else if (share) {
+                if (!fused.launched) {
+                    m_textFilter.FusedLaunch(fused, /*timeKernel=*/false);
+                }
+                filterPending = true;
+            } else {
+                RecordGuard guard{"TextFilter BatchCompute"};  // what is left of it after the window
+                if (!fused.launched) {
+                    m_textFilter.FusedLaunch(fused, /*timeKernel=*/true);
+                }
+                if (!m_textFilter.FusedFinish(fused, /*streamSynced=*/false)) {
+                    LOG_ERROR("textFilter.FusedFinish failed.");
+                    ok = false;
+                }
+            }
+        } else if (ok && !m_textFilter.BatchCompute(m_queries, filterResultInDevice, &exprs)) {
+            LOG_ERROR("textFilter.BatchCompute failed.");
+            ok = false;
+        }
+        // An unfinished in-window FusedPrepare still holds its blocks and the device reference.
+        if (fusedPrepared && !filterPending) {
+            m_textFilter.FusedFinish(fused, /*streamSynced=*/false);
+        }
+        // Not while the filter kernels that read them may still be running.
+        if (overlapPosting && !filterPending) {
+            m_textFilter.FreePreparedPostings(exprs);
+        }
+    } else {
+        ok = m_vectorScorerMmad.BatchCompute(m_queryVectors, m_dimension, vectorFieldName, resultChunk);
+        if (!ok)
+            LOG_ERROR("m_vectorScorerMmad.BatchCompute failed. m_deviceId=" << m_deviceId);
+        if (ok && !m_textFilter.BatchCompute(m_queries, filterResultInDevice)) {
+            LOG_ERROR("textFilter.BatchCompute failed.");
+            ok = false;
+        }
+    }
+    bool aggSynced = false;
+    if (ok) {
+        uint8_t* resultInDevice = reinterpret_cast<uint8_t*>(resultChunk.data);
+        ok = RunAggregationDevice(filterResultInDevice, resultInDevice, deviceResults,
+                                  filterPending ? fused.stream : nullptr, &aggSynced);
+    }
+    if (filterPending) {
+        // Either the aggregator's first sync waited for the filter kernels or FusedFinish does.
+        if (!m_textFilter.FusedFinish(fused, aggSynced)) {
+            LOG_ERROR("textFilter.FusedFinish (shared stream) failed.");
+            ok = false;
+        }
+        if (overlapPosting) {
+            m_textFilter.FreePreparedPostings(exprs);
+        }
+    }
+    GmMemoryManager::GetByDeviceId(m_deviceId)->FreeBlock(resultChunk);
+    GmMemoryManager::GetByDeviceId(m_deviceId)->FreeBlock(filterResultChunk);
+    CHECK_ACL_ONLY_LOG(aclrtResetDevice(m_deviceId));
+    return ok;
+}
+
+bool FullRecallSearcher::BatchSearchExtract(std::vector<AggrDeviceResult>& deviceResults,
+                                            std::vector<std::shared_ptr<FullRecallResult>>& fullRecallResults,
+                                            bool isMultiShard) {
+    RecordGuard guard{"BatchSearchExtract"};
+    return RunAggregationExtract(deviceResults, fullRecallResults, isMultiShard);
 }
 }  // namespace NpuRetrieval

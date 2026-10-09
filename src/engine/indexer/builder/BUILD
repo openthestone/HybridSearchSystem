@@ -7,10 +7,10 @@ package(
 cc_library(
     name = "idmapping_builder",
     srcs = [
-        "idmapping_builder.cpp",
+        "segment/idmapping_builder.cpp",
     ],
     hdrs = [
-        "idmapping_builder.h",
+        "segment/idmapping_builder.h",
     ],
     deps = [
         "//src/full_recall/indexer/schema:builder_schema",
@@ -27,10 +27,10 @@ cc_library(
 cc_library(
     name = "vector_builder",
     srcs = [
-        "vector_builder.cpp",
+        "segment/vector_builder.cpp",
     ],
     hdrs = [
-        "vector_builder.h",
+        "segment/vector_builder.h",
     ],
     deps = [
         "//src/full_recall/indexer/schema:builder_schema",
@@ -69,10 +69,10 @@ cc_library(
 cc_library(
     name = "inverted_builder",
     srcs = [
-        "inverted_builder.cpp",
+        "segment/inverted_builder.cpp",
     ],
     hdrs = [
-        "inverted_builder.h",
+        "segment/inverted_builder.h",
     ],
     deps = [
         "//src/full_recall/indexer/schema:builder_schema",
@@ -97,9 +97,11 @@ cc_library(
     name = "builder_impl",
     srcs = [
         "builder_impl.cpp",
+        "stream_input.cpp",
     ],
     hdrs = [
         "builder_impl.h",
+        "stream_input.h",
     ],
     deps = [
         "//src/full_recall/indexer/schema:builder_schema",

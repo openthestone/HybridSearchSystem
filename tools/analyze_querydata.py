@@ -36,7 +36,6 @@ from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-# ---- output buffer (hard-capped so the report stays < 50 KB) ----------------
 _LINES: List[str] = []
 _MAX_BYTES = 48_000
 
@@ -53,7 +52,6 @@ def _render() -> str:
     return out
 
 
-# ---- small stats helpers ----------------------------------------------------
 def stat_line(name: str, xs: List[float]) -> str:
     if not xs:
         return f"  {name}: (none)"
@@ -95,7 +93,6 @@ def top_counter(name: str, ctr: Counter, top: int) -> None:
         emit(f"    {cnt:>10d}  {str(key)[:80]}")
 
 
-# ---- tag_map.bin ------------------------------------------------------------
 def load_tag_map(path: Path) -> Dict[str, int]:
     data = path.read_bytes()
     for size_t in (8, 4):
@@ -141,10 +138,9 @@ def report_tag_map(tag_map: Dict[str, int], top: int) -> None:
     top_counter("sections (prefix before '#'), by #tags", sec, top)
 
 
-# ---- dataset.bin (HYDSET2): header + sampled density/tag-freq/vector ---------
-# Layout (mirrors inspect_hw.py): [40B header][doc_num * dim FP32 vectors]
-# [doc_num * stride u64 bitmaps], stride=ceil(tag_num/64). Tag t lives in
-# word t//64, bit t%64 (LSB-first). Vectors and bitmaps are SEPARATE regions.
+# dataset.bin (HYDSET2) layout: [40B header][doc_num * dim FP32 vectors]
+# [doc_num * stride u64 bitmaps], stride=ceil(tag_num/64). Tag t lives in word t//64, bit t%64
+# (LSB-first). Vectors and bitmaps are SEPARATE regions.
 def report_dataset(path: Path, top: int, sample: int, seed: int) -> Optional[Dict[str, int]]:
     fsize = path.stat().st_size
     with path.open("rb") as f:
@@ -191,8 +187,8 @@ def report_dataset(path: Path, top: int, sample: int, seed: int) -> Optional[Dic
                 hits = np.zeros(tag_num, dtype=np.int64)
                 for d in idxs:
                     vo = vec_off + d * dim * 4
-                    # slice mm into a bytes copy first so no numpy view keeps the
-                    # mmap "exported" (which would make mm.close() raise).
+                    # Copy the slice out of mm first: a numpy view would keep the mmap
+                    # "exported" and make mm.close() raise.
                     vec = np.frombuffer(mm[vo:vo + dim * 4], dtype="<f4")
                     ss = float(vec @ vec)
                     vnorms.append(math.sqrt(ss))
@@ -279,10 +275,6 @@ def report_dataset(path: Path, top: int, sample: int, seed: int) -> Optional[Dic
         emit(f"    tag {t:>6d}: {100 * fr(c):7.4f}%  ({c}/{n} sampled docs)")
     emit(f"  (+ {tag_num - seen} tags NEVER seen in the sample -> effectively absent)")
 
-    # index storage implication (why full-recall postings are huge / HBM-bound):
-    # a tag with global freq f has per-segment density ~f; when f >= threshold it
-    # is stored as a dense bitset (seg/8 bytes) and, being frequent, appears in
-    # essentially every segment. So common tags dominate posting storage.
     emit("")
     emit("-- index storage implication (doc_num_per_segment=65536, density_threshold=0.05) --")
     seg, thr = 65536, 0.05
@@ -309,7 +301,6 @@ def report_dataset(path: Path, top: int, sample: int, seed: int) -> Optional[Dic
     return {"doc_num": doc_num, "dim": dim, "tag_num": tag_num, "frac": frac}
 
 
-# ---- syntax_filter tree walk ------------------------------------------------
 class FilterStats:
     def __init__(self) -> None:
         self.node_types: Counter = Counter()
@@ -419,7 +410,6 @@ def eval_prob(node: Any, tag_map: Dict[str, int], frac: Dict[int, float]) -> flo
     return 1.0
 
 
-# ---- QueryData_*.txt --------------------------------------------------------
 def load_records(path: Path) -> List[Dict[str, Any]]:
     txt = path.read_text(encoding="utf-8", errors="replace").strip()
     if not txt:
@@ -493,8 +483,7 @@ def report_query(path: Path, tag_map: Optional[Dict[str, int]], top: int,
                     vnorms.append(math.sqrt(sum(x * x for x in fv)))
                     vminmax.append(min(fv))
                     vminmax.append(max(fv))
-        # syntax_filter lives INSIDE the vector node (mirrors convert_querydata.py /
-        # DataReader.h: `if syntax_filter_key in vector_node`), not at inner level.
+        # syntax_filter lives INSIDE the vector node, not at inner level (mirrors DataReader.h).
         sf = vnode.get("syntax_filter") if isinstance(vnode, dict) else None
         if sf is None:  # tolerate the alternate placement just in case
             sf = inner.get("syntax_filter")
@@ -572,7 +561,6 @@ def report_query(path: Path, tag_map: Optional[Dict[str, int]], top: int,
              f"referenced posting (full-recall cost is paid regardless of selectivity)")
 
 
-# ---- main -------------------------------------------------------------------
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)

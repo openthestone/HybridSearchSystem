@@ -1,9 +1,6 @@
 #!/usr/bin/env bash
-# Build + run the src/ host-side unit tests. Pure C++17 (no CANN, no protobuf),
-# so these run on the local dev box as well as the server.
-#
-#   src/tests/run_tests.sh
-#
+# Build + run the src/ host-side unit tests. Pure C++17 (no CANN, no protobuf), so these run on
+# the local dev box as well as the server.
 set -u
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo="$(cd "$here/../.." && pwd)"
@@ -30,13 +27,12 @@ run() {  # name  <extra compile args...>
     if "$bin"; then echo "[PASS] $name"; else echo "[FAIL] $name"; rc=1; fi
 }
 
-# 1) filter parser / evaluators — pure header
 run test_filter_expr "$here/test_filter_expr.cpp"
 
-# 2) fvecs query loader — pure header
 run test_query_io "$here/test_query_io.cpp"
 
-# 3) record envelope round-trip through engine/'s REAL ReadAndDoTask
+run test_dataset_hw "$here/test_dataset_hw.cpp" -I"$repo"
+
 run test_record_io \
     "$here/test_record_io.cpp" \
     "$repo/src/engine/indexer/file/file_reader.cpp" \

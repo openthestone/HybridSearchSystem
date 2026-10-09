@@ -1,4 +1,6 @@
 #include "data_table.h"
+#include <chrono>
+#include <cstdio>
 #include <filesystem>
 #include "google/protobuf/json/json.h"
 #include "src/utils/file_manager.h"
@@ -8,6 +10,15 @@
 #include "src/full_recall/core/number/trans_number.h"
 
 namespace NpuRetrieval {
+namespace {
+// Printed to stdout unconditionally, like main.cpp's [Load] lines: the profiled search sets
+// NPUR_LOG_LEVEL=ERROR, which would swallow a LOG_INFO.
+using LoadClock = std::chrono::steady_clock;
+inline long long MsSince(const LoadClock::time_point& t0) {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(LoadClock::now() - t0).count();
+}
+}  // namespace
+
 bool DataTable::ResolveDataDir(const std::string& dataDir, std::string& realDataDir) {
     if (!GetRealFilePath(dataDir, realDataDir)) {
         LOG_ERROR("GetRealFilePath check failed.");
@@ -32,7 +43,7 @@ bool DataTable::LoadData(const int32_t deviceId, const std::string& dataDir) {
         return false;
     }
     m_deviceId = deviceId;
-    // load the meta file
+    auto stageT0 = LoadClock::now();
     Building::Meta::IndexMeta indexMeta;
     if (!LoadIndexMeta(realDataDir, indexMeta)) {
         LOG_ERROR("LoadIndexMeta fail");
@@ -53,13 +64,17 @@ bool DataTable::LoadData(const int32_t deviceId, const std::string& dataDir) {
         LOG_ERROR("split_doc_num_zn is 0, please check");
         return false;
     }
-    // load the id mapping
+    const long long metaMs = MsSince(stageT0);
+
+    stageT0 = LoadClock::now();
     m_docIdMapping = std::make_unique<DocIdMapping>(m_version, m_segmentNum, m_docNum, m_docNumPerSegment, realDataDir);
     if (!m_docIdMapping->Load()) {
         LOG_ERROR("Load idmapping fail");
         return false;
     }
-    // load the vectors
+    const long long idMapMs = MsSince(stageT0);
+
+    stageT0 = LoadClock::now();
     m_vectorData = std::make_unique<VectorData>(m_version, m_segmentNum, realDataDir);
     for (auto& fieldName : indexMeta.schema().vector()) {
         if (!m_vectorData->AddFieldData(fieldName)) {
@@ -67,12 +82,13 @@ bool DataTable::LoadData(const int32_t deviceId, const std::string& dataDir) {
             return false;
         }
     }
-    // validate the vector data
     if (!m_vectorData->CheckData(m_splitDocNumZn)) {
         LOG_ERROR("check vector data fail");
         return false;
     }
-    // load the postings (inverted index)
+    const long long vectorMs = MsSince(stageT0);
+
+    stageT0 = LoadClock::now();
     m_postingData = std::make_unique<PostingData>(m_version, m_segmentNum, realDataDir, m_docNum, m_docNumPerSegment);
     for (auto& fieldName : indexMeta.schema().posting()) {
         if (!m_postingData->AddFieldData(fieldName)) {
@@ -82,10 +98,23 @@ bool DataTable::LoadData(const int32_t deviceId, const std::string& dataDir) {
         m_postingFields.insert(fieldName);
     }
 
+    const long long postingMs = MsSince(stageT0);
+
     // upload the identity doc-location array used by the aggregator kernel
+    stageT0 = LoadClock::now();
     if (!UploadDocLocation()) {
         return false;
     }
+    const long long docLocMs = MsSince(stageT0);
+    // One line per shard: the stage split, then the posting sub-split in brackets. "other" absorbs
+    // meta + docloc.
+    std::printf(
+        "[Load] device %d: idmap %.1fs | vector %.1fs (H2D %.2fs) | posting %.1fs "
+        "(dict %.1f, bulk %.1f, H2D %.1f) | other %.2fs\n",
+        deviceId, idMapMs / 1000.0, vectorMs / 1000.0, m_vectorData->LoadH2dMs() / 1000.0, postingMs / 1000.0,
+        m_postingData->LoadDictMs() / 1000.0, m_postingData->LoadBulkMs() / 1000.0, m_postingData->LoadH2dMs() / 1000.0,
+        (metaMs + docLocMs) / 1000.0);
+    std::fflush(stdout);
     LOG_INFO("data table load success. dataDir="
              << dataDir << ", deviceId=" << deviceId << ", m_segmentNum=" << m_segmentNum
              << ",m_segmentLength=" << m_segmentLength << ",m_segmentByteSize=" << m_segmentByteSize
@@ -132,7 +161,6 @@ bool DataTable::LoadIndexMeta(const std::string& dataDir, Building::Meta::IndexM
         LOG_ERROR("meta file not exist");
         return false;
     }
-    // parse the version
     std::vector<std::string> nameSplit;
     StringSplit(fileNameWithoutExt, '_', nameSplit);
     if (nameSplit.size() < 2 || !StringToNumber(nameSplit[1], m_version)) {  // nameSplit must have >= 2 parts
@@ -140,7 +168,6 @@ bool DataTable::LoadIndexMeta(const std::string& dataDir, Building::Meta::IndexM
         return false;
     }
 
-    // parse the file
     std::ifstream ifs(metaPath);
     if (!ifs.is_open()) {
         LOG_ERROR("read meta file fail");

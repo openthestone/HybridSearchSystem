@@ -18,7 +18,6 @@ constexpr uint32_t kMantissaShiftDelta = kF32ExpShift - kF16ExpShift;
 // the NPU processes docs in groups of 32
 constexpr uint64_t kNpuDocAlign = 32;
 
-// bit-cast a float32 to its raw uint32 representation and back
 uint32_t FloatToBits(float value) {
     uint32_t bits = 0;
     if (memcpy_s(&bits, sizeof(bits), &value, sizeof(value)) != EOK) {
@@ -39,7 +38,6 @@ float BitsToFloat(uint32_t bits) {
 uint16_t Float32ToFloat16(float f) {
     uint32_t bits = FloatToBits(f);
 
-    // split the float32 into its fields
     uint32_t sign = (bits >> kF32SignShift) & 0x1;
     uint32_t exponent = (bits >> kF32ExpShift) & 0xFF;
     uint32_t mantissa = bits & 0x007FFFFF;

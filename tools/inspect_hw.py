@@ -43,7 +43,6 @@ def main():
     sample = min(a.sample, N)
     idxs = random.sample(range(N), sample) if sample < N else list(range(N))
 
-    # ---- tag density ----
     tag_counts = []
     tag_freq = {}   # tag -> how many sampled docs have it (to spot degenerate tags)
     for d in idxs:
@@ -72,8 +71,7 @@ def main():
     for t, c in top:
         print(f"  tag {t}: {c/n*100:.1f}%")
 
-    # ---- tag-frequency structure (is it power-law: universal/common/rare?) ----
-    # buckets by per-tag frequency (fraction of sampled docs that have the tag).
+    # buckets by per-tag frequency (fraction of sampled docs that have the tag)
     b_univ = sum(1 for c in tag_freq.values() if c/n >= 0.90)
     b_common = sum(1 for c in tag_freq.values() if 0.05 <= c/n < 0.90)
     b_low = sum(1 for c in tag_freq.values() if 0.01 <= c/n < 0.05)
@@ -87,7 +85,6 @@ def main():
     print("(realistic power-law ~ a few universal + tens of thousands common + long rare tail;")
     print(" uniform Bernoulli(0.5) would put ALL ~{} tags near 50%)".format(tag_num))
 
-    # ---- optional: cross-check a filter file against the data ----
     if a.filter:
         import re
         exprs = [ln.strip() for ln in open(a.filter) if ln.strip()]
@@ -115,7 +112,6 @@ def main():
         for k in ("universal", "common", "low", "rare/absent", "out-of-range"):
             if comp.get(k): print(f"  {k}: {comp[k]}")
 
-    # ---- vector sanity ----
     norms, zeros = [], 0
     vmin, vmax = math.inf, -math.inf
     for d in idxs[:min(1000, len(idxs))]:

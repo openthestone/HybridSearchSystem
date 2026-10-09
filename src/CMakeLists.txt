@@ -60,10 +60,19 @@ endif()
 set(RUN_MODE "npu" CACHE STRING "run mode" FORCE)
 include(${ASCENDC_CMAKE_DIR}/ascendc.cmake)
 
+# REPO_ROOT is needed by the third-party search below, so it is resolved here rather than in the
+# paths section further down.
+get_filename_component(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/.." ABSOLUTE)
+
 # ---- third-party host deps -------------------------------------------------
 # Match the original project: third-party packages on the server are installed
 # under /usr/local, but some CMake defaults on the Ascend host do not search it.
 list(APPEND CMAKE_PREFIX_PATH "/usr/local")
+# A self-contained drop: unpack gflags/protobuf/absl under <repo>/third_party and they are found
+# with no arguments at all. The runtime side already works -- third_party/lib64 and third_party/lib
+# are in NPUR_HOST_RPATH_DIRS below and in run.sh's LD_LIBRARY_PATH -- so this line is what makes
+# find_package() agree with it. Costs nothing when the directory does not exist.
+list(APPEND CMAKE_PREFIX_PATH "${REPO_ROOT}/third_party")
 
 find_package(Threads REQUIRED)
 find_package(gflags REQUIRED)
@@ -101,7 +110,6 @@ endif()
 add_link_options(-Wl,--copy-dt-needed-entries)
 
 # ---- paths -----------------------------------------------------------------
-get_filename_component(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/.." ABSOLUTE)
 set(ENGINE_DIR   "${REPO_ROOT}/src/engine")
 set(STUBS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/platform")
 set(DEVICE_DIR "${ENGINE_DIR}/retrieval/device")
@@ -212,10 +220,10 @@ else()
     message(STATUS "Device: no prebuilt at ${_dev_lib}; building inline "
                    "(subsequent rebuilds will need a clean build — prebuild via src/device to avoid).")
     file(GLOB DEVICE_KERNELS
-        "${DEVICE_DIR}/kernel_bitmap_text_filter.cpp"
-        "${DEVICE_DIR}/kernel_aggregator.cpp"
-        "${DEVICE_DIR}/kernel_vector_mmad_op.cpp"
-        "${DEVICE_DIR}/kernel_topk.cpp"
+        "${DEVICE_DIR}/filter/kernel_bitmap_text_filter.cpp"
+        "${DEVICE_DIR}/aggregator/kernel_aggregator.cpp"
+        "${DEVICE_DIR}/scorer/kernel_vector_mmad_op.cpp"
+        "${DEVICE_DIR}/topk/kernel_topk.cpp"
     )
     ascendc_library(ascend_device SHARED ${DEVICE_KERNELS})
     ascendc_compile_definitions(ascend_device PRIVATE
@@ -292,9 +300,10 @@ add_library(npur_search STATIC
     "${ENGINE_DIR}/retrieval/query/query_node.cpp"
     "${ENGINE_DIR}/retrieval/query/query_node_imp.cpp"
     "${ENGINE_DIR}/retrieval/searcher/full_recall_searcher.cpp"
-    "${ENGINE_DIR}/retrieval/searcher/result_aggregator.cpp"
-    "${ENGINE_DIR}/retrieval/searcher/text_filter.cpp"
-    "${ENGINE_DIR}/retrieval/searcher/vector_scorer_mmad.cpp"
+    "${ENGINE_DIR}/retrieval/searcher/stage/text_filter.cpp"
+    "${ENGINE_DIR}/retrieval/searcher/stage/filter_stats.cpp"
+    "${ENGINE_DIR}/retrieval/searcher/stage/vector_scorer_mmad.cpp"
+    "${ENGINE_DIR}/retrieval/searcher/stage/result_aggregator.cpp"
     "${ENGINE_DIR}/retrieval/searcher/runtime/gm_memory_manager.cpp"
     "${ENGINE_DIR}/retrieval/searcher/runtime/stream_manager.cpp"
 )
@@ -368,10 +377,11 @@ if(NPUR_BUILD_BUILDER)
         "${ENGINE_DIR}/indexer/file/memory_data_manager.cpp"
         "${ENGINE_DIR}/indexer/schema/builder_schema.cpp"
         "${ENGINE_DIR}/indexer/builder/builder_impl.cpp"
-        "${ENGINE_DIR}/indexer/builder/idmapping_builder.cpp"
-        "${ENGINE_DIR}/indexer/builder/inverted_builder.cpp"
+        "${ENGINE_DIR}/indexer/builder/stream_input.cpp"
         "${ENGINE_DIR}/indexer/builder/meta_builder.cpp"
-        "${ENGINE_DIR}/indexer/builder/vector_builder.cpp"
+        "${ENGINE_DIR}/indexer/builder/segment/idmapping_builder.cpp"
+        "${ENGINE_DIR}/indexer/builder/segment/vector_builder.cpp"
+        "${ENGINE_DIR}/indexer/builder/segment/inverted_builder.cpp"
     )
     target_include_directories(npur_build PUBLIC ${COMMON_INCLUDES} "${RAPIDJSON_INCLUDE_DIR}")
     target_compile_definitions(npur_build PUBLIC ${COMMON_DEFINES})
@@ -388,7 +398,23 @@ endif()
 # 4. Search harness executable (Phase 6). Gated on the driver existing.
 # =============================================================================
 if(NPUR_BUILD_SEARCH AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/harness/main.cpp")
-    add_executable(fr_search "${CMAKE_CURRENT_SOURCE_DIR}/harness/main.cpp")
+    # main.cpp keeps the flags, the run schedules and main(). What it drives sits in three
+    # subdirectories: query/ (the run's inputs), recall/ (is the run correct) and host/ (CPU
+    # pinning, memory accounting). Headers are included by directory-relative name, so no extra -I.
+    add_executable(fr_search
+        "${CMAKE_CURRENT_SOURCE_DIR}/harness/main.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/harness/query/filter_setup.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/harness/recall/filter_report.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/harness/recall/recall_ref.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/harness/host/cpu_affinity.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/harness/host/mem_report.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/harness/run/report.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/harness/run/setup.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/harness/run/run_context.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/harness/run/schedule_serial.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/harness/run/schedule_round_robin.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/harness/run/schedule_groups.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/harness/run/schedule_pipeline.cpp")
     target_link_libraries(fr_search PRIVATE npur_search npur_common)
     npur_apply_executable_runtime_paths(fr_search)
     # When importing a prebuilt device lib, embed its dir as rpath so the executable
@@ -398,6 +424,25 @@ if(NPUR_BUILD_SEARCH AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/harness/main.cpp")
     endif()
 elseif(NPUR_BUILD_SEARCH)
     message(STATUS "src/harness/main.cpp not present yet; skipping fr_search (Phase 6).")
+endif()
+
+# ---- fr_npuload: standalone NPU load generator (simulated load fluctuation) ----
+# Links ascend_device for the MMad scorer kernel (the compute half of the load) but NOT
+# npur_search: it borrows one kernel, not the engine, so it cannot perturb the measured process
+# except through the device contention that is its entire purpose.
+if(NPUR_BUILD_SEARCH AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/harness/npu_load.cpp")
+    add_executable(fr_npuload "${CMAKE_CURRENT_SOURCE_DIR}/harness/npu_load.cpp")
+    target_include_directories(fr_npuload PRIVATE ${COMMON_INCLUDES} "${NPUR_DEVICE_INC_DIR}")
+    target_compile_definitions(fr_npuload PRIVATE ${COMMON_DEFINES})
+    target_link_libraries(fr_npuload PRIVATE ascend_device ascendcl gflags Threads::Threads)
+    if(NOT NPUR_DEVICE_PREBUILT)
+        add_dependencies(fr_npuload ascend_device)
+    endif()
+    npur_apply_host_link_dirs(fr_npuload)
+    npur_apply_executable_runtime_paths(fr_npuload)
+    if(NPUR_DEVICE_PREBUILT)
+        target_link_options(fr_npuload PRIVATE "-Wl,-rpath,${NPUR_DEVICE_BUILD}/lib")
+    endif()
 endif()
 
 # =============================================================================

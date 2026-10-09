@@ -50,14 +50,14 @@ endif()
 set(RUN_MODE "npu" CACHE STRING "run mode" FORCE)
 include(${ASCENDC_CMAKE_DIR}/ascendc.cmake)
 
-# ---- build the 4 kernels into libascend_device.so --------------------------
+# ---- build the 5 kernels into libascend_device.so --------------------------
 get_filename_component(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
 set(DEVICE_DIR "${REPO_ROOT}/src/engine/retrieval/device")
 file(GLOB DEVICE_KERNELS
-    "${DEVICE_DIR}/kernel_bitmap_text_filter.cpp"
-    "${DEVICE_DIR}/kernel_aggregator.cpp"
-    "${DEVICE_DIR}/kernel_vector_mmad_op.cpp"
-    "${DEVICE_DIR}/kernel_topk.cpp"
+    "${DEVICE_DIR}/filter/kernel_bitmap_text_filter.cpp"
+    "${DEVICE_DIR}/aggregator/kernel_aggregator.cpp"
+    "${DEVICE_DIR}/scorer/kernel_vector_mmad_op.cpp"
+    "${DEVICE_DIR}/topk/kernel_topk.cpp"
 )
 ascendc_library(ascend_device SHARED ${DEVICE_KERNELS})
 ascendc_compile_definitions(ascend_device PRIVATE

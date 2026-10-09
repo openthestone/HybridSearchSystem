@@ -44,8 +44,8 @@ SECTIONS = [("99072",5001),("99078",4146),("99036",4020),("99041",4020),("99009"
 TAG_NUM = sum(sz for _, sz in SECTIONS)  # 35672
 DIM = 64
 
-# tag-frequency bucket counts (sum == TAG_NUM). Frequent tags get the LOW ids,
-# which (since ids are assigned section-by-section) land in the big sections.
+# tag-frequency bucket counts (sum == TAG_NUM). Frequent tags get the LOW ids, which land in the
+# big sections.
 B_ALWAYS, B_UNIV, B_COMMON, B_LOW, B_RARE = 79, 28, 894, 2080, 15601
 B_ABSENT = TAG_NUM - (B_ALWAYS + B_UNIV + B_COMMON + B_LOW + B_RARE)  # 16990
 
@@ -74,9 +74,8 @@ def build_probs(rng):
     p[i:i+B_COMMON] = np.clip(rng.normal(0.24, 0.16, B_COMMON), 0.05, 0.90); i += B_COMMON
     p[i:i+B_LOW] = rng.uniform(0.01, 0.05, B_LOW); i += B_LOW
     p[i:i+B_RARE] = np.clip(rng.exponential(0.0016, B_RARE), 5e-5, 0.0099); i += B_RARE
-    # remaining B_ABSENT stay 0 (never seen)
-    # gently rescale the non-fixed part; base target is below 378 because the
-    # per-doc "rich" factor (write_dataset) inflates the realized mean back to ~378.
+    # Base target is below 378 because the per-doc "rich" factor in write_dataset inflates the
+    # realized mean back to ~378.
     target = 330.0
     fixed = p[:B_ALWAYS + B_UNIV].sum()
     rest = slice(B_ALWAYS + B_UNIV, B_ALWAYS + B_UNIV + B_COMMON + B_LOW + B_RARE)
@@ -102,7 +101,6 @@ def write_dataset(path, doc_num, p, rng, chunk, log):
     with open(path, "wb") as f:
         f.write(b"HYDSET2\0")
         f.write(struct.pack("<IIQIIII", 2, 0, doc_num, DIM, TAG_NUM, 0, 0))
-        # --- vectors region: L2 ~30, per-doc lognormal scale for the right skew ---
         done = 0
         while done < doc_num:
             n = min(chunk, doc_num - done)
@@ -112,7 +110,6 @@ def write_dataset(path, doc_num, p, rng, chunk, log):
             done += n
             if done % (chunk * 50) == 0 or done == doc_num:
                 log(f"  vectors {done}/{doc_num}")
-        # --- bitmaps region: per-doc Bernoulli, ~10% "rich" docs give the tag tail ---
         done = 0
         while done < doc_num:
             n = min(chunk, doc_num - done)

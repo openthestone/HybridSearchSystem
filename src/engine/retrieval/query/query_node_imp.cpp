@@ -2,13 +2,13 @@
 #include "src/utils/logger.h"
 
 namespace NpuRetrieval {
-// AND and OR nodes emit the same post-order layout and differ only in the op
-// code: recurse into the non-term children first (each pushes a sub-result onto
-// the filter stack), then append the direct term children as postings, and
-// finally emit [op, postingNum, stackNum].
+// AND and OR emit the same post-order layout and differ only in the op code: recurse into the
+// non-term children first (each pushes a sub-result onto the filter stack), then append the direct
+// term children as postings, then emit [op, postingNum, stackNum].
 static bool EmitAndOrOp(const std::vector<std::unique_ptr<QueryNode>>& children, FilterOpType opType,
                         const DataTable& dataTable, std::vector<uint32_t>& postExpr,
                         std::vector<std::vector<uint8_t>*>& postingTypes,
+                        std::vector<std::vector<uint16_t>*>& postingWeights,
                         std::vector<std::vector<uint8_t*>*>& postingDeviceAddrs, uint32_t& opNum) {
     uint32_t postingNum = 0;
     uint32_t stackNum = 0;
@@ -20,7 +20,8 @@ static bool EmitAndOrOp(const std::vector<std::unique_ptr<QueryNode>>& children,
         if (child->GetNodeType() == QueryNodeType::TermNode) {
             continue;
         }
-        if (child->GetPostOrderExpression(dataTable, postExpr, postingTypes, postingDeviceAddrs, opNum)) {
+        if (child->GetPostOrderExpression(dataTable, postExpr, postingTypes, postingWeights, postingDeviceAddrs,
+                                          opNum)) {
             ++stackNum;
         }
     }
@@ -33,7 +34,8 @@ static bool EmitAndOrOp(const std::vector<std::unique_ptr<QueryNode>>& children,
         if (child->GetNodeType() != QueryNodeType::TermNode) {
             continue;
         }
-        if (child->GetPostOrderExpression(dataTable, postExpr, postingTypes, postingDeviceAddrs, opNum)) {
+        if (child->GetPostOrderExpression(dataTable, postExpr, postingTypes, postingWeights, postingDeviceAddrs,
+                                          opNum)) {
             ++postingNum;
         }
     }
@@ -46,18 +48,23 @@ static bool EmitAndOrOp(const std::vector<std::unique_ptr<QueryNode>>& children,
 
 bool AndNode::GetPostOrderExpression(const NpuRetrieval::DataTable& dataTable, std::vector<uint32_t>& postExpr,
                                      std::vector<std::vector<uint8_t>*>& postingTypes,
+                                     std::vector<std::vector<uint16_t>*>& postingWeights,
                                      std::vector<std::vector<uint8_t*>*>& postingDeviceAddrs, uint32_t& opNum) const {
-    return EmitAndOrOp(m_children, FilterOpType::AND, dataTable, postExpr, postingTypes, postingDeviceAddrs, opNum);
+    return EmitAndOrOp(m_children, FilterOpType::AND, dataTable, postExpr, postingTypes, postingWeights,
+                       postingDeviceAddrs, opNum);
 }
 
 bool OrNode::GetPostOrderExpression(const NpuRetrieval::DataTable& dataTable, std::vector<uint32_t>& postExpr,
                                     std::vector<std::vector<uint8_t>*>& postingTypes,
+                                    std::vector<std::vector<uint16_t>*>& postingWeights,
                                     std::vector<std::vector<uint8_t*>*>& postingDeviceAddrs, uint32_t& opNum) const {
-    return EmitAndOrOp(m_children, FilterOpType::OR, dataTable, postExpr, postingTypes, postingDeviceAddrs, opNum);
+    return EmitAndOrOp(m_children, FilterOpType::OR, dataTable, postExpr, postingTypes, postingWeights,
+                       postingDeviceAddrs, opNum);
 }
 
 bool NotNode::GetPostOrderExpression(const NpuRetrieval::DataTable& dataTable, std::vector<uint32_t>& postExpr,
                                      std::vector<std::vector<uint8_t>*>& postingTypes,
+                                     std::vector<std::vector<uint16_t>*>& postingWeights,
                                      std::vector<std::vector<uint8_t*>*>& postingDeviceAddrs, uint32_t& opNum) const {
     if (m_children.size() != 1) {
         LOG_ERROR("invalid child node size of not node, size is " << m_children.size());
@@ -71,7 +78,7 @@ bool NotNode::GetPostOrderExpression(const NpuRetrieval::DataTable& dataTable, s
     uint32_t postingNum = 0;
     uint32_t stackNum = 0;
     QueryNodeType nodeType = child->GetNodeType();
-    if (!child->GetPostOrderExpression(dataTable, postExpr, postingTypes, postingDeviceAddrs, opNum)) {
+    if (!child->GetPostOrderExpression(dataTable, postExpr, postingTypes, postingWeights, postingDeviceAddrs, opNum)) {
         LOG_ERROR("get subnode post order epression failed");
         return false;
     }
@@ -108,20 +115,21 @@ bool TermNode::IsNodeValid(const std::unordered_set<std::string>& postingFields)
 
 bool TermNode::GetPostOrderExpression(const NpuRetrieval::DataTable& dataTable, std::vector<uint32_t>& postExpr,
                                       std::vector<std::vector<uint8_t>*>& postingTypes,
+                                      std::vector<std::vector<uint16_t>*>& postingWeights,
                                       std::vector<std::vector<uint8_t*>*>& postingDeviceAddrs, uint32_t& opNum) const {
     LOG_TRACE("current opnum:" << opNum << " postExpr size:" << postExpr.size());
-    return AppendPostings(dataTable, postingTypes, postingDeviceAddrs);
+    return AppendPostings(dataTable, postingTypes, postingWeights, postingDeviceAddrs);
 }
 
 bool TermNode::AppendPostings(const DataTable& dataTable, std::vector<std::vector<uint8_t>*>& postingTypes,
+                              std::vector<std::vector<uint16_t>*>& postingWeights,
                               std::vector<std::vector<uint8_t*>*>& postingDeviceAddrs) const {
     PostingFieldData* fieldData = nullptr;
     if (!dataTable.GetPostingFieldData(m_fieldName, fieldData)) {
         LOG_ERROR("get posting field data failed, field name:" << m_fieldName);
         return false;
     }
-    // AdjustNode has already removed invalid target fields, so fieldData should
-    // not be null here; if it is, fail the request.
+    // AdjustNode has already removed invalid target fields, so fieldData should not be null here.
     if (fieldData == nullptr) {
         LOG_ERROR("fieldData is null ");
         return false;
@@ -132,15 +140,16 @@ bool TermNode::AppendPostings(const DataTable& dataTable, std::vector<std::vecto
         LOG_DEBUG("m_token not found");
         return false;
     }
-    // posting type
     std::vector<uint8_t>* postingType = fieldData->GetPostingTypes(m_token);
     if (postingType == nullptr) {
         LOG_DEBUG("postingType is nullptr");
         return false;
     }
     postingTypes.emplace_back(postingType);
+    // Null keeps postingWeights the same length as postingTypes, which PrepareExpr checks and emit
+    // indexes in lockstep.
+    postingWeights.emplace_back(PostingWeightsWanted() ? fieldData->GetPostingWeights(m_token) : nullptr);
 
-    // posting device address
     std::vector<uint8_t*>* postingDeviceAddr = fieldData->GetPostingDeviceAddrs(m_token);
     if (postingDeviceAddr == nullptr) {
         LOG_DEBUG("postingDeviceAddr is nullptr");
@@ -170,11 +179,12 @@ bool TermsNode::IsNodeValid(const std::unordered_set<std::string>& postingFields
 
 bool TermsNode::GetPostOrderExpression(const NpuRetrieval::DataTable& dataTable, std::vector<uint32_t>& postExpr,
                                        std::vector<std::vector<uint8_t>*>& postingTypes,
+                                       std::vector<std::vector<uint16_t>*>& postingWeights,
                                        std::vector<std::vector<uint8_t*>*>& postingDeviceAddrs, uint32_t& opNum) const {
     uint32_t postingNum = 0;
     uint32_t stackNum = 0;
     size_t postingBase = postingDeviceAddrs.size();
-    if (!AppendPostings(dataTable, postingTypes, postingDeviceAddrs)) {
+    if (!AppendPostings(dataTable, postingTypes, postingWeights, postingDeviceAddrs)) {
         LOG_ERROR("append posting failed.");
         return false;
     }
@@ -191,6 +201,7 @@ bool TermsNode::GetPostOrderExpression(const NpuRetrieval::DataTable& dataTable,
 }
 
 bool TermsNode::AppendPostings(const DataTable& dataTable, std::vector<std::vector<uint8_t>*>& postingTypes,
+                               std::vector<std::vector<uint16_t>*>& postingWeights,
                                std::vector<std::vector<uint8_t*>*>& postingDeviceAddrs) const {
     PostingFieldData* fieldData = nullptr;
     if (!dataTable.GetPostingFieldData(m_fieldName, fieldData)) {
@@ -213,14 +224,13 @@ bool TermsNode::AppendPostings(const DataTable& dataTable, std::vector<std::vect
         if ((!tokenExist) && addedPosting) {
             continue;
         }
-        // posting type
         std::vector<uint8_t>* postingType = fieldData->GetPostingTypes(token);
         if (postingType == nullptr) {
             LOG_DEBUG("postingType is nullptr");
             continue;
         }
         postingTypes.emplace_back(postingType);
-        // posting device address
+        postingWeights.emplace_back(PostingWeightsWanted() ? fieldData->GetPostingWeights(token) : nullptr);
         std::vector<uint8_t*>* postingDeviceAddr = fieldData->GetPostingDeviceAddrs(token);
         if (postingDeviceAddr == nullptr) {
             LOG_DEBUG("postingDeviceAddr is nullptr");
@@ -234,12 +244,13 @@ bool TermsNode::AppendPostings(const DataTable& dataTable, std::vector<std::vect
 
 bool OrTermsNode::GetPostOrderExpression(const NpuRetrieval::DataTable& dataTable, std::vector<uint32_t>& postExpr,
                                          std::vector<std::vector<uint8_t>*>& postingTypes,
+                                         std::vector<std::vector<uint16_t>*>& postingWeights,
                                          std::vector<std::vector<uint8_t*>*>& postingDeviceAddrs,
                                          uint32_t& opNum) const {
     uint32_t postingNum = 0;
     uint32_t stackNum = 0;
     size_t postingBase = postingDeviceAddrs.size();
-    if (!AppendPostings(dataTable, postingTypes, postingDeviceAddrs)) {
+    if (!AppendPostings(dataTable, postingTypes, postingWeights, postingDeviceAddrs)) {
         LOG_ERROR("append posting failed.");
         return false;
     }
@@ -256,6 +267,7 @@ bool OrTermsNode::GetPostOrderExpression(const NpuRetrieval::DataTable& dataTabl
 }
 
 bool OrTermsNode::AppendPostings(const DataTable& dataTable, std::vector<std::vector<uint8_t>*>& postingTypes,
+                                 std::vector<std::vector<uint16_t>*>& postingWeights,
                                  std::vector<std::vector<uint8_t*>*>& postingDeviceAddrs) const {
     for (const std::unique_ptr<QueryNode>& child : m_children) {
         if (child == nullptr) {
@@ -272,7 +284,7 @@ bool OrTermsNode::AppendPostings(const DataTable& dataTable, std::vector<std::ve
             LOG_WARN("or_terms only support term/terms, skiped, unsupport type: " << static_cast<uint32_t>(nodeType));
             continue;
         }
-        if (!leaf->AppendPostings(dataTable, postingTypes, postingDeviceAddrs)) {
+        if (!leaf->AppendPostings(dataTable, postingTypes, postingWeights, postingDeviceAddrs)) {
             LOG_WARN("Append Postings failed");
             continue;
         }
@@ -282,6 +294,7 @@ bool OrTermsNode::AppendPostings(const DataTable& dataTable, std::vector<std::ve
 
 bool ConjunctionNode::GetPostOrderExpression(const NpuRetrieval::DataTable& dataTable, std::vector<uint32_t>& postExpr,
                                              std::vector<std::vector<uint8_t>*>& postingTypes,
+                                             std::vector<std::vector<uint16_t>*>& postingWeights,
                                              std::vector<std::vector<uint8_t*>*>& postingDeviceAddrs,
                                              uint32_t& opNum) const {
     std::vector<uint32_t> groupSizes;
@@ -305,7 +318,7 @@ bool ConjunctionNode::GetPostOrderExpression(const NpuRetrieval::DataTable& data
             continue;
         }
         size_t postingBase = postingDeviceAddrs.size();
-        if (!leaf->AppendPostings(dataTable, postingTypes, postingDeviceAddrs)) {
+        if (!leaf->AppendPostings(dataTable, postingTypes, postingWeights, postingDeviceAddrs)) {
             LOG_WARN("Append Postings failed");
             continue;
         }

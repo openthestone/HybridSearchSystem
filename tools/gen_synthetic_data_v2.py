@@ -50,9 +50,7 @@ UNIVERSAL_TAGS = ["99073#delivery_all","10011#140737489362418","10011#delivery_a
 # sections whose value lists are mirrored (referenced with identical values).
 PAIRS = {"3000": "3001", "99046": "99047", "99051": "99052"}
 
-# small "anchor" sections whose value-0 tag is forced ALWAYS-ON in the dataset and
-# referenced by EVERY query (resolves) — reproduces the real freq~1.0 spike among
-# referenced tags (so filters aren't all-rare -> match fraction > 0, ~15% common).
+# small "anchor" sections whose value-0 tag is forced ALWAYS-ON and referenced by EVERY query.
 ANCHOR_SECTIONS = ["304", "305", "307", "99017", "99018", "99000", "99001",
                    "1006", "2001", "2003", "10004", "10011", "99012", "99043", "99005"]
 
@@ -62,7 +60,6 @@ B_ALWAYS, B_UNIV, B_COMMON, B_LOW, B_RARE = 79, 28, 894, 2080, 15601
 B_ABSENT = TAG_NUM - (B_ALWAYS + B_UNIV + B_COMMON + B_LOW + B_RARE)
 
 
-# ---- tag_map + per-tag frequency (unchanged model from v1) ------------------
 def build_tag_map(sections):
     id2term, sec_span, idx = [], {}, 0
     for name, size in sections:
@@ -74,13 +71,12 @@ def build_tag_map(sections):
 
 
 def build_probs(rng, sec_span):
-    # Tag frequencies must line up with how queries reference sections (see
-    # SELECTIVE_SECTIONS / CARRIER_SECTIONS). Getting this wrong is what made the
-    # first v2 match nothing (present tags landed in unreferenced sections).
+    # Tag frequencies must line up with how queries reference sections: getting this wrong made
+    # the first v2 match nothing.
     p = np.zeros(TAG_NUM, dtype=np.float64)
 
-    # SELECTIVE sections: values are RARE (freq F_SEL); a small fraction are made
-    # 'common' so the OR-union's tail reaches the real ~19% max match fraction.
+    # SELECTIVE sections: RARE values, a small fraction made common so the OR-union's tail reaches
+    # the real ~19% max match fraction.
     for s in SELECTIVE_SECTIONS:
         start, size = sec_span.get(s, (None, 0))
         if start is None:
@@ -89,8 +85,7 @@ def build_probs(rng, sec_span):
         n_com = int(size * SEL_COMMON_FRAC)
         if n_com > 0:
             idx = rng.choice(size, n_com, replace=False)
-            # cap at 0.12: a query occasionally ORs several common values, and a
-            # higher cap lets them saturate (>=90% match), which real never does.
+            # cap at 0.12: a higher cap lets several ORed common values saturate (>=90% match).
             seg[idx] = np.clip(rng.exponential(SEL_COMMON_FREQ, n_com), 0.01, 0.12)
         p[start:start + size] = seg
 
@@ -100,10 +95,7 @@ def build_probs(rng, sec_span):
         if start is not None and size > 0:
             p[start] = 1.0
 
-    # Density pool: the always/univ/common/low/rare buckets (v1 model) are placed
-    # on NON-selective tags (carrier values>0 + unreferenced sections). They carry
-    # the dataset density (~1%) WITHOUT joining the selective OR-union, so they
-    # don't inflate the match fraction. Unreferenced/leftover tags stay absent.
+    # Density pool on NON-selective tags, so it cannot inflate the match fraction.
     nonsel = []
     sel_set = set(SELECTIVE_SECTIONS)
     for name, size in SECTIONS:
@@ -202,13 +194,8 @@ def write_dataset(path, doc_num, p, seed, chunk, jobs, log):
             log(f"  dataset: {done}/{doc_num} docs done")
 
 
-# ---- section roles (from real query-analysis.md) ---------------------------
-# The real filters match ~5% of docs (never empty, never >=90%). That selectivity
-# comes from ORing ~200 RARE values of the heavily-referenced SELECTIVE sections
-# (mostly 3000/3001) into one union; CARRIER sections contribute an always-on
-# value (real: 304#0, 305#1 at freq 1) as PERMISSIVE clauses that don't restrict
-# the top-level AND. Splitting the selective values across AND-joined nodes (the
-# old bug) destroyed the union -> 93% empty; keeping them OR'd reproduces ~5%.
+# Selectivity comes from ORing ~200 RARE SELECTIVE values into ONE union; CARRIER sections add an
+# always-on value as PERMISSIVE clauses. AND-splitting the selective values destroys it -> 93% empty.
 SELECTIVE_SECTIONS = ["3000", "3001", "99002", "99046", "99047", "99051", "99052", "10015", "99036"]
 CARRIER_SECTIONS = ["304", "305", "307", "99017", "99018", "99000", "99001", "1006", "2000", "10000",
                     "10004", "99012", "2001", "2003", "99043", "10011", "10012", "99073", "99005", "99011"]
@@ -231,9 +218,7 @@ def _sel_value(rng, size):
 
 
 def build_filter_v2(rng, sec_span):
-    # Selectivity = ONE OR-union of ~200 rare SELECTIVE values (mostly 3000/3001).
-    # Top-level AND also holds permissive CARRIER clauses (P~1) + one mild NOT.
-    # depth 2; node mix ~ terms 7-8 / or 2-3 / and 1 / not 1 (like the real data).
+    # Top-level AND: the OR-union, permissive CARRIER clauses (P~1), and one mild NOT.
     total = int(np.clip(rng.normal(780, 290), 67, 2046))
     sel_frac = rng.uniform(0.5, 0.9)
     selw = np.array([SECTION_REF_WEIGHTS.get(s, 1.0) for s in SELECTIVE_SECTIONS], dtype=np.float64)
@@ -248,8 +233,7 @@ def build_filter_v2(rng, sec_span):
         if s in PAIRS:                              # mirror value onto the paired section
             bysec.setdefault(PAIRS[s], []).append(v)
 
-    # selective OR-cluster: split sections into <=3 OR-joined terms nodes, all
-    # wrapped in ONE {"or":...} so their matches UNION (never AND-split -> empty).
+    # All wrapped in ONE {"or":...} so their matches UNION -- never AND-split, which gives empty.
     items = list(bysec.items())
     rng.shuffle(items)
     n_nodes = min(3, len(items)) or 1
@@ -262,11 +246,9 @@ def build_filter_v2(rng, sec_span):
 
     sel_nodes = [or_terms(items[gi::n_nodes]) for gi in range(n_nodes)]
 
-    # permissive carrier clauses: value "0" resolves to an always-on tag -> P~1.
     perm = [{"terms": {"join_type": "or", "inner_section_join_type": "or", s: ["0"]}}
             for s in rng.choice(CARRIER_SECTIONS, size=min(4, len(CARRIER_SECTIONS)), replace=False)]
 
-    # mild NOT: a handful of rare SELECTIVE values -> excludes ~1% of docs.
     ns = str(rng.choice(SELECTIVE_SECTIONS))
     _, nsz = sec_span.get(ns, (0, 1))
     nv = [x for x in (_sel_value(rng, nsz) for _ in range(20)) if x is not None]

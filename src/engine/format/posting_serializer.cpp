@@ -1,5 +1,7 @@
 #include "posting_serializer.h"
+#include <cstdlib>
 #include "src/utils/logger.h"
+#include "src/utils/env_switch.h"
 
 namespace NpuRetrieval {
 namespace {
@@ -23,8 +25,7 @@ bool PackHeadWord(uint32_t layoutCode, uint32_t hitCount, uint32_t& headWord) {
     return true;
 }
 
-// Appends the two 4-byte header words that begin every posting layout: the
-// packed head word (layout + hit count) followed by the payload length.
+// The two 4-byte header words that begin every posting layout: head word, then payload length.
 bool AppendHeader(std::string& buffer, PostingLayout layout, uint32_t hitCount, uint32_t payloadLength) {
     uint32_t headWord = 0;
     if (!PackHeadWord(static_cast<uint32_t>(layout), hitCount, headWord)) {
@@ -36,13 +37,11 @@ bool AppendHeader(std::string& buffer, PostingLayout layout, uint32_t hitCount, 
     return true;
 }
 
-// Number of 16-doc bitmap units needed to cover docNum positions (the final
-// unit is zero-padded when docNum is not a multiple of 16).
+// Number of 16-doc bitmap units covering docNum positions (the final unit is zero-padded).
 uint32_t BitmapUnitCount(uint32_t docNum) {
     return (docNum + kDocsPerUnit - 1) / kDocsPerUnit;
 }
 
-// Builds the dense 16-doc bitmap unit covering doc positions [unitIndex*16, +16).
 // Bit i is set when the doc at that position is a hit; low bits map to low doc ids.
 uint16_t PackBitmapUnit(const std::unordered_set<uint32_t>& docIds, uint32_t unitIndex) {
     uint16_t mask = 0;
@@ -54,6 +53,13 @@ uint16_t PackBitmapUnit(const std::unordered_set<uint32_t>& docIds, uint32_t uni
     }
     return mask;
 }
+// NPUR_SPARSE_PACKED=1 makes sparse bitmap postings come out packed. Write side only -- every
+// reader handles both layouts off the head word's tag -- so the arms are two indexes, not two
+// binaries, and an index built without it stays readable.
+bool SparsePackedEnabled() {
+    static const bool on = npur_env::On("NPUR_SPARSE_PACKED");
+    return on;
+}
 }  // namespace
 
 PostingLayout PostingSerializer::SelectLayout(bool isMatrixType, uint32_t targetDocNum, uint32_t docNum,
@@ -64,7 +70,10 @@ PostingLayout PostingSerializer::SelectLayout(bool isMatrixType, uint32_t target
     }
     float density = targetDocNum * 1.0 / docNum;
     if (density < densityThreshold) {
-        return isMatrixType ? PostingLayout::SPARSE_IDLIST : PostingLayout::SPARSE_BITMAP;
+        if (isMatrixType) {
+            return PostingLayout::SPARSE_IDLIST;
+        }
+        return SparsePackedEnabled() ? PostingLayout::SPARSE_PACKED : PostingLayout::SPARSE_BITMAP;
     }
     return isMatrixType ? PostingLayout::DENSE_BYTEMAP : PostingLayout::DENSE_BITMAP;
 }
@@ -79,6 +88,8 @@ bool PostingSerializer::Serialize(const std::unordered_set<uint32_t>& docIds, ui
             return WriteDenseBitmap(docIds, docNum, buffer);
         case PostingLayout::SPARSE_BITMAP:
             return WriteSparseBitmap(docIds, docNum, buffer);
+        case PostingLayout::SPARSE_PACKED:
+            return WriteSparsePacked(docIds, docNum, buffer);
         case PostingLayout::DENSE_BYTEMAP:
             return WriteDenseByteMap(docIds, docNum, buffer);
         case PostingLayout::SPARSE_IDLIST:
@@ -130,9 +141,8 @@ bool PostingSerializer::WriteSparseBitmap(const std::unordered_set<uint32_t>& do
                                           std::string& buffer) {
     LOG_DEBUG("WriteSparseBitmap start");
     uint32_t hitCount = docIds.size();
-    // Keep only the bitmap units that have at least one hit. The payload stores
-    // their byte offsets first, then their masks. Each offset is the unit's byte
-    // position (unitIndex * sizeof(uint16)) within the equivalent dense bitmap.
+    // Keep only the units with at least one hit: byte offsets first, then masks. Each offset is
+    // unitIndex * sizeof(uint16) within the equivalent dense bitmap.
     std::string masks;
     std::string offsets;
     uint32_t unitCount = BitmapUnitCount(docNum);
@@ -150,6 +160,34 @@ bool PostingSerializer::WriteSparseBitmap(const std::unordered_set<uint32_t>& do
     }
     buffer.append(offsets.data(), offsets.length());
     buffer.append(masks.data(), masks.length());
+    return true;
+}
+
+bool PostingSerializer::WriteSparsePacked(const std::unordered_set<uint32_t>& docIds, uint32_t docNum,
+                                          std::string& buffer) {
+    LOG_DEBUG("WriteSparsePacked start");
+    uint32_t hitCount = docIds.size();
+    // One uint32 per non-zero unit: [unitIndex:16][mask:16]. A segment holds at most
+    // docNumPerSegment/16 units -- 8192 at 131072 docs -- so 16 bits is ample. Ascending order,
+    // exactly as in WriteSparseBitmap.
+    std::string payload;
+    uint32_t unitCount = BitmapUnitCount(docNum);
+    for (uint32_t unit = 0; unit < unitCount; unit++) {
+        uint16_t mask = PackBitmapUnit(docIds, unit);
+        if (mask != 0) {
+            if (unit > 0xFFFF) {
+                LOG_ERROR("unit index " << unit << " does not fit the packed layout, needs <= 65535");
+                return false;
+            }
+            uint32_t word = (unit << 16) | mask;
+            payload.append(reinterpret_cast<const char*>(&word), sizeof(word));
+        }
+    }
+    uint32_t payloadLength = payload.length();
+    if (!AppendHeader(buffer, PostingLayout::SPARSE_PACKED, hitCount, payloadLength)) {
+        return false;
+    }
+    buffer.append(payload.data(), payload.length());
     return true;
 }
 

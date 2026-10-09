@@ -1,4 +1,6 @@
 #include "posting_data.h"
+#include <chrono>
+#include <cstdio>
 #include <filesystem>
 #include "src/utils/file_manager.h"
 #include "src/utils/logger.h"
@@ -41,6 +43,8 @@ bool PostingData::AddFieldData(const std::string& fieldName) {
         return false;
     }
     auto fieldData = std::make_unique<PostingFieldData>(m_segmentNum, m_docNum, m_docNumPerSegment, fieldName);
+    // Same split as the vector path, for the same reason.
+    auto readT0 = std::chrono::steady_clock::now();
     for (uint32_t i = 0; i < m_segmentNum; i++) {
         std::string filePath;
         if (!ResolveSegmentPath(fieldDir, fieldName, i, filePath)) {
@@ -56,10 +60,20 @@ bool PostingData::AddFieldData(const std::string& fieldName) {
             return false;
         }
     }
+    const long long readMs =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - readT0).count();
+    auto upT0 = std::chrono::steady_clock::now();
     if (!fieldData->FinishAdd()) {
         LOG_ERROR("posting data finish add failed, fieldName:" << fieldName);
         return false;
     }
+    const long long uploadMs =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - upT0).count();
+    m_loadReadMs += readMs;
+    m_loadDictMs += fieldData->DictUs() / 1000;
+    m_loadBulkMs += fieldData->BulkUs() / 1000;
+    m_loadH2dMs += uploadMs;
+    m_loadTokens += fieldData->TokenTotal();
     m_fields[fieldName] = std::move(fieldData);
     return true;
 }

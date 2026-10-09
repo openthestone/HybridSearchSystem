@@ -21,7 +21,17 @@ class VectorData {
 
     bool CheckData(uint32_t splitDocNumZn) const;
 
+    // Load-time attribution for DataTable's one-line [Load] summary, summed over fields.
+    long long LoadReadMs() const {
+        return m_loadReadMs;
+    }
+    long long LoadH2dMs() const {
+        return m_loadH2dMs;
+    }
+
    private:
+    long long m_loadReadMs{0};
+    long long m_loadH2dMs{0};
     bool ResolveFieldDir(const std::string& fieldName, std::string& realInputDir);
     bool ResolveSegmentPath(const std::string& inputDir, const std::string& fieldName, uint32_t segmentId,
                             std::string& filePath);

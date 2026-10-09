@@ -23,6 +23,15 @@ class DocIdMapping {
 
     bool GetGDocId(uint32_t lDocId, uint64_t& gDocid) const;
 
+    // The global-id array itself, for a caller that knows its lookups in advance and wants to
+    // prefetch them. Reads still go through GetGDocId, which is the bounds-checked accessor.
+    const uint64_t* GDocIdData() const {
+        return m_gDocIds.data();
+    }
+    size_t GDocIdCount() const {
+        return m_gDocIds.size();
+    }
+
     std::string GetSDocId(uint32_t lDocId) const;
 
     bool GetLDocId(uint64_t gDocId, uint32_t& lDocid) const;

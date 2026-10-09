@@ -21,7 +21,29 @@ class PostingData {
 
     bool GetFieldData(const std::string& fieldName, PostingFieldData*& fieldData) const;
 
+    // Load-time attribution for DataTable's one-line [Load] summary, summed over fields.
+    long long LoadReadMs() const {
+        return m_loadReadMs;
+    }
+    long long LoadDictMs() const {
+        return m_loadDictMs;
+    }
+    long long LoadBulkMs() const {
+        return m_loadBulkMs;
+    }
+    long long LoadH2dMs() const {
+        return m_loadH2dMs;
+    }
+    uint64_t LoadTokens() const {
+        return m_loadTokens;
+    }
+
    private:
+    long long m_loadReadMs{0};
+    long long m_loadDictMs{0};
+    long long m_loadBulkMs{0};
+    long long m_loadH2dMs{0};
+    uint64_t m_loadTokens{0};
     bool ResolveFieldDir(const std::string& fieldName, std::string& realInputDir);
     bool ResolveSegmentPath(const std::string& inputDir, const std::string& fieldName, uint32_t segmentId,
                             std::string& filePath);

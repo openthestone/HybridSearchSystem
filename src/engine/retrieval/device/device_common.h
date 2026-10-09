@@ -14,8 +14,10 @@ enum FilterOpType : uint32_t {
 
 const uint8_t BUFFER_NUM = 2;  // number of buffer blocks to allocate
 const uint32_t HEADER_BYTE_SIZE = 8;
+
 const uint32_t DUMP_DEFAULT_LENGTH = 64;
-constexpr uint32_t BLOCK_SIZE = 32;
+// BLOCK_SIZE lives in device_common_external.h: the host sizes a posting region's tail pad
+// against the same number, and this header is device-only.
 const uint16_t MAX_UINT16_VALUE = 65535;
 
 const uint32_t FILTER_AND_PARM_NUM = 2;
@@ -60,19 +62,14 @@ __aicore__ inline void DataCopyPadCustom_UB2GM(const AscendC::GlobalTensor<typeT
     }
 }
 
-// log-level print switches
 #define DEBUG_LOG_ENABLE false
 #define ERROR_LOG_ENABLE false
 #define DUMP_TENSOR_ENABLE false
 
-// The extra macro nesting here is to fully disable log printing. By design, as long
-// as an AscendC::printf call exists in the code, the kernel still prints kernel info
-// when it runs through the function containing that AscendC::printf -- even if the
-// surrounding condition makes the printf itself unreachable -- e.g.:
-// opType=PostingBitListToSet, DumpHead: AIC-0, CoreType=MIX, block dim=8, total_block_num=8, block_remain_len=1048456,
-// block_initial_space=1048576, rsv=0, magic=5aa5bccd
-// CANN Version: 8.0.0, TimeStamp: 20241231000821303
-// So when logging is disabled we use macros to remove the AscendC::printf calls entirely.
+// The extra macro nesting fully disables log printing. As long as an AscendC::printf call exists
+// in the code, the kernel prints its DumpHead info whenever it runs through the containing
+// function -- even if the surrounding condition makes the printf itself unreachable. So when
+// logging is off the macros remove the AscendC::printf calls entirely.
 #if DEBUG_LOG_ENABLE == true
 #define DEBUG_LOG(fmt, args...) AscendC::printf(fmt, ##args)
 #else

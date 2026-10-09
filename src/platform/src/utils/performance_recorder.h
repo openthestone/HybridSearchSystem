@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include "src/utils/env_switch.h"
 
 namespace NpuRetrieval {
 
@@ -21,7 +22,7 @@ class RecordGuard {
     explicit RecordGuard(const std::string& tag) : m_tag(tag), m_start(std::chrono::steady_clock::now()) {}
 
     ~RecordGuard() {
-        static const bool enabled = (std::getenv("NPUR_PERF") != nullptr);
+        static const bool enabled = npur_env::Present("NPUR_PERF");
         if (!enabled) {
             return;
         }
@@ -29,7 +30,7 @@ class RecordGuard {
             std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - m_start).count();
         // Print straight to stderr (not the logger) so per-stage timings show
         // regardless of NPUR_LOG_LEVEL. Gate: NPUR_PERF set.
-        std::fprintf(stderr, "[PERF] %-44s %8lld us\n", m_tag.c_str(), static_cast<long long>(us));
+        std::fprintf(stderr, "[Perf] %-44s %8lld us\n", m_tag.c_str(), static_cast<long long>(us));
     }
 
     RecordGuard(const RecordGuard&) = delete;

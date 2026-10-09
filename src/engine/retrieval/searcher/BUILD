@@ -8,17 +8,19 @@ cc_library(
     name = "searcher",
     srcs = [
         "full_recall_searcher.cpp",
-        "result_aggregator.cpp",
-        "text_filter.cpp",
-        "vector_scorer_mmad.cpp",
+        "stage/result_aggregator.cpp",
+        "stage/text_filter.cpp",
+        "stage/filter_stats.cpp",
+        "stage/vector_scorer_mmad.cpp",
         "runtime/gm_memory_manager.cpp",
         "runtime/stream_manager.cpp"
     ],
     hdrs = [
         "full_recall_searcher.h",
-        "result_aggregator.h",
-        "text_filter.h",
-        "vector_scorer_mmad.h",
+        "stage/result_aggregator.h",
+        "stage/text_filter.h",
+        "stage/filter_stats.h",
+        "stage/vector_scorer_mmad.h",
         "runtime/gm_memory_pool.h",
         "runtime/gm_memory_manager.h",
         "runtime/stream_manager.h"

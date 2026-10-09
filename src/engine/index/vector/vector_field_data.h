@@ -19,15 +19,10 @@ class VectorFieldData {
         }
     }
 
-    /*
-     * Called by the caller once per segment, in order, to load one segment's data.
-     * size: the file size.
-     */
+    // Called once per segment, in order. size: the file size.
     bool AddSegment(std::ifstream& inputStream, uint64_t size);
 
-    /*
-     * Copy the accumulated data to the device.
-     */
+    // Copy the accumulated data to the device.
     bool FinishAdd();
 
     uint32_t GetDimension() const {
