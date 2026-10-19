@@ -7,6 +7,19 @@
 #   ./setup.sh FORCE=1         覆盖已有索引
 #   SHARDS=4 ./setup.sh        改分片数
 #
+ln -sf $ROOT/third_party/ $ROOT/cards/third_party
+ln -sf $ROOT/third_party/ $ROOT/index/third_party
+ln -sf $ROOT/third_party/ $ROOT/load/third_party
+ln -sf $ROOT/logs/ $ROOT/cards/logs
+ln -sf $ROOT/logs/ $ROOT/index/logs
+ln -sf $ROOT/logs/ $ROOT/load/logs
+ln -sf $ROOT/third_party/lib/ $ROOT/third_party/lib64
+ln -sf $ROOT/third_party/lib/libprotobuf.so.3.21.12.0 $ROOT/third_party/lib/libprotobuf.so
+ln -sf $ROOT/third_party/lib/libprotobuf-lite.so.3.21.12.0 $ROOT/third_party/lib/libprotobuf-lite.so
+ln -sf $ROOT/third_party/lib/libprotoc.so.3.21.12.0 $ROOT/third_party/lib/libprotoc.so
+ln -sf $ROOT/third_party/lib/libgflags.so.2.2.2 $ROOT/third_party/lib/libgflags.so
+ln -sf $ROOT/third_party/lib/libgflags_nothreads.so.2.2.2 $ROOT/third_party/lib/libgflags_nothreads.so
+ldconfig -n $ROOT/third_party/lib
 # 用 cards 那份的代码建（三份由 tools/release_sync.sh 复制而来，内容相同）。
 set -uo pipefail
 unset PREPARE
