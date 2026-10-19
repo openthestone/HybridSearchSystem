@@ -1,0 +1,30 @@
+syntax = "proto3";
+package Building;
+
+message Attachment {
+   bytes data = 1;
+}
+
+message IntEmbedding {
+    repeated int32 embedding = 1;
+}
+
+message FloatEmbedding {
+    repeated float embedding = 1;
+}
+
+message Section {
+    repeated TermInfo termInfos = 1;
+    repeated IntEmbedding int32_embedding = 2;
+    repeated FloatEmbedding float_embedding = 3;
+}
+
+message TermInfo {
+    string term = 1;
+    bool extra = 2;
+    bool index = 3;
+    oneof value {
+            uint32 uint32Value = 4;
+            uint64 uint64Value = 5;
+    }
+}

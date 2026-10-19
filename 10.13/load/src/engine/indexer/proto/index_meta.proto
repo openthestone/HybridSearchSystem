@@ -1,0 +1,23 @@
+syntax = "proto3";
+package Building.Meta;
+
+message IndexMeta {
+    Config config = 1;
+    Schema schema = 2;
+    Statistics statistics = 3;
+}
+
+message Config {
+    uint32 doc_num_per_segment = 1;  // documents per segment; the last segment may be partial
+    uint32 split_doc_num_zn = 2; // vector fields are chunked by this value, Zn format within a chunk, padded if short
+}
+
+message Schema {
+    repeated string posting = 1;
+    repeated string vector = 2;
+}
+
+message Statistics {
+    uint32 doc_num = 1;
+    uint32 segment_num = 2;
+}
