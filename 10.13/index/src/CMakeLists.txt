@@ -68,11 +68,11 @@ get_filename_component(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/.." ABSOLUTE)
 # Match the original project: third-party packages on the server are installed
 # under /usr/local, but some CMake defaults on the Ascend host do not search it.
 list(APPEND CMAKE_PREFIX_PATH "/usr/local")
-# A self-contained drop: unpack gflags/protobuf/absl under <repo>/third_party and they are found
-# with no arguments at all. The runtime side already works -- third_party/lib64 and third_party/lib
-# are in NPUR_HOST_RPATH_DIRS below and in run.sh's LD_LIBRARY_PATH -- so this line is what makes
-# find_package() agree with it. Costs nothing when the directory does not exist.
-list(APPEND CMAKE_PREFIX_PATH "${REPO_ROOT}/third_party")
+# Standalone tree: <repo>/third_party. Release copies: <release>/third_party.
+# Search both directly so archives need no per-copy symlinks.
+list(APPEND CMAKE_PREFIX_PATH
+    "${REPO_ROOT}/third_party"
+    "${REPO_ROOT}/../third_party")
 
 find_package(Threads REQUIRED)
 find_package(gflags REQUIRED)
@@ -154,6 +154,8 @@ set(NPUR_HOST_RPATH_DIRS
     "${REPO_ROOT}/lib"
     "${REPO_ROOT}/third_party/lib64"
     "${REPO_ROOT}/third_party/lib"
+    "${REPO_ROOT}/../third_party/lib64"
+    "${REPO_ROOT}/../third_party/lib"
     "${ASCEND_CANN_PACKAGE_PATH}/lib64"
     "${ASCEND_CANN_PACKAGE_PATH}/opp/vendors/aicpu_mask/op_impl/cpu/aicpu_kernel/impl"
     "/usr/local/lib64"
@@ -356,6 +358,10 @@ if(NPUR_BUILD_BUILDER)
                 "${REPO_ROOT}/rapidjson-1.1.0/include"
                 "${REPO_ROOT}/third_party/rapidjson/include"
                 "${REPO_ROOT}/third_party/rapidjson-1.1.0/include"
+                "${REPO_ROOT}/third_party/include"
+                "${REPO_ROOT}/../third_party/rapidjson/include"
+                "${REPO_ROOT}/../third_party/rapidjson-1.1.0/include"
+                "${REPO_ROOT}/../third_party/include"
                 "${REPO_ROOT}/../rapidjson/include"
                 "${REPO_ROOT}/../rapidjson-1.1.0/include"
                 "/opt/rapidjson/include"
@@ -430,6 +436,16 @@ endif()
 # Links ascend_device for the MMad scorer kernel (the compute half of the load) but NOT
 # npur_search: it borrows one kernel, not the engine, so it cannot perturb the measured process
 # except through the device contention that is its entire purpose.
+# fr_loadbench: 只量"切片并行搬到 NPU"的耗时，不链引擎，只要 ACL。
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/harness/load_bench.cpp")
+    add_executable(fr_loadbench "${CMAKE_CURRENT_SOURCE_DIR}/harness/load_bench.cpp")
+    target_include_directories(fr_loadbench PRIVATE ${COMMON_INCLUDES})
+    target_compile_definitions(fr_loadbench PRIVATE ${COMMON_DEFINES})
+    target_link_libraries(fr_loadbench PRIVATE ascendcl gflags Threads::Threads)
+    npur_apply_host_link_dirs(fr_loadbench)
+    npur_apply_executable_runtime_paths(fr_loadbench)
+endif()
+
 if(NPUR_BUILD_SEARCH AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/harness/npu_load.cpp")
     add_executable(fr_npuload "${CMAKE_CURRENT_SOURCE_DIR}/harness/npu_load.cpp")
     target_include_directories(fr_npuload PRIVATE ${COMMON_INCLUDES} "${NPUR_DEVICE_INC_DIR}")

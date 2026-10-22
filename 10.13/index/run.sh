@@ -90,6 +90,10 @@ if [[ -z "${RAPIDJSON_INCLUDE_DIR}" ]]; then
         "${ROOT_DIR}/rapidjson-1.1.0/include" \
         "${ROOT_DIR}/third_party/rapidjson/include" \
         "${ROOT_DIR}/third_party/rapidjson-1.1.0/include" \
+        "${ROOT_DIR}/third_party/include" \
+        "${ROOT_DIR}/../third_party/rapidjson/include" \
+        "${ROOT_DIR}/../third_party/rapidjson-1.1.0/include" \
+        "${ROOT_DIR}/../third_party/include" \
         "${ROOT_DIR}/../rapidjson/include" \
         "${ROOT_DIR}/../rapidjson-1.1.0/include" \
         "/opt/rapidjson/include" \
@@ -883,6 +887,8 @@ append_runtime_library_dir "${ROOT_DIR}/lib64"
 append_runtime_library_dir "${ROOT_DIR}/lib"
 append_runtime_library_dir "${ROOT_DIR}/third_party/lib64"
 append_runtime_library_dir "${ROOT_DIR}/third_party/lib"
+append_runtime_library_dir "${ROOT_DIR}/../third_party/lib64"
+append_runtime_library_dir "${ROOT_DIR}/../third_party/lib"
 append_runtime_library_dir "${CANN}/lib64"
 append_runtime_library_dir "${CANN}/opp/vendors/aicpu_mask/op_impl/cpu/aicpu_kernel/impl"
 append_runtime_library_dir "${GFLAGS_LIBRARY_DIR}"

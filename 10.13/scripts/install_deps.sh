@@ -185,6 +185,7 @@ RAPIDJSON_FOUND=""
 check_rapidjson() {
     local d
     for d in "${RAPIDJSON_INCLUDE_DIR:-}" "${TP}/rapidjson/include" "${TP}/rapidjson-1.1.0/include" \
+             "${TP}/include" \
              "${ROOT_DIR}/rapidjson/include" "${ROOT_DIR}/rapidjson-1.1.0/include" \
              /opt/rapidjson/include /usr/local/include /usr/include; do
         [[ -n "${d}" && -f "${d}/rapidjson/document.h" ]] && { RAPIDJSON_FOUND="${d}"; break; }
@@ -383,5 +384,9 @@ if [[ -n "${BLOCKED// /}" ]]; then
     exit 1
 fi
 say "all dependencies satisfied. Next:"
-say "  bash src/tests/run_tests.sh      # host-side unit tests, no NPU needed"
-say "  ./run.sh -c 1 --convert-query 0 --convert-data 0 --build-index 0 --search 0   # compile only"
+if [[ -x "${ROOT_DIR}/setup.sh" ]]; then
+    say "  ./setup.sh                       # compile and build the shared index and recall cache"
+else
+    say "  bash src/tests/run_tests.sh      # host-side unit tests, no NPU needed"
+    say "  ./run.sh -c 1 --convert-query 0 --convert-data 0 --build-index 0 --search 0   # compile only"
+fi

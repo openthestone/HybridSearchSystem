@@ -17,6 +17,7 @@
 #                          CONVERT_QUERY 默认 1，要 tag_map.bin 和 QueryData_10000.txt；
 #                          已经转好过就 CONVERT_QUERY=0 跳过（查询和阈值无关）
 #                          RECALL_REF=1 顺带把召回参考缓存建好（校内两卡约 3 分钟，之后所有场景命中）
+#                          FORCE=1 覆盖已有索引，并连召回缓存一起重算
 #   tools/exp.sh ref       只建召回参考缓存，索引不重建。改过 C++ 要 COMPILE=1；
 #                          缓存已是当前版本要 FORCE=1 才重算，算完和原来的逐字节比
 #   tools/exp.sh compile   只编译，数据和索引都不碰
@@ -37,7 +38,7 @@ set -uo pipefail
 
 ROOT="${ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 SCENARIO="${1:-}"; [[ $# -gt 0 ]] && shift
-[[ -n "${SCENARIO}" ]] || { sed -n '2,22p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 1; }
+[[ -n "${SCENARIO}" ]] || { sed -n '2,23p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 1; }
 
 # 变量写在场景名后面也行：tools/exp.sh build DENSITY_THRESHOLD=0，和写在前面等价。
 # 名册里有几个（HBM_SAMPLE / NPU_UTIL / TARGET_QPS / SLOW_CARDS）本脚本自己不用，是 run.sh
@@ -47,6 +48,7 @@ SCENARIO="${1:-}"; [[ $# -gt 0 ]] && shift
 KNOBS="ROOT DATA_ROOT RUNS_DIR DENSITY_THRESHOLD WORK_DIR DATASET_FILE QUERY_OUT_DIR
        DEVICE_IDS DOCS DOC_NUM_PER_SEGMENT NUM_QUERIES WARMUP
        RECALL_QUERIES MEM_REPORT RECALL_REF_FILE CARDS_PER_GROUP INDEX_DIRS FULL_INDEX_DIR
+       HBM_BUDGET_MIB
        TASKSET_CPUS CARD_CPUS LOG_DIR PARSE_LOG ROUNDS NOTIFY NPU_LOAD_CARDS DROP_CACHES
        MODE ARMS BATCH_SIZE BATCH_SIZES CARD_SETS REPEAT SHARDS FORCE COMPILE
        CONVERT_QUERY PARALLEL_LOAD RECALL_REF
@@ -234,7 +236,7 @@ build_recall_ref() {   # <分片数>  [编译0|1]
     for ((i = 0; i < shards; i++)); do dev+="${dev:+,}${i}"; done
     printf '[召回缓存] 输出：%s\n' "${RECALL_REF_FILE}"
     echo "[召回缓存] 正在为全部查询计算 CPU 真值，可能需要数分钟。"
-    env RAPIDJSON_INCLUDE_DIR="${RAPIDJSON_INCLUDE_DIR:-/usr/include}" \
+    env RAPIDJSON_INCLUDE_DIR="${RAPIDJSON_INCLUDE_DIR:-}" \
         DATASET_FILE="${DATASET_FILE}" DEVICE_IDS="${dev}" \
         SHARD_INDEX_DIRS="$(shard_dir_list "${shards}")" \
         DOCS="${DOCS}" DENSITY_THRESHOLD="${DENSITY_THRESHOLD}" \
@@ -255,9 +257,25 @@ build_recall_ref() {   # <分片数>  [编译0|1]
 if [[ "${SCENARIO}" == "size" ]]; then
     dirs=("${@:-}"); [[ -n "${dirs[0]:-}" ]] || IFS=',' read -r -a dirs <<< "${INDEX_DIRS}"
     size_report "${dirs[@]}"
-    # 两个目录时给出比值，用来对阈值/布局改动前后的索引大小（验收要求小 20%）
-    (( ${#dirs[@]} == 2 )) && awk -v a="${SIZE_BYTES[0]}" -v b="${SIZE_BYTES[1]}" \
-        'BEGIN{printf "\n第二个相对第一个 %+.2f%%\n", 100*(b/a-1)}'
+    # 两个目录时给出比值，用来对阈值/布局改动前后的索引大小。标签取两条路径里不一样的那一段，
+    # 省得读的人回头去数哪个是"第一个"
+    if (( ${#dirs[@]} == 2 )); then
+        IFS='/' read -r -a _pa <<< "${dirs[0]}"
+        IFS='/' read -r -a _pb <<< "${dirs[1]}"
+        _la=""; _lb=""
+        for ((_i = 0; _i < ${#_pa[@]} || _i < ${#_pb[@]}; _i++)); do
+            [[ "${_pa[_i]:-}" == "${_pb[_i]:-}" ]] && continue
+            [[ -n "${_pa[_i]:-}" ]] && _la+="${_la:+/}${_pa[_i]}"
+            [[ -n "${_pb[_i]:-}" ]] && _lb+="${_lb:+/}${_pb[_i]}"
+        done
+        [[ -n "${_la}" ]] || { _la="${dirs[0]}"; _lb="${dirs[1]}"; }
+        awk -v a="${SIZE_BYTES[0]}" -v b="${SIZE_BYTES[1]}" -v la="${_la}" -v lb="${_lb}" \
+            -v ha="$(numfmt --to=iec --suffix=B "${SIZE_BYTES[0]}")" \
+            -v hb="$(numfmt --to=iec --suffix=B "${SIZE_BYTES[1]}")" \
+            'BEGIN{d = 100 * (b / a - 1);
+                   printf "\n索引体积 %s 相对 %s %s %.2f%%：%s -> %s\n",
+                          lb, la, (d < 0 ? "小" : "大"), (d < 0 ? -d : d), ha, hb}'
+    fi
     exit 0
 fi
 
@@ -314,7 +332,7 @@ EOT
     printf '[建索引] 输出目录：%s（shard0 至 shard%s）\n' \
         "${INDEX_ROOT}" "$((SHARDS - 1))"
     echo
-    env RAPIDJSON_INCLUDE_DIR="${RAPIDJSON_INCLUDE_DIR:-/usr/include}" \
+    env RAPIDJSON_INCLUDE_DIR="${RAPIDJSON_INCLUDE_DIR:-}" \
         DATASET_FILE="${DATASET_FILE}" DEVICE_IDS="${BUILD_DEVICE_IDS}" \
         DOCS="${DOCS}" DENSITY_THRESHOLD="${DENSITY_THRESHOLD}" \
         DOC_NUM_PER_SEGMENT="${DOC_NUM_PER_SEGMENT}" \
@@ -336,12 +354,27 @@ EOT
         echo
         ref_want="$(ref_code_version)"
         ref_have="$(ref_file_version "${RECALL_REF_FILE}")"
-        if [[ -n "${ref_have}" && "${ref_have}" == "${ref_want}" ]]; then
+        if [[ -n "${ref_have}" && "${ref_have}" == "${ref_want}" && "${FORCE:-0}" != "1" ]]; then
             echo "[召回缓存] 已有当前版本（v${ref_want}），跳过生成：${RECALL_REF_FILE}"
         else
-            [[ -n "${ref_have}" ]] && echo \
-                "[召回缓存] 版本由 v${ref_have} 变为 v${ref_want}，将重新生成。"
+            if [[ -n "${ref_have}" && "${ref_have}" == "${ref_want}" ]]; then
+                # 指纹没变的话 fr_search 会直接命中、根本不会重算，所以必须先把文件挪开
+                REF_PREV="${RECALL_REF_FILE}.prev"
+                [[ -e "${REF_PREV}" ]] && die "${REF_PREV} 已经在了，先处理掉它再来"
+                mv -- "${RECALL_REF_FILE}" "${REF_PREV}"
+                trap ref_restore EXIT
+                echo "[召回缓存] FORCE=1：重新生成 v${ref_want}，旧文件暂存为 ${REF_PREV}"
+            elif [[ -n "${ref_have}" ]]; then
+                echo "[召回缓存] 版本由 v${ref_have} 变为 v${ref_want}，将重新生成。"
+            fi
             build_recall_ref "${SHARDS}"
+            if [[ -n "${REF_PREV}" ]]; then
+                if [[ -f "${RECALL_REF_FILE}" ]]; then
+                    rm -f -- "${REF_PREV}"
+                else
+                    ref_restore
+                fi
+            fi
         fi
     fi
     exit 0
@@ -352,7 +385,7 @@ if [[ "${SCENARIO}" == "compile" ]]; then
     [[ -f "${DATASET_FILE}" ]] || die "数据集不存在：${DATASET_FILE}"
     [[ -f "${QUERY_OUT_DIR}/queries.fvecs" ]] \
         || die "${QUERY_OUT_DIR} 下没有 queries.fvecs（run.sh 编译之后会无条件检查，run.sh:978）"
-    env RAPIDJSON_INCLUDE_DIR="${RAPIDJSON_INCLUDE_DIR:-/usr/include}" \
+    env RAPIDJSON_INCLUDE_DIR="${RAPIDJSON_INCLUDE_DIR:-}" \
         DATASET_FILE="${DATASET_FILE}" \
         WORK_DIR="${WORK_DIR}" RESULT_DIR="${RUNS_DIR}/exp_compile_$(basename "${ROOT}")" \
         QUERY_OUT_DIR="${QUERY_OUT_DIR}" \
@@ -516,7 +549,7 @@ one_run() {   # <tag> <第几个样本> [额外的 env 赋值...]
     local notify_this=0
     [[ "${NOTIFY}" == "1" && "${RUN_INDEX}" -eq "${RUN_TOTAL}" ]] && notify_this=1
     local -a environment=(
-        RAPIDJSON_INCLUDE_DIR="${RAPIDJSON_INCLUDE_DIR:-/usr/include}"
+        RAPIDJSON_INCLUDE_DIR="${RAPIDJSON_INCLUDE_DIR:-}"
         DATASET_FILE="${DATASET_FILE}" DEVICE_IDS="${DEVICE_IDS}" SHARD_INDEX_DIRS="${INDEX_DIRS}"
         DOCS="${DOCS}" DENSITY_THRESHOLD="${DENSITY_THRESHOLD}"
         DOC_NUM_PER_SEGMENT="${DOC_NUM_PER_SEGMENT}"
@@ -654,17 +687,31 @@ index)
     # 加载只在进程启动时发生一次，所以 --repeat 3 就是三次独立的加载样本。
     PARALLEL_LOAD="${PARALLEL_LOAD:-1}"
     BATCH_SIZE="${BATCH_SIZE:-1}"; REPEAT="${REPEAT:-3}"
-    # 查询条数必须和 topk.txt 的行数一致（LoadTopKFile 会校验），所以不能自己砍成 100；
-    # 和别档一样用全部查询，顺带让召回缓存的指纹对上、直接命中。加载时间不受此影响——
-    # 它发生在检索之前，多跑的只是每轮末尾那十几秒检索。
+    # 这一档只量加载，检索一条都不用跑。加载发生在检索之前，时间不受影响。
+    # fr_search 必须起来才会加载索引，所以没法真的"零查询"，取 1 条（约 1.5ms）。
+    NUM_QUERIES="${NUM_QUERIES:-1}"
+    WARMUP="${WARMUP:-0}"
+    # 召回校验要全程关掉：指纹含 nq，查询条数一变就会 MISS 并覆盖那份共用的缓存；而且
+    # 即使只抽查几条，QuantizeCorpus 也是对整个语料做一遍（report.cpp:134），比省下的
+    # 检索还慢。RECALL_QUERIES=0 且不给缓存文件时 CheckRecall 直接返回（report.cpp:92）。
+    RECALL_REF_FILE=""
+    RECALL_QUERIES=0
     RUN_TOTAL=1
     SHOW_SHARD_COLUMNS=1
-    printf '[索引测试] 设备：%s；并行加载：%s；查询数：%s；重复：%s 轮\n' \
-        "${DEVICE_IDS}" "${PARALLEL_LOAD}" "${NUM_QUERIES}" "${REPEAT}"
+    printf '[索引测试] 设备：%s；并行加载：%s；重复：%s 轮（只量加载，不跑检索与召回）\n' \
+        "${DEVICE_IDS}" "${PARALLEL_LOAD}" "${REPEAT}"
     echo
     echo "[索引大小]"
     IFS=',' read -r -a index_dir_list <<< "${INDEX_DIRS}"
     size_report "${index_dir_list[@]}"
+    # 验收判据：索引要装得进 910B4 单卡显存的 80%（32 GiB x 0.8 = 26214 MiB，
+    # 见 docs/run-density.md）。校内盒子是 910B3 64GB，但判据按目标机的 32GB 算。
+    HBM_BUDGET_MIB="${HBM_BUDGET_MIB:-26214}"
+    awk -v b="${SIZE_TOTAL}" -v budget="${HBM_BUDGET_MIB}" \
+        'BEGIN{mib = b / 1048576;
+               printf "  %.0f MiB / 预算 %d MiB（32 GiB x 0.8）  %s %.0f MiB（%+.1f%%）\n",
+                      mib, budget, (mib <= budget ? "余量" : "超出"),
+                      (mib <= budget ? budget - mib : mib - budget), 100 * (mib / budget - 1)}'
     echo
     # 调度方式不影响加载（加载发生在任何调度之前），固定成最简单的一种，少一个变量
     one_run index 1 "SHARD_GROUP_SIZE=${CARDS_PER_GROUP}" PIPELINE=0 ROUND_ROBIN=0 \
@@ -779,9 +826,14 @@ if len(samples) == 1:
     if line:
         print("  " + "   ".join(line))
     if one("load_sec"):
-        n = len(values(tag, "load_sec"))
+        each = values(tag, "load_sec")
+        n = len(each)
         sp = spread_percent(tag, "load_sec")
-        extra = "" if n < 2 or sp != sp else "（%d 次，极差 %.1f%%）" % (n, sp)
+        # 逐次列出来：第一次是冷页缓存，后面是热的，只看中位数会把这个差别藏掉
+        extra = ""
+        if n >= 2:
+            extra = "（%d 次 %s%s）" % (n, " / ".join("%.1f" % x for x in each),
+                                       "" if sp != sp else "，波动 %.1f%%" % sp)
         line = "  索引加载 %s s%s" % (one("load_sec"), extra)
         if show_shard_columns:
             per = ["分片%s %s s" % (c[5:], one(c)) for c in shard_columns if one(c)]

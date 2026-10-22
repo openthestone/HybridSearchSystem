@@ -83,10 +83,14 @@ bool LoadTopKFile(const std::string& path, size_t numQueries, std::vector<uint32
         LOG_ERROR("topk file has no values: " << path);
         return false;
     }
-    if (topks.size() != numQueries) {
-        LOG_ERROR("topk file line count " << topks.size() << " does not match running query count " << numQueries);
+    // --num_queries smaller than the file is legitimate (setup.cpp:146 allows it), so a longer
+    // file just means "run the first numQueries". Only a SHORT file is a real mismatch.
+    if (topks.size() < numQueries) {
+        LOG_ERROR("topk file has " << topks.size() << " lines, fewer than the " << numQueries
+                                   << " queries being run: " << path);
         return false;
     }
+    topks.resize(numQueries);
     return true;
 }
 

@@ -48,9 +48,11 @@ EOT
     export LOG_DIR="${LOG_DIR:-${RELEASE}/logs}"
     mkdir -p "${LOG_DIR}"
 
-    # 副本里挂上软链，这样进到 release/<名字> 直接跑 tools/exp.sh 也能拿到共用的数据
+    # 三份工程各自以自身目录为构建根；日志通过 LOG_DIR 共享，依赖直接查 release/third_party。
+    # 清掉旧交付包留下的软链，避免解压后指向开发机或不存在的路径。
+    [[ -L "${COPY}/logs" ]] && rm "${COPY}/logs"
+    [[ -L "${COPY}/third_party" ]] && rm "${COPY}/third_party"
     link_shared "${DATA_ROOT}" "${COPY}/frnew_syn_v3"
-    link_shared "${LOG_DIR}" "${COPY}/logs"
 
     if [[ "${COMPILE:-0}" == "1" ]]; then
         printf '[编译] %s\n' "${name}"

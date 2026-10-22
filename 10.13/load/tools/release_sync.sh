@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # 开发侧：把仓库里的代码同步成 release 下的三份。这个脚本不随 release 交付，
 # 交付前在本机跑一次，再把整个 release 目录打包发出去。
-# 每份的 build/ build_device/ 不动，数据和日志的软链由三个驱动脚本自己维护。
+# 每份的 build/ build_device/ 不动；日志和依赖从 release 根目录直接读取。
 set -uo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RELEASE="${REPO}/release"
@@ -31,6 +31,10 @@ for c in "${COPIES[@]}"; do
     for p in "${PARTS[@]}"; do
         rm -rf "${RELEASE}/${c}/${p}"
         cp -R "${REPO}/${p}" "${RELEASE}/${c}/${p}"
+    done
+    # 清理旧版生成的软链；保留用户自行放入的实体目录。
+    for shared in logs third_party; do
+        [[ -L "${RELEASE}/${c}/${shared}" ]] && rm "${RELEASE}/${c}/${shared}"
     done
     rm -rf "${RELEASE}/${c}/tools/__pycache__"
     echo "[同步] ${c} 代码"
